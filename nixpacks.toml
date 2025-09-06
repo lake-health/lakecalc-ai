@@ -1,12 +1,19 @@
 [phases.setup]
-nixPkgs = ["python311", "python311Packages.pip", "tesseract", "poppler_utils", "pkg-config"]
+nixPkgs = ["python311", "python311Packages.pip", "python311Packages.setuptools", "python311Packages.wheel", "tesseract", "poppler_utils", "pkg-config"]
 
 [phases.install]
-cmds = ["python -m pip install --upgrade pip", "python -m pip install -r requirements.txt"]
+cmds = [
+    "python3.11 -m ensurepip --upgrade",
+    "python3.11 -m pip install --upgrade pip setuptools wheel",
+    "python3.11 -m pip install -r requirements.txt"
+]
 
 [phases.build]
 cmds = ["echo 'Build complete'"]
 
 [start]
 cmd = "gunicorn --bind 0.0.0.0:$PORT app:app"
+
+[variables]
+NIXPACKS_PYTHON_VERSION = "3.11"
 
