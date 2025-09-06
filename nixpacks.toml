@@ -1,14 +1,13 @@
 # nixpacks.toml
 
 [phases.setup]
-# Add essential build tools and system libraries
-# This now includes a more comprehensive list for libraries like OpenCV
+# Corrected the OpenGL library package name
 aptPkgs = [
     "build-essential",
     "pkg-config",
     "tesseract-ocr",
     "poppler-utils",
-    "libgl1-mesa-glx",
+    "libgl1",  # Corrected package name
     "libglib2.0-0",
     "libsm6",
     "libxext6",
@@ -23,9 +22,7 @@ cmds = [
 ]
 
 [phases.start]
-# Ensure the application starts with the correct command
 start_cmd = "gunicorn app:app"
 
 [variables]
-# Set the port for the application
 PORT = "5000"
