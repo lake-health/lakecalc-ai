@@ -1,410 +1,103 @@
-#!/usr/bin/env python3
-"""
-Lake Health IOL Calculator - Railway Optimized Backend
-Full OCR functionality with Railway-compatible dependencies
-Updated: Sep 6, 2025 - Fixed Python distutils compatibility
-"""
-
+from flask import Flask, jsonify, request, render_template, send_from_directory
+from google.cloud import vision
 import os
-import logging
-import tempfile
-import traceback
-from flask import Flask, request, jsonify, send_from_directory
-from flask_cors import CORS
-from werkzeug.utils import secure_filename
-import json
+import io
+import PyPDF2
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Initialize Flask App
+app = Flask(__name__, static_folder='static', template_folder='templates')
 
-# Initialize Flask app
-app = Flask(__name__)
-CORS(app, origins="*")
+# Configure Google Cloud credentials from environment variable
+# The content of the JSON key file is expected to be in this env var
+credentials_json_str = os.environ.get('GOOGLE_APPLICATION_CREDENTIALS_JSON')
+if credentials_json_str:
+    from google.oauth2 import service_account
+    import json
+    credentials_info = json.loads(credentials_json_str)
+    credentials = service_account.Credentials.from_service_account_info(credentials_info)
+    client = vision.ImageAnnotatorClient(credentials=credentials)
+else:
+    # Fallback for local development if the env var is not set
+    # This will use the GOOGLE_APPLICATION_CREDENTIALS file path if available
+    client = vision.ImageAnnotatorClient()
 
-# Configuration
-UPLOAD_FOLDER = tempfile.mkdtemp()
-ALLOWED_EXTENSIONS = {'pdf', 'png', 'jpg', 'jpeg'}
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
+def perform_ocr(image_content):
+    """Performs OCR on the given image content."""
+    image = vision.Image(content=image_content)
+    response = client.text_detection(image=image)
+    texts = response.text_annotations
+    if texts:
+        return texts[0].description
+    return "No text found."
 
-# OCR Configuration
-OCR_ENABLED = True
-GOOGLE_CLOUD_CREDENTIALS_JSON = os.environ.get('GOOGLE_CLOUD_CREDENTIALS_JSON')
-GOOGLE_CLOUD_CREDENTIALS_PATH = os.environ.get('GOOGLE_CLOUD_CREDENTIALS_PATH', '/app/google-cloud-credentials.json')
+# --- API Routes ---
 
-def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
-
-def initialize_ocr():
-    """Initialize OCR components with Railway compatibility"""
-    global OCR_ENABLED
-    try:
-        # Try to import OCR dependencies
-        import pytesseract
-        from pdf2image import convert_from_path
-        from PIL import Image
-        
-        # Test tesseract availability
-        try:
-            pytesseract.get_tesseract_version()
-            logger.info("Tesseract OCR initialized successfully")
-        except Exception as e:
-            logger.warning(f"Tesseract not available: {e}")
-        
-        # Test Google Cloud Vision
-        try:
-            # Try environment variable first (for Railway)
-            if GOOGLE_CLOUD_CREDENTIALS_JSON:
-                import tempfile
-                import json
-                # Create temporary credentials file from environment variable
-                with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-                    f.write(GOOGLE_CLOUD_CREDENTIALS_JSON)
-                    temp_creds_path = f.name
-                os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = temp_creds_path
-                from google.cloud import vision
-                client = vision.ImageAnnotatorClient()
-                logger.info("Google Cloud Vision API initialized from environment variable")
-            elif os.path.exists(GOOGLE_CLOUD_CREDENTIALS_PATH):
-                os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = GOOGLE_CLOUD_CREDENTIALS_PATH
-                from google.cloud import vision
-                client = vision.ImageAnnotatorClient()
-                logger.info("Google Cloud Vision API initialized from file")
-            else:
-                logger.warning("No Google Cloud credentials found")
-        except Exception as e:
-            logger.warning(f"Google Cloud Vision not available: {e}")
-        
-        return True
-        
-    except ImportError as e:
-        logger.error(f"OCR dependencies not available: {e}")
-        OCR_ENABLED = False
-        return False
-
-def get_vision_client():
-    """Get Google Cloud Vision client with proper credentials handling"""
-    try:
-        # Try environment variable first (for Railway)
-        if GOOGLE_CLOUD_CREDENTIALS_JSON:
-            import tempfile
-            import json
-            # Create temporary credentials file from environment variable
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-                f.write(GOOGLE_CLOUD_CREDENTIALS_JSON)
-                temp_creds_path = f.name
-            os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = temp_creds_path
-            from google.cloud import vision
-            return vision.ImageAnnotatorClient()
-        elif os.path.exists(GOOGLE_CLOUD_CREDENTIALS_PATH):
-            os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = GOOGLE_CLOUD_CREDENTIALS_PATH
-            from google.cloud import vision
-            return vision.ImageAnnotatorClient()
-        else:
-            return None
-    except Exception as e:
-        logger.error(f"Failed to create Vision client: {e}")
-        return None
-
-def extract_text_with_ocr(file_path):
-    """Extract text using hybrid OCR approach"""
-    if not OCR_ENABLED:
-        return None, "OCR not available in this environment"
-    
-    try:
-        # Import OCR libraries
-        import pytesseract
-        from pdf2image import convert_from_path
-        from PIL import Image
-        
-        extracted_text = ""
-        confidence_scores = []
-        
-        # Handle PDF files
-        if file_path.lower().endswith('.pdf'):
-            try:
-                # Convert PDF to images
-                images = convert_from_path(file_path, dpi=300, first_page=1, last_page=3)
-                
-                for i, image in enumerate(images):
-                    # Try local tesseract first
-                    try:
-                        text = pytesseract.image_to_string(image, config='--psm 6')
-                        if text.strip():
-                            extracted_text += f"Page {i+1}:\n{text}\n\n"
-                            confidence_scores.append(0.75)  # Estimated confidence
-                    except Exception as e:
-                        logger.warning(f"Tesseract failed for page {i+1}: {e}")
-                        
-                        # Fallback to Google Cloud Vision
-                        try:
-                            client = get_vision_client()
-                            if client:
-                                # Convert PIL image to bytes
-                                import io
-                                img_byte_arr = io.BytesIO()
-                                image.save(img_byte_arr, format='PNG')
-                                img_byte_arr = img_byte_arr.getvalue()
-                                
-                                # Perform OCR
-                                from google.cloud import vision
-                                image_vision = vision.Image(content=img_byte_arr)
-                                response = client.text_detection(image=image_vision)
-                                
-                                if response.text_annotations:
-                                    text = response.text_annotations[0].description
-                                    extracted_text += f"Page {i+1} (Cloud Vision):\n{text}\n\n"
-                                    confidence_scores.append(0.85)
-                                    
-                        except Exception as cloud_error:
-                            logger.error(f"Cloud Vision failed: {cloud_error}")
-                            
-            except Exception as pdf_error:
-                logger.error(f"PDF processing failed: {pdf_error}")
-                return None, f"PDF processing error: {str(pdf_error)}"
-        
-        # Handle image files
-        else:
-            try:
-                from PIL import Image
-                image = Image.open(file_path)
-                
-                # Try local tesseract
-                try:
-                    text = pytesseract.image_to_string(image, config='--psm 6')
-                    if text.strip():
-                        extracted_text = text
-                        confidence_scores.append(0.75)
-                except Exception as e:
-                    logger.warning(f"Tesseract failed: {e}")
-                    
-                    # Fallback to Google Cloud Vision
-                    try:
-                        client = get_vision_client()
-                        if client:
-                            with open(file_path, 'rb') as image_file:
-                                content = image_file.read()
-                            
-                            from google.cloud import vision
-                            image_vision = vision.Image(content=content)
-                            response = client.text_detection(image=image_vision)
-                            
-                            if response.text_annotations:
-                                extracted_text = response.text_annotations[0].description
-                                confidence_scores.append(0.85)
-                                
-                    except Exception as cloud_error:
-                        logger.error(f"Cloud Vision failed: {cloud_error}")
-                        
-            except Exception as img_error:
-                logger.error(f"Image processing failed: {img_error}")
-                return None, f"Image processing error: {str(img_error)}"
-        
-        if extracted_text.strip():
-            avg_confidence = sum(confidence_scores) / len(confidence_scores) if confidence_scores else 0
-            return extracted_text, avg_confidence
-        else:
-            return None, "No text extracted"
-            
-    except Exception as e:
-        logger.error(f"OCR extraction failed: {e}")
-        logger.error(traceback.format_exc())
-        return None, f"OCR error: {str(e)}"
-
-def parse_medical_measurements(text):
-    """Parse medical measurements from extracted text"""
-    import re
-    
-    measurements = {}
-    
-    if not text:
-        return measurements
-    
-    # Common patterns for medical device measurements
-    patterns = {
-        'k1': [
-            r'K1[:\s]*([0-9]+\.?[0-9]*)\s*D',
-            r'Steep[:\s]*([0-9]+\.?[0-9]*)\s*D',
-            r'K steep[:\s]*([0-9]+\.?[0-9]*)\s*D'
-        ],
-        'k2': [
-            r'K2[:\s]*([0-9]+\.?[0-9]*)\s*D',
-            r'Flat[:\s]*([0-9]+\.?[0-9]*)\s*D',
-            r'K flat[:\s]*([0-9]+\.?[0-9]*)\s*D'
-        ],
-        'axial_length': [
-            r'AL[:\s]*([0-9]+\.?[0-9]*)\s*mm',
-            r'Axial[:\s]*([0-9]+\.?[0-9]*)\s*mm',
-            r'Length[:\s]*([0-9]+\.?[0-9]*)\s*mm'
-        ]
-    }
-    
-    for measurement, pattern_list in patterns.items():
-        for pattern in pattern_list:
-            matches = re.findall(pattern, text, re.IGNORECASE)
-            if matches:
-                try:
-                    value = float(matches[0])
-                    # Validate reasonable ranges
-                    if measurement in ['k1', 'k2'] and 35.0 <= value <= 55.0:
-                        measurements[measurement] = {
-                            'value': value,
-                            'unit': 'D',
-                            'confidence': 0.8
-                        }
-                    elif measurement == 'axial_length' and 20.0 <= value <= 30.0:
-                        measurements[measurement] = {
-                            'value': value,
-                            'unit': 'mm',
-                            'confidence': 0.8
-                        }
-                except ValueError:
-                    continue
-                break
-    
-    return measurements
-
-@app.route('/api/health', methods=['GET'])
+@app.route('/api/health')
 def health_check():
-    """Health check endpoint"""
+    """Health check endpoint to verify service is running."""
     return jsonify({
-        'status': 'healthy',
-        'service': 'LakeCalc.ai OCR Backend (Railway Optimized)',
-        'version': '2.0.0',
-        'ocr_enabled': OCR_ENABLED,
-        'environment': 'railway'
+        "status": "running",
+        "version": "2.0.0",
+        "ocr_enabled": bool(credentials_json_str),
+        "service": "LakeCalc.ai API (Railway Optimized)"
     })
+
+@app.route('/api/calculate-lol', methods=['POST'])
+def calculate_lol():
+    """Endpoint to perform OCR on an uploaded image."""
+    if 'file' not in request.files:
+        return jsonify({"error": "No file part"}), 400
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({"error": "No selected file"}), 400
+    if file:
+        try:
+            content = file.read()
+            extracted_text = perform_ocr(content)
+            return jsonify({"text": extracted_text})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    return jsonify({"error": "File processing failed"}), 500
 
 @app.route('/api/parse-pdf', methods=['POST'])
 def parse_pdf():
-    """Parse uploaded PDF and extract biometry measurements"""
-    try:
-        if 'file' not in request.files:
-            return jsonify({'error': 'No file uploaded'}), 400
-        
-        file = request.files['file']
-        if file.filename == '':
-            return jsonify({'error': 'No file selected'}), 400
-        
-        if not allowed_file(file.filename):
-            return jsonify({'error': 'Invalid file type. Please upload PDF, PNG, or JPG files.'}), 400
-        
-        # Save uploaded file
-        filename = secure_filename(file.filename)
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file.save(filepath)
-        
+    """Endpoint to perform OCR on an uploaded PDF."""
+    if 'file' not in request.files:
+        return jsonify({"error": "No file part"}), 400
+    file = request.files['file']
+    if file.filename == '' or not file.filename.lower().endswith('.pdf'):
+        return jsonify({"error": "Please select a PDF file"}), 400
+    if file:
         try:
-            # Extract text using OCR
-            extracted_text, confidence_or_error = extract_text_with_ocr(filepath)
-            
-            if extracted_text:
-                # Parse measurements from extracted text
-                measurements = parse_medical_measurements(extracted_text)
-                
-                result = {
-                    'success': True,
-                    'device_manufacturer': 'Auto-detected',
-                    'device_model': 'OCR Processed',
-                    'measurements': measurements,
-                    'extracted_text': extracted_text[:500] + "..." if len(extracted_text) > 500 else extracted_text,
-                    'parse_confidence': confidence_or_error if isinstance(confidence_or_error, (int, float)) else 0.7,
-                    'warnings': [] if measurements else ['No valid measurements found in extracted text'],
-                    'ocr_method': 'Hybrid (Tesseract + Cloud Vision)'
-                }
-            else:
-                # OCR failed, return error with details
-                result = {
-                    'success': False,
-                    'error': 'OCR extraction failed',
-                    'details': confidence_or_error,
-                    'measurements': {},
-                    'warnings': ['OCR processing unsuccessful', 'Please ensure document is clear and readable'],
-                    'ocr_method': 'Failed'
-                }
-        
-        finally:
-            # Clean up uploaded file
-            try:
-                os.remove(filepath)
-            except:
-                pass
-        
-        return jsonify(result)
-        
-    except Exception as e:
-        logger.error(f"Error processing file: {e}")
-        logger.error(traceback.format_exc())
-        return jsonify({
-            'error': 'Failed to process file',
-            'details': str(e),
-            'success': False
-        }), 500
+            pdf_reader = PyPDF2.PdfReader(io.BytesIO(file.read()))
+            full_text = ""
+            # This is a placeholder for actual PDF OCR.
+            # A real implementation would convert each PDF page to an image
+            # and run OCR on it. For now, we just count pages.
+            num_pages = len(pdf_reader.pages)
+            full_text = f"PDF processing is a work in progress. The document has {num_pages} page(s)."
+            # To actually OCR a PDF, you would need a library like pdf2image
+            # to convert pages to images, then loop through them calling perform_ocr.
+            return jsonify({"text": full_text})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    return jsonify({"error": "PDF processing failed"}), 500
 
-@app.route('/api/calculate-iol', methods=['POST'])
-def calculate_iol():
-    """Calculate IOL power based on biometry measurements"""
-    try:
-        data = request.get_json()
-        
-        # Extract measurements
-        k1 = float(data.get('k1', 43.0))
-        k2 = float(data.get('k2', 43.0))
-        axial_length = float(data.get('axial_length', 24.0))
-        target_refraction = float(data.get('target_refraction', 0.0))
-        
-        # Simple IOL calculation (SRK/T formula approximation)
-        k_avg = (k1 + k2) / 2
-        a_constant = 118.4  # Default A-constant
-        
-        # Simplified calculation
-        iol_power = a_constant - 2.5 * axial_length - 0.9 * k_avg + target_refraction
-        
-        return jsonify({
-            'success': True,
-            'iol_power': round(iol_power, 1),
-            'formula': 'SRK/T (simplified)',
-            'measurements_used': {
-                'k1': k1,
-                'k2': k2,
-                'k_avg': round(k_avg, 2),
-                'axial_length': axial_length,
-                'target_refraction': target_refraction
-            }
-        })
-        
-    except Exception as e:
-        logger.error(f"Error calculating IOL: {e}")
-        return jsonify({
-            'error': 'Failed to calculate IOL power',
-            'details': str(e)
-        }), 500
+# --- Frontend Serving Routes ---
 
-@app.route('/', defaults={'path': ''})
+@app.route('/')
+def serve_app():
+    """Serves the main index.html file."""
+    return render_template("index.html")
+
 @app.route('/<path:path>')
-def serve_frontend(path):
-    """Serve frontend files or API info"""
-    return jsonify({
-        'service': 'LakeCalc.ai API (Railway Optimized)',
-        'status': 'running',
-        'version': '2.0.0',
-        'endpoints': [
-            '/api/health',
-            '/api/parse-pdf',
-            '/api/calculate-iol'
-        ],
-        'ocr_enabled': OCR_ENABLED
-    })
+def serve_fallback(path):
+    """
+    Serves the index.html for any other path.
+    This is useful for client-side routing in single-page applications.
+    """
+    return render_template('index.html')
 
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    debug = os.environ.get('DEBUG', 'False').lower() == 'true'
-    
-    # Initialize OCR on startup
-    initialize_ocr()
-    
-    logger.info(f"Starting LakeCalc.ai Railway Backend on 0.0.0.0:{port}")
-    logger.info(f"OCR Enabled: {OCR_ENABLED}")
-    app.run(host='0.0.0.0', port=port, debug=debug)
-
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
