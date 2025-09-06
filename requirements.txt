@@ -1,31 +1,8 @@
-Flask==3.0.0
-Flask-CORS==4.0.0
-Flask-SQLAlchemy==3.1.1
-Werkzeug==3.0.1
-gunicorn==21.2.0
-python-multipart==0.0.6
-
-# PDF Processing - Railway compatible versions
-PyPDF2==3.0.1
-pdfplumber==0.10.3
-reportlab==4.0.7
-
-# OCR dependencies - Railway optimized
-Pillow==10.0.1
-pytesseract==0.3.10
-pdf2image==1.16.3
-
-# Google Cloud Vision API
-google-cloud-vision==3.4.4
-
-# Scientific computing
-numpy==1.24.4
-pandas==2.0.3
-requests==2.31.0
-
-# Use compatible cryptography version
-cryptography==41.0.4
-
-# Fix Python 3.12+ compatibility
-setuptools==68.2.2
-
+Flask
+Flask-Cors
+google-cloud-vision
+Pillow
+PyPDF2
+gunicorn
+# Use the headless version of OpenCV to avoid GUI dependencies
+opencv-python-headless

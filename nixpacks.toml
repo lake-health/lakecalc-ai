@@ -1,19 +1,31 @@
+# nixpacks.toml
+
 [phases.setup]
-nixPkgs = ["python311", "python311Packages.pip", "python311Packages.setuptools", "python311Packages.wheel", "tesseract", "poppler_utils", "pkg-config"]
+# Add essential build tools and system libraries
+# This now includes a more comprehensive list for libraries like OpenCV
+aptPkgs = [
+    "build-essential",
+    "pkg-config",
+    "tesseract-ocr",
+    "poppler-utils",
+    "libgl1-mesa-glx",
+    "libglib2.0-0",
+    "libsm6",
+    "libxext6",
+    "libxrender-dev"
+]
+nixPkgs = ["...", "python311"]
 
 [phases.install]
 cmds = [
-    "python3.11 -m ensurepip --upgrade",
-    "python3.11 -m pip install --upgrade pip setuptools wheel",
-    "python3.11 -m pip install -r requirements.txt"
+    "pip install --upgrade pip setuptools wheel",
+    "pip install -r requirements.txt"
 ]
 
-[phases.build]
-cmds = ["echo 'Build complete'"]
-
-[start]
-cmd = "gunicorn --bind 0.0.0.0:$PORT app:app"
+[phases.start]
+# Ensure the application starts with the correct command
+start_cmd = "gunicorn app:app"
 
 [variables]
-NIXPACKS_PYTHON_VERSION = "3.11"
-
+# Set the port for the application
+PORT = "5000"
