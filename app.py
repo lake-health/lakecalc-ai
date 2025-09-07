@@ -37,9 +37,8 @@ def perform_ocr(image_content):
 
 def parse_iol_master_700(text):
     """
-    Parses a ZEISS IOLMaster 700 report using a "Line-by-Line" strategy.
-    It finds all occurrences of a parameter and assumes the first is OD and
-    the second is OS, which is robust for column-based layouts.
+    Parses a ZEISS IOLMaster 700 report using a "Line-by-Line" strategy
+    with non-greedy patterns to correctly capture interleaved data.
     Returns the data in a standardized, logical order.
     """
     key_order = ["source", "axial_length", "acd", "k1", "k2", "ak", "wtw", "cct", "lt"]
@@ -52,33 +51,32 @@ def parse_iol_master_700(text):
     data["OS"]["source"] = "IOL Master 700"
 
     patterns = {
-        "axial_length": r"AL:\s*([\d,.]+\s*mm)",
-        "acd": r"ACD:\s*([\d,.]+\s*mm)",
-        "lt": r"LT:\s*([\d,.]+\s*mm)",
-        "cct": r"CCT:\s*([\d,.]+\s*μm)",
-        "wtw": r"WTW:\s*([\d,.]+\s*mm)",
-        "k1": r"K1:\s*([\d,.]+\s*@\s*\d+°)",
-        "k2": r"K2:\s*([\d,.]+\s*@\s*\d+°)",
-        "ak": r"[ΔA]K:\s*(-?[\d,.]+\s*D\s*@\s*\d+°)"
+        "axial_length": r"AL:\s*([^\n]+)",
+        "acd": r"ACD:\s*([^\n]+)",
+        "lt": r"LT:\s*([^\n]+)",
+        "cct": r"CCT:\s*([^\n]+)",
+        "wtw": r"WTW:\s*([^\n]+)",
+        "k1": r"K1:\s*([^\n]+)",
+        "k2": r"K2:\s*([^\n]+)",
+        "ak": r"[ΔA]K:\s*([^\n]+)"
     }
 
-    # --- KEY CHANGE: Only use the text from the first page for primary biometry ---
     first_page_text = text.split('--- Page ---')[0]
 
     for key, pattern in patterns.items():
-        # Find all matches for the current pattern on the first page
         matches = re.findall(pattern, first_page_text)
         
-        # Clean up the matches to a standard format
-        cleaned_matches = [' '.join(m.strip().replace(',', '.').replace('\n', ' ').split()) for m in matches]
+        def clean_value(val):
+            val = re.sub(r'\s*SD:.*', '', val)
+            return ' '.join(val.strip().replace(',', '.').split())
+
+        cleaned_matches = [clean_value(m) for m in matches]
         
-        # Assign the first found value to OD and the second to OS
         if len(cleaned_matches) > 0:
             data["OD"][key] = cleaned_matches[0]
         if len(cleaned_matches) > 1:
             data["OS"][key] = cleaned_matches[1]
 
-    # Rebuild the final dictionaries to ensure the requested key order
     ordered_data = {
         "OD": {key: data["OD"][key] for key in key_order if data["OD"].get(key) is not None},
         "OS": {key: data["OS"][key] for key in key_order if data["OS"].get(key) is not None}
@@ -86,7 +84,6 @@ def parse_iol_master_700(text):
     return ordered_data
 
 def parse_pentacam(text):
-    # This parser can also be updated to use the ordered dictionary approach
     data = {"OD": {"source": "Pentacam"}, "OS": {"source": "Pentacam"}}
     def find(p, t):
         m = re.search(p, t, re.MULTILINE)
@@ -124,7 +121,7 @@ def parse_clinical_data(text):
 
 @app.route('/api/health')
 def health_check():
-    return jsonify({"status": "running", "version": "3.0.0", "ocr_enabled": bool(client)})
+    return jsonify({"status": "running", "version": "3.1.0", "ocr_enabled": bool(client)})
 
 def process_file_and_parse(file):
     if file.filename.lower().endswith('.pdf'):
