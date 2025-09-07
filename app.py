@@ -37,8 +37,9 @@ def perform_ocr(image_content):
 
 def parse_iol_master_700(text):
     """
-    Parses a ZEISS IOLMaster 700 report using a multi-line strategy
-    based on the ground-truth OCR text. This is the definitive parser.
+    Parses a ZEISS IOLMaster 700 report using a robust 'Search from Label'
+    strategy. This is the final, definitive parser, abandoning all
+    previous failed methods.
     """
     key_order = ["source", "axial_length", "acd", "k1", "k2", "ak", "wtw", "cct", "lt"]
     
@@ -49,42 +50,47 @@ def parse_iol_master_700(text):
     data["OD"]["source"] = "IOL Master 700"
     data["OS"]["source"] = "IOL Master 700"
 
-    # We only need to look at the first page for the core biometric data
-    first_page_text = text.split('--- Page ---')[0]
-
-    # Split the first page into two columns based on a common central element
-    columns = re.split(r'Status de olho|Valores biométricos', first_page_text)
-    od_text = columns[1] if len(columns) > 1 else ""
-    os_text = columns[2] if len(columns) > 2 else ""
-
-    def find_value(text_block, label, value_pattern):
-        # Find the label, then look for the value pattern anywhere after it
-        match = re.search(f"{label}(.*?{value_pattern})", text_block, re.DOTALL)
-        if match:
-            value_match = re.search(value_pattern, match.group(1))
-            if value_match:
-                return ' '.join(value_match.group(0).strip().replace(',', '.').split())
-        return None
-
+    # Define the patterns for each piece of data. Now they are simpler.
     patterns = {
-        "axial_length": r"[\d.]+\s*mm", "acd": r"[\d.]+\s*mm", "lt": r"[\d.]+\s*mm",
-        "cct": r"[\d.]+\s*μm", "wtw": r"[\d.]+\s*mm", "k1": r"[\d.]+\s*D\s*@\s*\d+°",
-        "k2": r"[\d.]+\s*D\s*@\s*\d+°", "ak": r"-?[\d.]+\s*D\s*@\s*\d+°"
-    }
-    labels = {
-        "axial_length": "AL:", "acd": "ACD:", "lt": "LT:", "cct": "CCT:", "wtw": "WTW:",
-        "k1": "K1:", "k2": "K2:", "ak": r"[ΔA]K:"
+        "axial_length": r"AL:\s*([\d,.]+\s*mm)",
+        "acd": r"ACD:\s*([\d,.]+\s*mm)",
+        "lt": r"LT:\s*([\d,.]+\s*mm)",
+        "cct": r"CCT:\s*([\d,.]+\s*μm)",
+        "wtw": r"WTW:\s*([\d,.]+\s*mm)",
+        "k1": r"K1:\s*([\d,.]+\s*D\s*@\s*\d+°)",
+        "k2": r"K2:\s*([\d,.]+\s*D\s*@\s*\d+°)",
+        "ak": r"[ΔA]K:\s*(-?[\d,.]+\s*D\s*@\s*\d+°)"
     }
 
-    for key, label in labels.items():
-        if od_text: data["OD"][key] = find_value(od_text, label, patterns[key])
-        if os_text: data["OS"][key] = find_value(os_text, label, patterns[key])
+    # Find all eye markers and their positions
+    eye_markers = list(re.finditer(r'\b(OD|OS)\b', text))
+
+    for key, pattern in patterns.items():
+        # Find all matches for the current data type
+        matches = list(re.finditer(pattern, text))
+        
+        for match in matches:
+            # For each match, find the most recent eye marker that appeared before it
+            current_pos = match.start()
+            last_eye = None
+            for marker in eye_markers:
+                if marker.start() < current_pos:
+                    last_eye = marker.group(1)
+                else:
+                    break 
+            
+            if last_eye:
+                # Only store the first value we find for each eye to avoid duplicates
+                if data[last_eye][key] is None:
+                    value = match.group(1).strip().replace(',', '.')
+                    data[last_eye][key] = ' '.join(value.split())
 
     ordered_data = {
         "OD": {key: data["OD"][key] for key in key_order if data["OD"].get(key) is not None},
         "OS": {key: data["OS"][key] for key in key_order if data["OS"].get(key) is not None}
     }
     return ordered_data
+
 
 def parse_pentacam(text):
     data = {"OD": {"source": "Pentacam"}, "OS": {"source": "Pentacam"}}
@@ -124,7 +130,7 @@ def parse_clinical_data(text):
 
 @app.route('/api/health')
 def health_check():
-    return jsonify({"status": "running", "version": "4.0.0", "ocr_enabled": bool(client)})
+    return jsonify({"status": "running", "version": "5.0.0", "ocr_enabled": bool(client)})
 
 def process_file_and_parse(file):
     if file.filename.lower().endswith('.pdf'):
