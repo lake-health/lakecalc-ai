@@ -37,8 +37,8 @@ def perform_ocr(image_content):
 
 def parse_iol_master_700(text):
     """
-    Parses a ZEISS IOLMaster 700 report by finding the first unique pair of
-    values for each parameter, assuming the first is OD and the second is OS.
+    Parses a ZEISS IOLMaster 700 report by focusing exclusively on the
+    first page for primary biometry to ensure correct OD/OS association.
     Returns the data in a standardized, logical order.
     """
     key_order = ["source", "axial_length", "acd", "k1", "k2", "ak", "wtw", "cct", "lt"]
@@ -60,9 +60,12 @@ def parse_iol_master_700(text):
         "ak": r"[ΔA]K:\s*(-?[\d,.]+\s*D\s*@\s*\d+°)"
     }
 
+    first_page_text = text.split('--- Page ---')[0]
+
     for key, pattern in patterns.items():
-        matches = re.findall(pattern, text, re.DOTALL)
+        matches = re.findall(pattern, first_page_text, re.DOTALL)
         cleaned_matches = [' '.join(m.strip().replace(',', '.').replace('\n', ' ').split()) for m in matches]
+        
         unique_values = []
         for val in cleaned_matches:
             if val not in unique_values:
@@ -118,17 +121,20 @@ def parse_clinical_data(text):
 
 @app.route('/api/health')
 def health_check():
-    return jsonify({"status": "running", "version": "2.7.0", "ocr_enabled": bool(client)})
+    return jsonify({"status": "running", "version": "2.8.0", "ocr_enabled": bool(client)})
 
 def process_file_and_parse(file):
     if file.filename.lower().endswith('.pdf'):
         pdf_bytes = file.read()
         images = convert_from_bytes(pdf_bytes, fmt='jpeg')
         full_text = ""
-        for page_image in images:
+        # Add a page separator that the parser can use
+        for i, page_image in enumerate(images):
             img_byte_arr = io.BytesIO()
             page_image.save(img_byte_arr, format='JPEG')
-            full_text += perform_ocr(img_byte_arr.getvalue()) + "\n\n--- Page ---\n\n"
+            full_text += perform_ocr(img_byte_arr.getvalue())
+            if i < len(images) - 1:
+                full_text += "\n\n--- Page --- \n\n"
     else:
         image_bytes = file.read()
         full_text = perform_ocr(image_bytes)
