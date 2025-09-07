@@ -38,8 +38,8 @@ def perform_ocr(image_content):
 def parse_iol_master_700(text):
     """
     Parses a ZEISS IOLMaster 700 report using a "Line-by-Line" strategy
-    with non-greedy patterns to correctly capture interleaved data.
-    Returns the data in a standardized, logical order.
+    with refined, non-greedy patterns to correctly capture all data,
+    including the axis for K-values.
     """
     key_order = ["source", "axial_length", "acd", "k1", "k2", "ak", "wtw", "cct", "lt"]
     
@@ -56,9 +56,9 @@ def parse_iol_master_700(text):
         "lt": r"LT:\s*([^\n]+)",
         "cct": r"CCT:\s*([^\n]+)",
         "wtw": r"WTW:\s*([^\n]+)",
-        "k1": r"K1:\s*([^\n]+)",
-        "k2": r"K2:\s*([^\n]+)",
-        "ak": r"[ΔA]K:\s*([^\n]+)"
+        "k1": r"K1:\s*([\d,.]+\s*D\s*@\s*\d+°)",
+        "k2": r"K2:\s*([\d,.]+\s*D\s*@\s*\d+°)",
+        "ak": r"[ΔA]K:\s*(-?[\d,.]+\s*D\s*@\s*\d+°)"
     }
 
     first_page_text = text.split('--- Page ---')[0]
@@ -70,8 +70,13 @@ def parse_iol_master_700(text):
             val = re.sub(r'\s*SD:.*', '', val)
             return ' '.join(val.strip().replace(',', '.').split())
 
-        cleaned_matches = [clean_value(m) for m in matches]
-        
+        # This logic is for the non-K values that still use the broader pattern
+        if key not in ['k1', 'k2', 'ak']:
+             cleaned_matches = [clean_value(m) for m in matches]
+        else:
+            # For the specific K-patterns, the match is already clean
+             cleaned_matches = [' '.join(m.strip().replace(',', '.').split()) for m in matches]
+
         if len(cleaned_matches) > 0:
             data["OD"][key] = cleaned_matches[0]
         if len(cleaned_matches) > 1:
@@ -121,7 +126,7 @@ def parse_clinical_data(text):
 
 @app.route('/api/health')
 def health_check():
-    return jsonify({"status": "running", "version": "3.1.0", "ocr_enabled": bool(client)})
+    return jsonify({"status": "running", "version": "3.2.0", "ocr_enabled": bool(client)})
 
 def process_file_and_parse(file):
     if file.filename.lower().endswith('.pdf'):
