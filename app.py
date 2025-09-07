@@ -37,9 +37,9 @@ def perform_ocr(image_content):
 
 def parse_iol_master_700(text):
     """
-    Parses a ZEISS IOLMaster 700 report by focusing exclusively on the
-    first page for primary biometry to ensure correct OD/OS association.
-    Returns the data in a standardized, logical order.
+    Parses a ZEISS IOLMaster 700 report by isolating OD and OS sections
+    on each page using the universal 'OD' and 'OS' labels. This handles
+    all page types correctly. Returns data in a standardized order.
     """
     key_order = ["source", "axial_length", "acd", "k1", "k2", "ak", "wtw", "cct", "lt"]
     data = {
@@ -60,21 +60,34 @@ def parse_iol_master_700(text):
         "ak": r"[ΔA]K:\s*(-?[\d,.]+\s*D\s*@\s*\d+°)"
     }
 
-    first_page_text = text.split('--- Page ---')[0]
+    pages = text.split('--- Page ---')
 
-    for key, pattern in patterns.items():
-        matches = re.findall(pattern, first_page_text, re.DOTALL)
-        cleaned_matches = [' '.join(m.strip().replace(',', '.').replace('\n', ' ').split()) for m in matches]
+    for page_text in pages:
+        # The OD section starts with 'OD' and ends right before 'OS'
+        od_section_match = re.search(r'\nOD\n(.*?)(?=\nOS\n)', page_text, re.DOTALL)
+        # The OS section starts with 'OS' and goes to the end of the relevant block
+        os_section_match = re.search(r'\nOS\n(.*)', page_text, re.DOTALL)
+
+        od_text = od_section_match.group(1) if od_section_match else ""
+        os_text = os_section_match.group(1) if os_section_match else ""
         
-        unique_values = []
-        for val in cleaned_matches:
-            if val not in unique_values:
-                unique_values.append(val)
+        if not od_text and not os_text:
+            if '\nOD\n' in page_text: od_text = page_text
+            if '\nOS\n' in page_text: os_text = page_text
+
+        if od_text:
+            for key, pattern in patterns.items():
+                match = re.search(pattern, od_text)
+                if match:
+                    cleaned_value = ' '.join(match.group(1).strip().replace(',', '.').replace('\n', ' ').split())
+                    data["OD"][key] = cleaned_value
         
-        if len(unique_values) > 0:
-            data["OD"][key] = unique_values[0]
-        if len(unique_values) > 1:
-            data["OS"][key] = unique_values[1]
+        if os_text:
+            for key, pattern in patterns.items():
+                match = re.search(pattern, os_text)
+                if match:
+                    cleaned_value = ' '.join(match.group(1).strip().replace(',', '.').replace('\n', ' ').split())
+                    data["OS"][key] = cleaned_value
 
     ordered_data = {
         "OD": {key: data["OD"][key] for key in key_order if data["OD"].get(key) is not None},
@@ -83,7 +96,6 @@ def parse_iol_master_700(text):
     return ordered_data
 
 def parse_pentacam(text):
-    # This parser can also be updated to use the ordered dictionary approach
     data = {"OD": {"source": "Pentacam"}, "OS": {"source": "Pentacam"}}
     def find(p, t):
         m = re.search(p, t, re.MULTILINE)
@@ -121,14 +133,13 @@ def parse_clinical_data(text):
 
 @app.route('/api/health')
 def health_check():
-    return jsonify({"status": "running", "version": "2.8.0", "ocr_enabled": bool(client)})
+    return jsonify({"status": "running", "version": "2.10.0", "ocr_enabled": bool(client)})
 
 def process_file_and_parse(file):
     if file.filename.lower().endswith('.pdf'):
         pdf_bytes = file.read()
         images = convert_from_bytes(pdf_bytes, fmt='jpeg')
         full_text = ""
-        # Add a page separator that the parser can use
         for i, page_image in enumerate(images):
             img_byte_arr = io.BytesIO()
             page_image.save(img_byte_arr, format='JPEG')
