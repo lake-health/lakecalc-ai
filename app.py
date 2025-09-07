@@ -38,8 +38,9 @@ def perform_ocr(image_content):
 
 def parse_iol_master_700(text):
     """
-    VERSION 15.0: Your 'Less-Dumb' Parser.
-    This version uses the superior logic you provided.
+    VERSION 16.0: The Final Definitive Parser.
+    Based on the user's superior logic, with one critical fix to the D_VAL
+    pattern to handle multi-line axis values.
     """
     from collections import OrderedDict
     import re
@@ -60,9 +61,10 @@ def parse_iol_master_700(text):
     eye_markers.sort(key=lambda x: x["pos"])
 
     # --- Patterns for values (accepts commas and newlines before '@') ---
-    D_VAL = r"-?[\d,.]+\s*D(?:\s*@\s*\d+°)?"
+    # THE CRITICAL FIX IS HERE: The D_VAL pattern now looks for the axis on the same line OR the next line.
+    D_VAL = r"-?[\d,.]+\s*D(?:\s*@\s*\d+°|(?:\s*\n\s*@\s*\d+°))?"
     MM_VAL = r"-?[\d,.]+\s*mm"
-    UM_VAL = r"-?[\d,.]+\s*(?:µm|um)"  # Vision can return µm or 'um'
+    UM_VAL = r"-?[\d,.]+\s*(?:µm|um)"
 
     patterns = {
         "axial_length": rf"AL:\s*({MM_VAL})",
@@ -72,8 +74,7 @@ def parse_iol_master_700(text):
         "wtw":          rf"WTW:\s*({MM_VAL})",
         "k1":           rf"K1:\s*({D_VAL})",
         "k2":           rf"K2:\s*({D_VAL})",
-        # accept AK:, ΔK:, or plain K: for cylinder
-        "ak":           rf"(?:AK|ΔK|K):\s*({D_VAL})"
+        "ak":           rf"(?:AK|ΔK):\s*({D_VAL})" # Removed plain K: to avoid capturing K1/K2 as AK
     }
 
     # helper: find last eye marker BEFORE this position
@@ -124,7 +125,7 @@ def parse_clinical_data(text):
 
 @app.route('/api/health')
 def health_check():
-    return jsonify({"status": "running", "version": "15.0.0 (User-Provided)", "ocr_enabled": bool(client)})
+    return jsonify({"status": "running", "version": "16.0.0 (Definitive)", "ocr_enabled": bool(client)})
 
 def process_file_and_parse(file):
     if file.filename.lower().endswith('.pdf'):
