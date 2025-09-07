@@ -38,97 +38,101 @@ def perform_ocr(image_content):
 
 def parse_iol_master_700(text):
     """
-    VERSION 10.0: The Definitive Parser.
-    This version uses a line-by-line analysis to correctly associate
-    values with their labels, even when they are on separate lines.
+    VERSION 11.0: The Final Parser.
+    This version uses a context-aware method to split the text into OD and OS
+    blocks before parsing, ensuring data integrity.
     """
-    data = {
-        "OD": OrderedDict([("source", "IOL Master 700"), ("axial_length", None), ("acd", None), ("k1", None), ("k2", None), ("ak", None), ("wtw", None), ("cct", None), ("lt", None)]),
-        "OS": OrderedDict([("source", "IOL Master 700"), ("axial_length", None), ("acd", None), ("k1", None), ("k2", None), ("ak", None), ("wtw", None), ("cct", None), ("lt", None)])
-    }
     
-    lines = text.split('\n')
+    # --- Split text into OD and OS blocks ---
+    od_text = ""
+    os_text = ""
     
-    # --- Find Eye Markers ---
-    eye_markers = []
-    for i, line in enumerate(lines):
-        if "OD" in line and "OS" not in line:
-            eye_markers.append({"eye": "OD", "line": i})
-        elif "OS" in line and "OD" not in line:
-            eye_markers.append({"eye": "OS", "line": i})
+    # Find the start of the side-by-side section
+    match = re.search(r"OD\s+direita\s+OS\s+esquerda", text, re.IGNORECASE)
+    if match:
+        # Split the text based on the header
+        header_pos = match.start()
+        body_text = text[header_pos:]
+        
+        lines = body_text.split('\n')
+        midpoint = len(lines[0]) // 2 # Approximate midpoint
+        
+        for line in lines:
+            od_text += line[:midpoint].strip() + "\n"
+            os_text += line[midpoint:].strip() + "\n"
+    else:
+        # Fallback for single-eye pages
+        if "OD" in text:
+            od_text = text
+        if "OS" in text:
+            os_text = text
 
-    def get_eye_for_line(line_index):
-        last_eye = None
-        for marker in eye_markers:
-            if marker["line"] <= line_index:
-                last_eye = marker["eye"]
-            else:
-                break
-        return last_eye
+    def parse_eye_block(block_text):
+        """Helper function to parse a single block of text for one eye."""
+        eye_data = OrderedDict([("source", "IOL Master 700"), ("axial_length", None), ("acd", None), ("k1", None), ("k2", None), ("ak", None), ("wtw", None), ("cct", None), ("lt", None)])
+        
+        lines = block_text.split('\n')
+        
+        patterns = {
+            "axial_length": r"AL:\s*(-?[\d,.]+\s*mm)",
+            "acd": r"ACD:\s*(-?[\d,.]+\s*mm)",
+            "cct": r"CCT:\s*(-?[\d,.]+\s*μm)",
+            "lt": r"LT:\s*(-?[\d,.]+\s*mm)",
+            "wtw": r"WTW:\s*(-?[\d,.]+\s*mm)",
+            "k1_val": r"K1:\s*(-?[\d,.]+\s*D)",
+            "k2_val": r"K2:\s*(-?[\d,.]+\s*D)",
+            "ak_val": r"[ΔA]K:\s*(-?[\d,.]+\s*D)",
+            "axis": r"@\s*(\d+°)"
+        }
 
-    # --- Define Patterns ---
-    patterns = {
-        "axial_length": r"AL:\s*(-?[\d,.]+\s*mm)",
-        "acd": r"ACD:\s*(-?[\d,.]+\s*mm)",
-        "cct": r"CCT:\s*(-?[\d,.]+\s*μm)",
-        "lt": r"LT:\s*(-?[\d,.]+\s*mm)",
-        "wtw": r"WTW:\s*(-?[\d,.]+\s*mm)",
-        "k1_val": r"K1:\s*(-?[\d,.]+\s*D)",
-        "k2_val": r"K2:\s*(-?[\d,.]+\s*D)",
-        "ak_val": r"[ΔA]K:\s*(-?[\d,.]+\s*D)",
-        "axis": r"@\s*(\d+°)"
-    }
+        temp_storage = {}
 
-    # --- Line-by-Line Extraction ---
-    temp_storage = {} # To hold values like K1 before we find their axis
+        for i, line in enumerate(lines):
+            # Simple values
+            for key, pattern in patterns.items():
+                if "_val" in key or key == "axis": continue
+                match = re.search(pattern, line)
+                if match and not eye_data[key]:
+                    eye_data[key] = match.group(1).strip()
 
-    for i, line in enumerate(lines):
-        eye = get_eye_for_line(i)
-        if not eye:
-            continue
+            # K-values
+            for key_val in ["k1_val", "k2_val", "ak_val"]:
+                match = re.search(patterns[key_val], line)
+                if match:
+                    simple_key = key_val.replace('_val', '')
+                    temp_storage[simple_key] = match.group(1).strip()
 
-        # Check for simple values first
-        for key, pattern in patterns.items():
-            if "_val" in key or key == "axis": continue # Skip complex patterns for now
-            match = re.search(pattern, line)
-            if match and not data[eye][key]:
-                data[eye][key] = match.group(1).strip()
-
-        # Handle K-values (value part)
-        for key_val in ["k1_val", "k2_val", "ak_val"]:
-            match = re.search(patterns[key_val], line)
-            if match:
-                simple_key = key_val.replace('_val', '')
-                temp_storage[f"{eye}_{simple_key}"] = match.group(1).strip()
-
-        # Handle Axis (the "look behind" logic)
-        axis_match = re.search(patterns["axis"], line)
-        if axis_match:
-            axis_val = axis_match.group(0).strip() # Get the full "@ ...°"
-            # Look at the previous line to see what this axis belongs to
-            if i > 0:
-                prev_line = lines[i-1]
-                for key_val in ["k1_val", "k2_val", "ak_val"]:
-                    if re.search(patterns[key_val], prev_line):
-                        simple_key = key_val.replace('_val', '')
-                        # Combine the stored value with the new axis
-                        if f"{eye}_{simple_key}" in temp_storage:
-                            data[eye][simple_key] = f"{temp_storage[f'{eye}_{simple_key}']} {axis_val}"
-                            del temp_storage[f"{eye}_{simple_key}"] # Clean up
-
-    # Final check: if any K-values were found without an axis, assign them
-    for temp_key, value in temp_storage.items():
-        eye, key = temp_key.split('_')
-        if not data[eye][key]:
-            data[eye][key] = value
-
-    # Clean up None values
-    for eye in ["OD", "OS"]:
-        for key, value in list(data[eye].items()):
+            # Axis
+            axis_match = re.search(patterns["axis"], line)
+            if axis_match:
+                axis_val = axis_match.group(0).strip()
+                if i > 0:
+                    prev_line = lines[i-1]
+                    for key_val in ["k1_val", "k2_val", "ak_val"]:
+                        if re.search(patterns[key_val], prev_line):
+                            simple_key = key_val.replace('_val', '')
+                            if simple_key in temp_storage:
+                                eye_data[simple_key] = f"{temp_storage[simple_key]} {axis_val}"
+                                del temp_storage[simple_key]
+        
+        for key, value in temp_storage.items():
+            if not eye_data[key]:
+                eye_data[key] = value
+        
+        # Clean up None values
+        for key, value in list(eye_data.items()):
             if value is None:
-                del data[eye][key]
+                del eye_data[key]
+        
+        return eye_data
 
-    return data
+    final_data = {}
+    if od_text:
+        final_data["OD"] = parse_eye_block(od_text)
+    if os_text:
+        final_data["OS"] = parse_eye_block(os_text)
+
+    return final_data
 
 def parse_pentacam(text):
     # This parser remains unchanged for now
@@ -150,7 +154,7 @@ def parse_clinical_data(text):
 
 @app.route('/api/health')
 def health_check():
-    return jsonify({"status": "running", "version": "10.0.0 (Definitive)", "ocr_enabled": bool(client)})
+    return jsonify({"status": "running", "version": "11.0.0 (Final)", "ocr_enabled": bool(client)})
 
 def process_file_and_parse(file):
     if file.filename.lower().endswith('.pdf'):
@@ -187,7 +191,7 @@ def parse_file_endpoint():
 # --- Frontend Serving Routes ---
 
 @app.route('/')
-def serve_app():
+def serve__app():
     return render_template("index.html")
 
 @app.route('/<path:path>')
