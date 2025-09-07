@@ -37,9 +37,8 @@ def perform_ocr(image_content):
 
 def parse_iol_master_700(text):
     """
-    Parses a ZEISS IOLMaster 700 report using a robust 'Search from Label'
-    strategy with a two-step pattern for K-values to handle multi-line OCR data.
-    This is the definitive, final parser.
+    Parses a ZEISS IOLMaster 700 report. Final version with a polished,
+    non-greedy search area for multi-line K-values.
     """
     key_order = ["source", "axial_length", "acd", "k1", "k2", "ak", "wtw", "cct", "lt"]
     
@@ -50,7 +49,6 @@ def parse_iol_master_700(text):
     data["OD"]["source"] = "IOL Master 700"
     data["OS"]["source"] = "IOL Master 700"
 
-    # Find all eye markers and their positions
     eye_markers = list(re.finditer(r'\b(OD|OS)\b', text))
 
     def get_eye_for_pos(pos):
@@ -62,13 +60,9 @@ def parse_iol_master_700(text):
                 break
         return last_eye
 
-    # --- Process Simple, Single-Line Values First ---
     simple_patterns = {
-        "axial_length": r"AL:\s*([\d,.]+\s*mm)",
-        "acd": r"ACD:\s*([\d,.]+\s*mm)",
-        "lt": r"LT:\s*([\d,.]+\s*mm)",
-        "cct": r"CCT:\s*([\d,.]+\s*μm)",
-        "wtw": r"WTW:\s*([\d,.]+\s*mm)",
+        "axial_length": r"AL:\s*([\d,.]+\s*mm)", "acd": r"ACD:\s*([\d,.]+\s*mm)",
+        "lt": r"LT:\s*([\d,.]+\s*mm)", "cct": r"CCT:\s*([\d,.]+\s*μm)", "wtw": r"WTW:\s*([\d,.]+\s*mm)",
     }
 
     for key, pattern in simple_patterns.items():
@@ -78,19 +72,14 @@ def parse_iol_master_700(text):
                 value = match.group(1).strip().replace(',', '.')
                 data[eye][key] = ' '.join(value.split())
 
-    # --- Process Complex, Multi-Line K-Values ---
-    k_labels = {
-        "k1": r"K1:",
-        "k2": r"K2:",
-        "ak": r"[ΔA]K:"
-    }
+    k_labels = {"k1": r"K1:", "k2": r"K2:", "ak": r"[ΔA]K:"}
 
     for key, label_pattern in k_labels.items():
         for label_match in re.finditer(label_pattern, text):
             eye = get_eye_for_pos(label_match.start())
             if eye and data[eye][key] is None:
-                # Define a search area after the label to find the value and axis
-                search_area = text[label_match.end():label_match.end() + 100] # Look in the next 100 chars
+                # --- THE FIX: Reduced search area from 100 to 30 ---
+                search_area = text[label_match.end():label_match.end() + 30]
                 
                 value_match = re.search(r"(-?[\d,.]+\s*D)", search_area)
                 axis_match = re.search(r"(@\s*\d+°)", search_area)
@@ -144,7 +133,7 @@ def parse_clinical_data(text):
 
 @app.route('/api/health')
 def health_check():
-    return jsonify({"status": "running", "version": "5.1.0", "ocr_enabled": bool(client)})
+    return jsonify({"status": "running", "version": "5.2.0", "ocr_enabled": bool(client)})
 
 def process_file_and_parse(file):
     if file.filename.lower().endswith('.pdf'):
