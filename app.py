@@ -38,7 +38,7 @@ def perform_ocr(image_content):
 def parse_iol_master_700(text):
     """
     Parses a ZEISS IOLMaster 700 report. This is the definitive version,
-    using hyper-specific patterns to correctly parse all values.
+    using a robust "Full Line" strategy to correctly parse all values.
     """
     key_order = ["source", "axial_length", "acd", "k1", "k2", "ak", "wtw", "cct", "lt"]
     
@@ -73,33 +73,30 @@ def parse_iol_master_700(text):
                 value = match.group(1).strip().replace(',', '.')
                 data[eye][key] = ' '.join(value.split())
 
-    # Process Complex, Multi-Line K-Values using the Search Window method
-    k_labels = ["K1:", "K2:", "[ΔA]K:"]
-    all_k_labels_text = "|".join(k_labels)
-
-    for i, label_match in enumerate(re.finditer(f"({all_k_labels_text})", text)):
-        key = {"K1:": "k1", "K2:": "k2"}.get(label_match.group(1), "ak")
-        eye = get_eye_for_pos(label_match.start())
-        
-        if eye and data[eye][key] is None:
-            start_pos = label_match.end()
-            end_pos = len(text)
-
-            next_label_search_area = text[start_pos:]
-            next_label_match = re.search(f"({all_k_labels_text})", next_label_search_area)
-            if next_label_match:
-                end_pos = start_pos + next_label_match.start()
+    # Process Complex, Multi-Line K-Values using the "Full Line" method
+    lines = text.split('\n')
+    for i, line in enumerate(lines):
+        k_match = re.search(r"(K1:|K2:|[ΔA]K:)", line)
+        if k_match:
+            key_label = k_match.group(1)
+            key = {"K1:": "k1", "K2:": "k2"}.get(key_label, "ak")
             
-            search_window = text[start_pos:min(end_pos, start_pos + 100)]
-
-            # HYPER-SPECIFIC PATTERN: Look for a number like "40.95", not "0.01"
-            value_match = re.search(r"(-?\d{2}[\d,.]*\s*D)", search_window)
-            axis_match = re.search(r"(@\s*\d+°)", search_window)
+            # Combine the current line and the next line to form the search area
+            search_area = line
+            if i + 1 < len(lines):
+                search_area += " " + lines[i+1]
             
-            if value_match and axis_match:
-                value = value_match.group(1).strip().replace(',', '.')
-                axis = axis_match.group(1).strip()
-                data[eye][key] = f"{value} {axis}"
+            eye = get_eye_for_pos(text.find(line))
+
+            if eye and data[eye][key] is None:
+                # Find the value and axis within this two-line area
+                value_match = re.search(r"(-?[\d,.]+\s*D)", search_area)
+                axis_match = re.search(r"(@\s*\d+°)", search_area)
+
+                if value_match and axis_match:
+                    value = value_match.group(1).strip().replace(',', '.')
+                    axis = axis_match.group(1).strip()
+                    data[eye][key] = f"{value} {axis}"
 
     ordered_data = {
         "OD": {key: data["OD"][key] for key in key_order if data["OD"].get(key) is not None},
@@ -145,7 +142,7 @@ def parse_clinical_data(text):
 
 @app.route('/api/health')
 def health_check():
-    return jsonify({"status": "running", "version": "6.1.0", "ocr_enabled": bool(client)})
+    return jsonify({"status": "running", "version": "7.0.0", "ocr_enabled": bool(client)})
 
 def process_file_and_parse(file):
     if file.filename.lower().endswith('.pdf'):
