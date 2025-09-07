@@ -38,7 +38,7 @@ def perform_ocr(image_content):
 def parse_iol_master_700(text):
     """
     Parses a ZEISS IOLMaster 700 report. This is the definitive version,
-    using a robust "Full Line" strategy to correctly parse all values.
+    using a robust "Full Line" strategy with a non-greedy axis match.
     """
     key_order = ["source", "axial_length", "acd", "k1", "k2", "ak", "wtw", "cct", "lt"]
     
@@ -81,7 +81,6 @@ def parse_iol_master_700(text):
             key_label = k_match.group(1)
             key = {"K1:": "k1", "K2:": "k2"}.get(key_label, "ak")
             
-            # Combine the current line and the next line to form the search area
             search_area = line
             if i + 1 < len(lines):
                 search_area += " " + lines[i+1]
@@ -89,9 +88,9 @@ def parse_iol_master_700(text):
             eye = get_eye_for_pos(text.find(line))
 
             if eye and data[eye][key] is None:
-                # Find the value and axis within this two-line area
+                # THE FINAL FIX: Make the axis search non-greedy with `?`
                 value_match = re.search(r"(-?[\d,.]+\s*D)", search_area)
-                axis_match = re.search(r"(@\s*\d+°)", search_area)
+                axis_match = re.search(r"(@\s*?\d+°)", search_area) # Added '?' here
 
                 if value_match and axis_match:
                     value = value_match.group(1).strip().replace(',', '.')
@@ -142,7 +141,7 @@ def parse_clinical_data(text):
 
 @app.route('/api/health')
 def health_check():
-    return jsonify({"status": "running", "version": "7.0.0", "ocr_enabled": bool(client)})
+    return jsonify({"status": "running", "version": "7.1.0", "ocr_enabled": bool(client)})
 
 def process_file_and_parse(file):
     if file.filename.lower().endswith('.pdf'):
