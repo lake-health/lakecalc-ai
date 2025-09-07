@@ -37,8 +37,8 @@ def perform_ocr(image_content):
 
 def parse_iol_master_700(text):
     """
-    Parses a ZEISS IOLMaster 700 report. Final version with a polished,
-    non-greedy search area for multi-line K-values.
+    Parses a ZEISS IOLMaster 700 report. This is the definitive version,
+    using a single, robust, multi-line pattern for each K-value.
     """
     key_order = ["source", "axial_length", "acd", "k1", "k2", "ak", "wtw", "cct", "lt"]
     
@@ -60,34 +60,28 @@ def parse_iol_master_700(text):
                 break
         return last_eye
 
-    simple_patterns = {
-        "axial_length": r"AL:\s*([\d,.]+\s*mm)", "acd": r"ACD:\s*([\d,.]+\s*mm)",
-        "lt": r"LT:\s*([\d,.]+\s*mm)", "cct": r"CCT:\s*([\d,.]+\s*μm)", "wtw": r"WTW:\s*([\d,.]+\s*mm)",
+    # A single, powerful pattern for each value
+    patterns = {
+        "axial_length": r"AL:\s*([\d,.]+\s*mm)",
+        "acd": r"ACD:\s*([\d,.]+\s*mm)",
+        "lt": r"LT:\s*([\d,.]+\s*mm)",
+        "cct": r"CCT:\s*([\d,.]+\s*μm)",
+        "wtw": r"WTW:\s*([\d,.]+\s*mm)",
+        # This pattern finds the label, allows any characters (including newlines)
+        # for a short distance, and then finds the value and axis together.
+        "k1": r"K1:[\s\S]{,30}?(-?[\d,.]+\s*D[\s\S]{,30}?@\s*\d+°)",
+        "k2": r"K2:[\s\S]{,30}?(-?[\d,.]+\s*D[\s\S]{,30}?@\s*\d+°)",
+        "ak": r"[ΔA]K:[\s\S]{,30}?(-?[\d,.]+\s*D[\s\S]{,30}?@\s*\d+°)"
     }
 
-    for key, pattern in simple_patterns.items():
+    for key, pattern in patterns.items():
         for match in re.finditer(pattern, text):
             eye = get_eye_for_pos(match.start())
             if eye and data[eye][key] is None:
-                value = match.group(1).strip().replace(',', '.')
+                # The value is now in group(1) for all patterns
+                value = match.group(1).strip().replace(',', '.').replace('\n', ' ')
+                # Consolidate whitespace
                 data[eye][key] = ' '.join(value.split())
-
-    k_labels = {"k1": r"K1:", "k2": r"K2:", "ak": r"[ΔA]K:"}
-
-    for key, label_pattern in k_labels.items():
-        for label_match in re.finditer(label_pattern, text):
-            eye = get_eye_for_pos(label_match.start())
-            if eye and data[eye][key] is None:
-                # --- THE FIX: Reduced search area from 100 to 30 ---
-                search_area = text[label_match.end():label_match.end() + 30]
-                
-                value_match = re.search(r"(-?[\d,.]+\s*D)", search_area)
-                axis_match = re.search(r"(@\s*\d+°)", search_area)
-                
-                if value_match and axis_match:
-                    value = value_match.group(1).strip().replace(',', '.')
-                    axis = axis_match.group(1).strip()
-                    data[eye][key] = f"{value} {axis}"
 
     ordered_data = {
         "OD": {key: data["OD"][key] for key in key_order if data["OD"].get(key) is not None},
@@ -133,7 +127,7 @@ def parse_clinical_data(text):
 
 @app.route('/api/health')
 def health_check():
-    return jsonify({"status": "running", "version": "5.2.0", "ocr_enabled": bool(client)})
+    return jsonify({"status": "running", "version": "5.3.0", "ocr_enabled": bool(client)})
 
 def process_file_and_parse(file):
     if file.filename.lower().endswith('.pdf'):
