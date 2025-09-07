@@ -38,9 +38,9 @@ def perform_ocr(image_content):
 
 def parse_iol_master_700(text):
     """
-    VERSION 17.0: The User's Definitive 'Scavenger' Parser.
-    This version uses the user's superior logic to find the main value
-    and then 'scavenge' for the axis if it's on a different line.
+    VERSION 18.0: The Final Definitive Parser.
+    This version uses the user's 'Scavenger' logic with a critical fix
+    to make the scavenger more 'cautious' and prevent it from stealing axes.
     """
     from collections import OrderedDict
     import re
@@ -57,8 +57,7 @@ def parse_iol_master_700(text):
     eye_markers.sort(key=lambda x: x["pos"])
 
     # --- Value patterns ---
-    AXIS_FLEX = r"(?:@?\s*\d{1,3}\s*(?:°|º|o)?)"
-    D_VAL     = rf"-?[\d,.]+\s*D(?:\s*{AXIS_FLEX})?"
+    D_VAL     = r"-?[\d,.]+\s*D" # We will capture the axis separately
     MM_VAL    = r"-?[\d,.]+\s*mm"
     UM_VAL    = r"-?[\d,.]+\s*(?:µm|um)"
 
@@ -70,7 +69,7 @@ def parse_iol_master_700(text):
         "wtw":          rf"WTW:\s*({MM_VAL})",
         "k1":           rf"K1:\s*({D_VAL})",
         "k2":           rf"K2:\s*({D_VAL})",
-        "ak":           rf"(?:AK|ΔK|K):\s*({D_VAL})"
+        "ak":           rf"(?:AK|ΔK):\s*({D_VAL})"
     }
 
     # Helper: last eye before this position
@@ -83,24 +82,38 @@ def parse_iol_master_700(text):
                 break
         return last_eye or eye_markers[0]["eye"]
 
-    # If axis didn't land in the group, try to pull it from the following chars.
-    AXIS_SCAVENGE = re.compile(r"@\s*(\d{1,3})\s*(?:°|º|o)?")
+    # If axis is missing, try to pull it from the following characters.
+    AXIS_SCAVENGE = re.compile(r"(@\s*\d{1,3}\s*(?:°|º|o))")
 
     for key, pattern in patterns.items():
         for m in re.finditer(pattern, text, flags=re.IGNORECASE):
-            raw = m.group(1)
-            value = re.sub(r"\s+", " ", raw).strip()
+            value = m.group(1).strip()
             eye = eye_before(m.start())
 
-            # Try to attach a missing axis for keratometry/cylinder fields
-            if key in ("k1", "k2", "ak") and "@" not in value:
-                tail = text[m.end(1): m.end(1) + 40]
-                mt = AXIS_SCAVENGE.search(tail)
-                if mt:
-                    value = f"{value} @ {mt.group(1)}°"
+            # Cautious Scavenger: Only look a short distance ahead for the axis.
+            if key in ("k1", "k2", "ak"):
+                # Look in the rest of the matched line first
+                line_end_pos = text.find('\n', m.end())
+                if line_end_pos == -1: line_end_pos = len(text)
+                
+                search_area = text[m.end():line_end_pos]
+                axis_match = AXIS_SCAVENGE.search(search_area)
+                
+                # If not found, check the next line (within a reasonable distance)
+                if not axis_match:
+                    next_line_start = line_end_pos + 1
+                    next_line_end = text.find('\n', next_line_start)
+                    if next_line_end == -1: next_line_end = len(text)
+                    
+                    if next_line_start < len(text):
+                         search_area = text[next_line_start:next_line_end]
+                         axis_match = AXIS_SCAVENGE.search(search_area)
+
+                if axis_match:
+                    value = f"{value} {axis_match.group(1)}"
 
             if eye and not data[eye][key]:
-                data[eye][key] = value
+                data[eye][key] = re.sub(r'\s+', ' ', value).strip()
 
     # prune None entries
     for eye in ("OD", "OS"):
@@ -130,7 +143,7 @@ def parse_clinical_data(text):
 
 @app.route('/api/health')
 def health_check():
-    return jsonify({"status": "running", "version": "17.0.0 (User's Scavenger)", "ocr_enabled": bool(client)})
+    return jsonify({"status": "running", "version": "18.0.0 (Cautious Scavenger)", "ocr_enabled": bool(client)})
 
 def process_file_and_parse(file):
     if file.filename.lower().endswith('.pdf'):
