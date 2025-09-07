@@ -37,45 +37,42 @@ def perform_ocr(image_content):
 
 def parse_iol_master_700(text):
     """
-    Parses the text extracted from a ZEISS IOLMaster 700 report with improved
-    accuracy for columnar data.
+    Parses text from a ZEISS IOLMaster 700 report by processing pages
+    and columns individually for higher accuracy.
     """
     data = {"OD": {"source": "IOL Master 700"}, "OS": {"source": "IOL Master 700"}}
     
-    def find_in_section(patterns, section_text):
-        """Helper to find multiple patterns within a specific text block."""
-        results = {}
-        for key, pattern in patterns.items():
-            matches = re.findall(pattern, section_text, re.MULTILINE)
-            if matches:
-                cleaned_match = matches[0].strip().replace(',', '.').replace('\n', ' ')
-                results[key] = ' '.join(cleaned_match.split())
-        return results
-
-    # Isolate the main biometry data blocks for each eye
-    od_biometry_match = re.search(r'OD\s*direita.*?Valores biométricos(.*?)(?=Cálculo IOL|ZEISS IOLMaster 700)', text, re.DOTALL)
-    os_biometry_match = re.search(r'OS\s*esquerda.*?Valores biométricos(.*?)(?=Cálculo IOL|ZEISS IOLMaster 700)', text, re.DOTALL)
-
-    od_text = od_biometry_match.group(1) if od_biometry_match else ""
-    os_text = os_biometry_match.group(1) if os_biometry_match else ""
-
-    # Define patterns for the values
     patterns = {
-        "axial_length": r"AL:\s*([\d,.]+\s*mm)",
-        "acd": r"ACD:\s*([\d,.]+\s*mm)",
-        "lt": r"LT:\s*([\d,.]+\s*mm)",
-        "cct": r"CCT:\s*([\d,.]+\s*μm)",
-        "wtw": r"WTW:\s*([\d,.]+\s*mm)",
-        "k1": r"K1:\s*([\d,.]+\s*D\s*@\s*\d+°)",
-        "k2": r"K2:\s*([\d,.]+\s*D\s*@\s*\d+°)",
-        "ak": r"AK:\s*(-?[\d,.]+\s*D)"
+        "axial_length": r"AL:\s*([\d,.]+\s*mm)", "acd": r"ACD:\s*([\d,.]+\s*mm)",
+        "lt": r"LT:\s*([\d,.]+\s*mm)", "cct": r"CCT:\s*([\d,.]+\s*μm)",
+        "wtw": r"WTW:\s*([\d,.]+\s*mm)", "k1": r"K1:\s*([\d,.]+\s*D\s*@\s*\d+°)",
+        "k2": r"K2:\s*([\d,.]+\s*D\s*@\s*\d+°)", "ak": r"AK:\s*(-?[\d,.]+\s*D)"
     }
 
-    if od_text:
-        data["OD"].update(find_in_section(patterns, od_text))
-    if os_text:
-        data["OS"].update(find_in_section(patterns, os_text))
-        
+    pages = text.split('--- Page')
+
+    for page_text in pages:
+        od_column_match = re.search(r'OD\s*direita(.*?)(?=OS\s*esquerda)', page_text, re.DOTALL)
+        os_column_match = re.search(r'OS\s*esquerda(.*)', page_text, re.DOTALL)
+
+        od_column_text = od_column_match.group(1) if od_column_match else ''
+        os_column_text = os_column_match.group(1) if os_column_match else ''
+
+        if not od_column_text and 'OD\n' in page_text:
+             od_column_text = page_text
+        if not os_column_text and 'OS\n' in page_text:
+             os_column_text = page_text
+
+        for key, pattern in patterns.items():
+            od_match = re.search(pattern, od_column_text)
+            if od_match:
+                cleaned_value = od_match.group(1).strip().replace(',', '.').replace('\n', ' ')
+                data["OD"][key] = ' '.join(cleaned_value.split())
+
+            os_match = re.search(pattern, os_column_text)
+            if os_match:
+                cleaned_value = os_match.group(1).strip().replace(',', '.').replace('\n', ' ')
+                data["OS"][key] = ' '.join(cleaned_value.split())
     return data
 
 def parse_pentacam(text):
@@ -105,4 +102,60 @@ def parse_pentacam(text):
 # --- MASTER PARSER CONTROLLER ---
 
 def parse_clinical_data(text):
-    if
+    if "IOLMaster 700" in text:
+        return parse_iol_master_700(text)
+    elif "OCULUS PENTACAM" in text:
+        return parse_pentacam(text)
+    else:
+        return {"error": "Unknown device or format", "raw_text": text}
+
+# --- API Routes ---
+
+@app.route('/api/health')
+def health_check():
+    return jsonify({"status": "running", "version": "2.4.0", "ocr_enabled": bool(client)})
+
+def process_file_and_parse(file):
+    if file.filename.lower().endswith('.pdf'):
+        pdf_bytes = file.read()
+        images = convert_from_bytes(pdf_bytes, fmt='jpeg')
+        full_text = ""
+        for page_image in images:
+            img_byte_arr = io.BytesIO()
+            page_image.save(img_byte_arr, format='JPEG')
+            full_text += perform_ocr(img_byte_arr.getvalue()) + "\n\n--- Page ---\n\n"
+    else:
+        image_bytes = file.read()
+        full_text = perform_ocr(image_bytes)
+    
+    return parse_clinical_data(full_text)
+
+@app.route('/api/parse-file', methods=['POST'])
+def parse_file_endpoint():
+    if 'file' not in request.files:
+        return jsonify({"error": "No file part"}), 400
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({"error": "No selected file"}), 400
+    
+    try:
+        structured_data = process_file_and_parse(file)
+        return jsonify(structured_data)
+    except Exception as e:
+        print(f"Error in /api/parse-file: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# --- Frontend Serving Routes ---
+
+@app.route('/')
+def serve_app():
+    return render_template("index.html")
+
+@app.route('/<path:path>')
+def serve_fallback(path):
+    return render_template('index.html')
+
+# --- Main Execution ---
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
