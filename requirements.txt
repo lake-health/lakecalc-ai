@@ -6,3 +6,4 @@ PyPDF2
 gunicorn
 # Use the headless version of OpenCV to avoid GUI dependencies
 opencv-python-headless
+pdf2image
