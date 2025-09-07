@@ -37,8 +37,9 @@ def perform_ocr(image_content):
 
 def parse_iol_master_700(text):
     """
-    Parses text from a ZEISS IOLMaster 700 report using a proximity-based
-    approach and returns the data in a standardized, logical order.
+    Parses a ZEISS IOLMaster 700 report by finding the first unique pair of
+    values for each parameter, assuming the first is OD and the second is OS.
+    Returns the data in a standardized, logical order.
     """
     key_order = ["source", "axial_length", "acd", "k1", "k2", "ak", "wtw", "cct", "lt"]
     data = {
@@ -60,20 +61,18 @@ def parse_iol_master_700(text):
     }
 
     for key, pattern in patterns.items():
-        all_matches = re.finditer(pattern, text, re.DOTALL)
-        for match in all_matches:
-            search_area = text[:match.start()]
-            last_od = search_area.rfind('OD\n')
-            last_os = search_area.rfind('OS\n')
+        matches = re.findall(pattern, text, re.DOTALL)
+        cleaned_matches = [' '.join(m.strip().replace(',', '.').replace('\n', ' ').split()) for m in matches]
+        unique_values = []
+        for val in cleaned_matches:
+            if val not in unique_values:
+                unique_values.append(val)
+        
+        if len(unique_values) > 0:
+            data["OD"][key] = unique_values[0]
+        if len(unique_values) > 1:
+            data["OS"][key] = unique_values[1]
 
-            cleaned_value = match.group(1).strip().replace(',', '.').replace('\n', ' ')
-            final_value = ' '.join(cleaned_value.split())
-
-            if last_od > last_os:
-                data["OD"][key] = final_value
-            elif last_os > last_od:
-                data["OS"][key] = final_value
-    
     ordered_data = {
         "OD": {key: data["OD"][key] for key in key_order if data["OD"].get(key) is not None},
         "OS": {key: data["OS"][key] for key in key_order if data["OS"].get(key) is not None}
@@ -119,7 +118,7 @@ def parse_clinical_data(text):
 
 @app.route('/api/health')
 def health_check():
-    return jsonify({"status": "running", "version": "2.6.0", "ocr_enabled": bool(client)})
+    return jsonify({"status": "running", "version": "2.7.0", "ocr_enabled": bool(client)})
 
 def process_file_and_parse(file):
     if file.filename.lower().endswith('.pdf'):
