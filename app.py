@@ -36,12 +36,57 @@ def perform_ocr(image_content):
 # --- PARSER IMPLEMENTATIONS ---
 
 def parse_iol_master_700(text):
-    # THIS IS THE DEBUGGING VERSION
-    # It returns the raw text so we can see what the parser sees.
-    return {"raw_text_from_ocr": text}
+    """
+    Parses a ZEISS IOLMaster 700 report using a multi-line strategy
+    based on the ground-truth OCR text. This is the definitive parser.
+    """
+    key_order = ["source", "axial_length", "acd", "k1", "k2", "ak", "wtw", "cct", "lt"]
+    
+    data = {
+        "OD": {key: None for key in key_order},
+        "OS": {key: None for key in key_order}
+    }
+    data["OD"]["source"] = "IOL Master 700"
+    data["OS"]["source"] = "IOL Master 700"
+
+    # We only need to look at the first page for the core biometric data
+    first_page_text = text.split('--- Page ---')[0]
+
+    # Split the first page into two columns based on a common central element
+    columns = re.split(r'Status de olho|Valores biométricos', first_page_text)
+    od_text = columns[1] if len(columns) > 1 else ""
+    os_text = columns[2] if len(columns) > 2 else ""
+
+    def find_value(text_block, label, value_pattern):
+        # Find the label, then look for the value pattern anywhere after it
+        match = re.search(f"{label}(.*?{value_pattern})", text_block, re.DOTALL)
+        if match:
+            value_match = re.search(value_pattern, match.group(1))
+            if value_match:
+                return ' '.join(value_match.group(0).strip().replace(',', '.').split())
+        return None
+
+    patterns = {
+        "axial_length": r"[\d.]+\s*mm", "acd": r"[\d.]+\s*mm", "lt": r"[\d.]+\s*mm",
+        "cct": r"[\d.]+\s*μm", "wtw": r"[\d.]+\s*mm", "k1": r"[\d.]+\s*D\s*@\s*\d+°",
+        "k2": r"[\d.]+\s*D\s*@\s*\d+°", "ak": r"-?[\d.]+\s*D\s*@\s*\d+°"
+    }
+    labels = {
+        "axial_length": "AL:", "acd": "ACD:", "lt": "LT:", "cct": "CCT:", "wtw": "WTW:",
+        "k1": "K1:", "k2": "K2:", "ak": r"[ΔA]K:"
+    }
+
+    for key, label in labels.items():
+        if od_text: data["OD"][key] = find_value(od_text, label, patterns[key])
+        if os_text: data["OS"][key] = find_value(os_text, label, patterns[key])
+
+    ordered_data = {
+        "OD": {key: data["OD"][key] for key in key_order if data["OD"].get(key) is not None},
+        "OS": {key: data["OS"][key] for key in key_order if data["OS"].get(key) is not None}
+    }
+    return ordered_data
 
 def parse_pentacam(text):
-    # This parser remains the same
     data = {"OD": {"source": "Pentacam"}, "OS": {"source": "Pentacam"}}
     def find(p, t):
         m = re.search(p, t, re.MULTILINE)
@@ -68,9 +113,7 @@ def parse_pentacam(text):
 # --- MASTER PARSER CONTROLLER ---
 
 def parse_clinical_data(text):
-    # --- DEBUGGING CHANGE ---
     if "IOLMaster 700" in text:
-        # We are now routing to the debug version of the parser
         return parse_iol_master_700(text)
     elif "OCULUS PENTACAM" in text:
         return parse_pentacam(text)
@@ -81,7 +124,7 @@ def parse_clinical_data(text):
 
 @app.route('/api/health')
 def health_check():
-    return jsonify({"status": "running", "version": "3.4.0-debug", "ocr_enabled": bool(client)})
+    return jsonify({"status": "running", "version": "4.0.0", "ocr_enabled": bool(client)})
 
 def process_file_and_parse(file):
     if file.filename.lower().endswith('.pdf'):
