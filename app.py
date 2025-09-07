@@ -38,9 +38,12 @@ def perform_ocr(image_content):
 
 def parse_iol_master_700(text):
     """
-    VERSION 14.0: The Final, Simplified Parser.
-    This version uses a clean, step-by-step process to find and assign all values.
+    VERSION 15.0: Your 'Less-Dumb' Parser.
+    This version uses the superior logic you provided.
     """
+    from collections import OrderedDict
+    import re
+
     data = {
         "OD": OrderedDict([("source", "IOL Master 700"), ("axial_length", None), ("acd", None), ("k1", None), ("k2", None), ("ak", None), ("wtw", None), ("cct", None), ("lt", None)]),
         "OS": OrderedDict([("source", "IOL Master 700"), ("axial_length", None), ("acd", None), ("k1", None), ("k2", None), ("ak", None), ("wtw", None), ("cct", None), ("lt", None)])
@@ -48,49 +51,56 @@ def parse_iol_master_700(text):
 
     # --- Find all eye markers and their positions ---
     eye_markers = []
-    for match in re.finditer(r"\b(OD|OS)\b", text):
-        eye_markers.append({"eye": match.group(1), "pos": match.start()})
-
+    for m in re.finditer(r"\b(OD|OS)\b", text):
+        eye_markers.append({"eye": m.group(1), "pos": m.start()})
     if not eye_markers:
         return {"error": "No OD or OS markers found."}
 
-    def get_closest_eye(position):
-        closest_eye = None
-        min_distance = float('inf')
-        for marker in eye_markers:
-            distance = abs(position - marker["pos"])
-            if distance < min_distance:
-                min_distance = distance
-                closest_eye = marker["eye"]
-        return closest_eye
+    # Sort by position (just to be safe)
+    eye_markers.sort(key=lambda x: x["pos"])
 
-    # --- Define patterns ---
+    # --- Patterns for values (accepts commas and newlines before '@') ---
+    D_VAL = r"-?[\d,.]+\s*D(?:\s*@\s*\d+°)?"
+    MM_VAL = r"-?[\d,.]+\s*mm"
+    UM_VAL = r"-?[\d,.]+\s*(?:µm|um)"  # Vision can return µm or 'um'
+
     patterns = {
-        "axial_length": r"AL:\s*(-?[\d,.]+\s*mm)",
-        "acd": r"ACD:\s*(-?[\d,.]+\s*mm)",
-        "cct": r"CCT:\s*(-?[\d,.]+\s*μm)",
-        "lt": r"LT:\s*(-?[\d,.]+\s*mm)",
-        "wtw": r"WTW:\s*(-?[\d,.]+\s*mm)",
-        "k1": r"K1:\s*(-?[\d,.]+\s*D(?:\s*@\s*\d+°)*)",
-        "k2": r"K2:\s*(-?[\d,.]+\s*D(?:\s*@\s*\d+°)*)",
-        "ak": r"[ΔA]K:\s*(-?[\d,.]+\s*D(?:\s*@\s*\d+°)*)"
+        "axial_length": rf"AL:\s*({MM_VAL})",
+        "acd":          rf"ACD:\s*({MM_VAL})",
+        "cct":          rf"CCT:\s*({UM_VAL})",
+        "lt":           rf"LT:\s*({MM_VAL})",
+        "wtw":          rf"WTW:\s*({MM_VAL})",
+        "k1":           rf"K1:\s*({D_VAL})",
+        "k2":           rf"K2:\s*({D_VAL})",
+        # accept AK:, ΔK:, or plain K: for cylinder
+        "ak":           rf"(?:AK|ΔK|K):\s*({D_VAL})"
     }
 
-    # --- Find all values and assign to the closest eye ---
-    for key, pattern in patterns.items():
-        for match in re.finditer(pattern, text):
-            value = match.group(1).strip().replace('\n', ' ')
-            value = re.sub(r'\s+', ' ', value)
-            
-            closest_eye = get_closest_eye(match.start())
-            if closest_eye and not data[closest_eye][key]:
-                data[closest_eye][key] = value
+    # helper: find last eye marker BEFORE this position
+    def eye_before(pos):
+        last_eye = None
+        for marker in eye_markers:
+            if marker["pos"] <= pos:
+                last_eye = marker["eye"]
+            else:
+                break
+        return last_eye or eye_markers[0]["eye"]
 
-    # Clean up None values
-    for eye in ["OD", "OS"]:
-        for key, value in list(data[eye].items()):
-            if value is None:
-                del data[eye][key]
+    # --- Extract and assign ---
+    for key, pattern in patterns.items():
+        for m in re.finditer(pattern, text, flags=re.IGNORECASE):
+            raw = m.group(1)
+            # normalize internal whitespace/newlines like "D\n@ 75°"
+            value = re.sub(r"\s+", " ", raw).strip()
+            eye = eye_before(m.start())
+            if eye and not data[eye][key]:
+                data[eye][key] = value
+
+    # remove missing keys
+    for eye in ("OD", "OS"):
+        for k in list(data[eye].keys()):
+            if data[eye][k] is None:
+                del data[eye][k]
 
     return data
 
@@ -114,7 +124,7 @@ def parse_clinical_data(text):
 
 @app.route('/api/health')
 def health_check():
-    return jsonify({"status": "running", "version": "14.0.0 (Simplified)", "ocr_enabled": bool(client)})
+    return jsonify({"status": "running", "version": "15.0.0 (User-Provided)", "ocr_enabled": bool(client)})
 
 def process_file_and_parse(file):
     if file.filename.lower().endswith('.pdf'):
