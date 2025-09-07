@@ -36,50 +36,12 @@ def perform_ocr(image_content):
 # --- PARSER IMPLEMENTATIONS ---
 
 def parse_iol_master_700(text):
-    """
-    Parses a ZEISS IOLMaster 700 report using a "Line-by-Line" strategy
-    with corrected, non-destructive cleaning logic.
-    """
-    key_order = ["source", "axial_length", "acd", "k1", "k2", "ak", "wtw", "cct", "lt"]
-    
-    data = {
-        "OD": {key: None for key in key_order},
-        "OS": {key: None for key in key_order}
-    }
-    data["OD"]["source"] = "IOL Master 700"
-    data["OS"]["source"] = "IOL Master 700"
-
-    patterns = {
-        "axial_length": r"AL:\s*([\d,.]+\s*mm)",
-        "acd": r"ACD:\s*([\d,.]+\s*mm)",
-        "lt": r"LT:\s*([\d,.]+\s*mm)",
-        "cct": r"CCT:\s*([\d,.]+\s*μm)",
-        "wtw": r"WTW:\s*([\d,.]+\s*mm)",
-        "k1": r"K1:\s*([\d,.]+\s*D\s*@\s*\d+°)",
-        "k2": r"K2:\s*([\d,.]+\s*D\s*@\s*\d+°)",
-        "ak": r"[ΔA]K:\s*(-?[\d,.]+\s*D\s*@\s*\d+°)"
-    }
-
-    first_page_text = text.split('--- Page ---')[0]
-
-    for key, pattern in patterns.items():
-        matches = re.findall(pattern, first_page_text)
-        
-        # Simple, non-destructive cleaning
-        cleaned_matches = [' '.join(m.strip().replace(',', '.').split()) for m in matches]
-        
-        if len(cleaned_matches) > 0:
-            data["OD"][key] = cleaned_matches[0]
-        if len(cleaned_matches) > 1:
-            data["OS"][key] = cleaned_matches[1]
-
-    ordered_data = {
-        "OD": {key: data["OD"][key] for key in key_order if data["OD"].get(key) is not None},
-        "OS": {key: data["OS"][key] for key in key_order if data["OS"].get(key) is not None}
-    }
-    return ordered_data
+    # THIS IS THE DEBUGGING VERSION
+    # It returns the raw text so we can see what the parser sees.
+    return {"raw_text_from_ocr": text}
 
 def parse_pentacam(text):
+    # This parser remains the same
     data = {"OD": {"source": "Pentacam"}, "OS": {"source": "Pentacam"}}
     def find(p, t):
         m = re.search(p, t, re.MULTILINE)
@@ -106,7 +68,9 @@ def parse_pentacam(text):
 # --- MASTER PARSER CONTROLLER ---
 
 def parse_clinical_data(text):
+    # --- DEBUGGING CHANGE ---
     if "IOLMaster 700" in text:
+        # We are now routing to the debug version of the parser
         return parse_iol_master_700(text)
     elif "OCULUS PENTACAM" in text:
         return parse_pentacam(text)
@@ -117,7 +81,7 @@ def parse_clinical_data(text):
 
 @app.route('/api/health')
 def health_check():
-    return jsonify({"status": "running", "version": "3.3.0", "ocr_enabled": bool(client)})
+    return jsonify({"status": "running", "version": "3.4.0-debug", "ocr_enabled": bool(client)})
 
 def process_file_and_parse(file):
     if file.filename.lower().endswith('.pdf'):
