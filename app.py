@@ -38,7 +38,7 @@ def perform_ocr(image_content):
 def parse_iol_master_700(text):
     """
     Parses a ZEISS IOLMaster 700 report. This is the definitive version,
-    using a robust negative lookahead to prevent greedy, cross-label matching.
+    using a robust "Search Window" method to correctly parse all values.
     """
     key_order = ["source", "axial_length", "acd", "k1", "k2", "ak", "wtw", "cct", "lt"]
     
@@ -60,27 +60,49 @@ def parse_iol_master_700(text):
                 break
         return last_eye
 
-    # Negative lookahead to prevent matching across labels
-    stop_at = r"(?!AL:|ACD:|LT:|CCT:|WTW:|K1:|K2:|AK:|ΔK:)"
-    
-    patterns = {
-        "axial_length": r"AL:\s*(" + stop_at + r"[\s\S])*?([\d,.]+\s*mm)",
-        "acd": r"ACD:\s*(" + stop_at + r"[\s\S])*?([\d,.]+\s*mm)",
-        "lt": r"LT:\s*(" + stop_at + r"[\s\S])*?([\d,.]+\s*mm)",
-        "cct": r"CCT:\s*(" + stop_at + r"[\s\S])*?([\d,.]+\s*μm)",
-        "wtw": r"WTW:\s*(" + stop_at + r"[\s\S])*?([\d,.]+\s*mm)",
-        "k1": r"K1:\s*(" + stop_at + r"[\s\S])*?(-?[\d,.]+\s*D\s*@\s*\d+°)",
-        "k2": r"K2:\s*(" + stop_at + r"[\s\S])*?(-?[\d,.]+\s*D\s*@\s*\d+°)",
-        "ak": r"[ΔA]K:\s*(" + stop_at + r"[\s\S])*?(-?[\d,.]+\s*D\s*@\s*\d+°)"
+    # Process Simple, Single-Line Values First
+    simple_patterns = {
+        "axial_length": r"AL:\s*([\d,.]+\s*mm)", "acd": r"ACD:\s*([\d,.]+\s*mm)",
+        "lt": r"LT:\s*([\d,.]+\s*mm)", "cct": r"CCT:\s*([\d,.]+\s*μm)", "wtw": r"WTW:\s*([\d,.]+\s*mm)",
     }
 
-    for key, pattern in patterns.items():
+    for key, pattern in simple_patterns.items():
         for match in re.finditer(pattern, text):
             eye = get_eye_for_pos(match.start())
             if eye and data[eye][key] is None:
-                # The desired value is now in the last captured group
-                value = match.groups()[-1].strip().replace(',', '.').replace('\n', ' ')
+                value = match.group(1).strip().replace(',', '.')
                 data[eye][key] = ' '.join(value.split())
+
+    # Process Complex, Multi-Line K-Values using the Search Window method
+    k_labels = ["K1:", "K2:", "[ΔA]K:"]
+    all_k_labels_text = "|".join(k_labels)
+
+    for i, label_match in enumerate(re.finditer(f"({all_k_labels_text})", text)):
+        key = {"K1:": "k1", "K2:": "k2"}.get(label_match.group(1), "ak")
+        eye = get_eye_for_pos(label_match.start())
+        
+        if eye and data[eye][key] is None:
+            # Define the search window: from the end of the current label
+            # to the start of the next K-label, or 100 chars, whichever is shorter.
+            start_pos = label_match.end()
+            end_pos = len(text)
+
+            # Find the next K-label to define the end of our window
+            next_label_search_area = text[start_pos:]
+            next_label_match = re.search(f"({all_k_labels_text})", next_label_search_area)
+            if next_label_match:
+                end_pos = start_pos + next_label_match.start()
+            
+            # Limit window to a reasonable size
+            search_window = text[start_pos:min(end_pos, start_pos + 100)]
+
+            value_match = re.search(r"(-?[\d,.]+\s*D)", search_window)
+            axis_match = re.search(r"(@\s*\d+°)", search_window)
+            
+            if value_match and axis_match:
+                value = value_match.group(1).strip().replace(',', '.')
+                axis = axis_match.group(1).strip()
+                data[eye][key] = f"{value} {axis}"
 
     ordered_data = {
         "OD": {key: data["OD"][key] for key in key_order if data["OD"].get(key) is not None},
@@ -126,7 +148,7 @@ def parse_clinical_data(text):
 
 @app.route('/api/health')
 def health_check():
-    return jsonify({"status": "running", "version": "5.4.0", "ocr_enabled": bool(client)})
+    return jsonify({"status": "running", "version": "6.0.0", "ocr_enabled": bool(client)})
 
 def process_file_and_parse(file):
     if file.filename.lower().endswith('.pdf'):
