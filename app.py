@@ -38,7 +38,7 @@ def perform_ocr(image_content):
 def parse_iol_master_700(text):
     """
     Parses a ZEISS IOLMaster 700 report. This is the definitive version,
-    using a robust "Search Window" method to correctly parse all values.
+    using hyper-specific patterns to correctly parse all values.
     """
     key_order = ["source", "axial_length", "acd", "k1", "k2", "ak", "wtw", "cct", "lt"]
     
@@ -82,21 +82,18 @@ def parse_iol_master_700(text):
         eye = get_eye_for_pos(label_match.start())
         
         if eye and data[eye][key] is None:
-            # Define the search window: from the end of the current label
-            # to the start of the next K-label, or 100 chars, whichever is shorter.
             start_pos = label_match.end()
             end_pos = len(text)
 
-            # Find the next K-label to define the end of our window
             next_label_search_area = text[start_pos:]
             next_label_match = re.search(f"({all_k_labels_text})", next_label_search_area)
             if next_label_match:
                 end_pos = start_pos + next_label_match.start()
             
-            # Limit window to a reasonable size
             search_window = text[start_pos:min(end_pos, start_pos + 100)]
 
-            value_match = re.search(r"(-?[\d,.]+\s*D)", search_window)
+            # HYPER-SPECIFIC PATTERN: Look for a number like "40.95", not "0.01"
+            value_match = re.search(r"(-?\d{2}[\d,.]*\s*D)", search_window)
             axis_match = re.search(r"(@\s*\d+°)", search_window)
             
             if value_match and axis_match:
@@ -148,7 +145,7 @@ def parse_clinical_data(text):
 
 @app.route('/api/health')
 def health_check():
-    return jsonify({"status": "running", "version": "6.0.0", "ocr_enabled": bool(client)})
+    return jsonify({"status": "running", "version": "6.1.0", "ocr_enabled": bool(client)})
 
 def process_file_and_parse(file):
     if file.filename.lower().endswith('.pdf'):
