@@ -1,3 +1,4 @@
+# app.py
 from flask import Flask, jsonify, request, render_template
 from google.cloud import vision
 import os
@@ -6,13 +7,17 @@ import re
 from pdf2image import convert_from_bytes
 from collections import OrderedDict
 
-# Initialize Flask App
+# ---------------------------
+# Flask
+# ---------------------------
 app = Flask(__name__, static_folder='static', template_folder='templates')
 
-# --- Google Cloud Vision Client Setup ---
+# ---------------------------
+# Google Cloud Vision setup
+# ---------------------------
 client = None
 try:
-    credentials_json_str = os.environ.get('GOOGLE_APPLICATION_CREDENTIALS_JSON')
+    credentials_json_str = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
     if credentials_json_str:
         from google.oauth2 import service_account
         import json
@@ -20,46 +25,77 @@ try:
         credentials = service_account.Credentials.from_service_account_info(credentials_info)
         client = vision.ImageAnnotatorClient(credentials=credentials)
     else:
-        print("WARNING: GOOGLE_APPLICATION_CREDENTIALS_JSON not set. OCR may not function.")
+        # If you’re running on GCP with a service account file on disk,
+        # set GOOGLE_APPLICATION_CREDENTIALS to the path and drop the JSON env var.
+        # Otherwise OCR will be disabled and the endpoint will raise a helpful error.
+        if os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
+            client = vision.ImageAnnotatorClient()
+        else:
+            print("WARNING: No Vision credentials found. Set GOOGLE_APPLICATION_CREDENTIALS_JSON or GOOGLE_APPLICATION_CREDENTIALS.")
 except Exception as e:
     print(f"Error initializing Google Cloud Vision client: {e}")
 
-# --- Core OCR Function ---
-def perform_ocr(image_content):
+# ---------------------------
+# OCR helper
+# ---------------------------
+def perform_ocr(image_content: bytes) -> str:
     if not client:
-        raise Exception("Google Cloud Vision client is not initialized.")
+        raise RuntimeError(
+            "Google Cloud Vision client is not initialized. "
+            "Set GOOGLE_APPLICATION_CREDENTIALS_JSON (recommended) or GOOGLE_APPLICATION_CREDENTIALS."
+        )
     image = vision.Image(content=image_content)
     response = client.text_detection(image=image)
     if response.error.message:
-        raise Exception(f"Vision API Error: {response.error.message}")
+        raise RuntimeError(f"Vision API Error: {response.error.message}")
     return response.text_annotations[0].description if response.text_annotations else ""
 
-# --- PARSER IMPLEMENTATIONS ---
+# ---------------------------
+# Parsers
+# ---------------------------
 
-def parse_iol_master_700(text):
+def parse_iol_master_700(text: str) -> dict:
     """
-    VERSION 19.0: The User's Definitive Parser.
-    This version uses the user's superior 'Cautious Scavenger' logic.
-    It correctly prioritizes 1-2 digit axes and uses a strict search window.
-    """
-    from collections import OrderedDict
-    import re
+    Robust parser for IOLMaster 700 blocks.
 
+    - Assigns each metric to the last eye marker (OD/OS) that appears BEFORE it.
+    - Captures K1/K2/AK values with inline axes (when present), and
+      scavenges axis from the same line (or until next label) when OCR splits it.
+    - Accepts degree variants ° / º / o and commas for decimals (keeps raw text).
+    """
     data = {
-        "OD": OrderedDict([("source", "IOL Master 700"), ("axial_length", None), ("acd", None), ("k1", None), ("k2", None), ("ak", None), ("wtw", None), ("cct", None), ("lt", None)]),
-        "OS": OrderedDict([("source", "IOL Master 700"), ("axial_length", None), ("acd", None), ("k1", None), ("k2", None), ("ak", None), ("wtw", None), ("cct", None), ("lt", None)])
+        "OD": OrderedDict([
+            ("source", "IOL Master 700"),
+            ("axial_length", None), ("acd", None), ("k1", None),
+            ("k2", None), ("ak", None), ("wtw", None), ("cct", None), ("lt", None)
+        ]),
+        "OS": OrderedDict([
+            ("source", "IOL Master 700"),
+            ("axial_length", None), ("acd", None), ("k1", None),
+            ("k2", None), ("ak", None), ("wtw", None), ("cct", None), ("lt", None)
+        ])
     }
 
-    # --- Eye markers ---
+    # --- Find eye markers (OD/OS) and positions
     eye_markers = [{"eye": m.group(1), "pos": m.start()} for m in re.finditer(r"\b(OD|OS)\b", text)]
     if not eye_markers:
         return {"error": "No OD or OS markers found."}
     eye_markers.sort(key=lambda x: x["pos"])
 
-    # --- Value patterns ---
-    D_VAL     = r"-?[\d,.]+\s*D"
-    MM_VAL    = r"-?[\d,.]+\s*mm"
-    UM_VAL    = r"-?[\d,.]+\s*(?:µm|um)"
+    def eye_before(position: int) -> str:
+        last = None
+        for marker in eye_markers:
+            if marker["pos"] <= position:
+                last = marker["eye"]
+            else:
+                break
+        return last or eye_markers[0]["eye"]
+
+    # --- Patterns
+    AXIS_INLINE = r"\s*@\s*\d{1,3}\s*(?:°|º|o)"
+    D_VAL       = rf"-?[\d,.]+\s*D(?:{AXIS_INLINE})?"   # diopters with optional inline axis
+    MM_VAL      = r"-?[\d,.]+\s*mm"
+    UM_VAL      = r"-?[\d,.]+\s*(?:µm|um)"
 
     patterns = {
         "axial_length": rf"AL:\s*({MM_VAL})",
@@ -69,53 +105,44 @@ def parse_iol_master_700(text):
         "wtw":          rf"WTW:\s*({MM_VAL})",
         "k1":           rf"K1:\s*({D_VAL})",
         "k2":           rf"K2:\s*({D_VAL})",
-        "ak":           rf"(?:AK|ΔK):\s*({D_VAL})"
+        # On many IOLMaster printouts the cylinder line is "K:" (sometimes AK or ΔK)
+        "ak":           rf"(?:AK|ΔK|K):\s*({D_VAL})",
     }
 
-    # Helper: last eye before this position
-    def eye_before(pos):
-        last_eye = None
-        for marker in eye_markers:
-            if marker["pos"] <= pos:
-                last_eye = marker["eye"]
-            else:
-                break
-        return last_eye or eye_markers[0]["eye"]
+    # Stop scavenging at newline OR at the next metric label
+    LABEL_STOP = re.compile(r"(?:\r?\n|(?=(?:AL|ACD|CCT|LT|WTW|K1|K2|K|AK|ΔK)\s*:))", re.IGNORECASE)
 
-    # --- User's Superior Scavenger Logic ---
-    AXIS_1_2 = re.compile(r"@\s*(\d{1,2})\s*(?:°|º|o)\b")
-    AXIS_3   = re.compile(r"@\s*(\d{3})\s*(?:°|º|o)\b")
+    # Accept axes with or without '@'
+    AXIS_PREFER_1_2 = re.compile(r"(?:@?\s*)(\d{1,2})\s*(?:°|º|o)\b")  # 0–99
+    AXIS_FALLBACK_3 = re.compile(r"(?:@?\s*)(\d{3})\s*(?:°|º|o)\b")    # 100–999 (rare, but robust)
 
     def scavenge_axis(tail: str) -> str | None:
-        stop_pos = len(tail)
-        for sep in ("\n", "\r", ":"):
-            p = tail.find(sep)
-            if p != -1:
-                stop_pos = min(stop_pos, p)
-        window = tail[:min(stop_pos, 14)]
-
-        m = AXIS_1_2.search(window)
+        mstop = LABEL_STOP.search(tail)
+        segment = tail[:mstop.start()] if mstop else tail
+        window = segment[:40]  # cap to stay on the same line / vicinity
+        m = AXIS_PREFER_1_2.search(window)
         if m:
             return m.group(1)
-        m = AXIS_3.search(window)
-        if m:
-            return m.group(1)
-        return None
+        m = AXIS_FALLBACK_3.search(window)
+        return m.group(1) if m else None
 
+    # --- Extract & assign
     for key, pattern in patterns.items():
         for m in re.finditer(pattern, text, flags=re.IGNORECASE):
-            value = m.group(1).strip()
+            raw = m.group(1)
+            value = re.sub(r"\s+", " ", raw).strip()
             eye = eye_before(m.start())
 
+            # If inline axis isn't present, try scavenging from same line/next chars
             if key in ("k1", "k2", "ak") and "@" not in value:
-                axis = scavenge_axis(text[m.end(1): m.end(1) + 40])
+                axis = scavenge_axis(text[m.end(1): m.end(1) + 100])
                 if axis:
                     value = f"{value} @ {axis}°"
 
             if eye and not data[eye][key]:
-                data[eye][key] = re.sub(r'\s+', ' ', value).strip()
+                data[eye][key] = value
 
-    # prune None entries
+    # Remove None fields to keep output tidy
     for eye in ("OD", "OS"):
         for k in list(data[eye].keys()):
             if data[eye][k] is None:
@@ -123,71 +150,101 @@ def parse_iol_master_700(text):
 
     return data
 
-def parse_pentacam(text):
-    # This parser remains unchanged for now
-    data = {"OD": {"source": "Pentacam"}, "OS": {"source": "Pentacam"}}
-    # ... (rest of pentacam parser is omitted for brevity but is included in the final code)
-    return data
 
-# --- MASTER PARSER CONTROLLER ---
+def parse_pentacam(text: str) -> dict:
+    # Minimal stub, expand as needed
+    return {"OD": {"source": "Pentacam"}, "OS": {"source": "Pentacam"}}
 
-def parse_clinical_data(text):
-    if "IOLMaster 700" in text:
+
+def parse_clinical_data(text: str) -> dict:
+    if "IOLMaster 700" in text or "IOL Master 700" in text:
         return parse_iol_master_700(text)
-    elif "OCULUS PENTACAM" in text:
+    if "OCULUS PENTACAM" in text or "Pentacam" in text:
         return parse_pentacam(text)
-    else:
-        return {"error": "Unknown device or format", "raw_text": text}
+    return {"error": "Unknown device or format", "raw_text": text}
 
-# --- API Routes ---
+# ---------------------------
+# Routes
+# ---------------------------
 
-@app.route('/api/health')
+@app.route("/api/health")
 def health_check():
-    return jsonify({"status": "running", "version": "19.0.0 (User's Definitive Parser)", "ocr_enabled": bool(client)})
+    return jsonify({
+        "status": "running",
+        "version": "20.0.0 (IOLMaster robust axis)",
+        "ocr_enabled": bool(client)
+    })
 
-def process_file_and_parse(file):
-    if file.filename.lower().endswith('.pdf'):
-        pdf_bytes = file.read()
-        images = convert_from_bytes(pdf_bytes, fmt='jpeg')
-        full_text = ""
+
+def process_file_and_parse(file_storage) -> dict:
+    filename = (file_storage.filename or "").lower()
+
+    if filename.endswith(".pdf"):
+        pdf_bytes = file_storage.read()
+        images = convert_from_bytes(pdf_bytes, fmt="jpeg")
+        full_text = []
         for i, page_image in enumerate(images):
-            img_byte_arr = io.BytesIO()
-            page_image.save(img_byte_arr, format='JPEG')
-            full_text += perform_ocr(img_byte_arr.getvalue())
-            if i < len(images) - 1:
-                full_text += "\n\n--- Page --- \n\n"
+            img_buf = io.BytesIO()
+            page_image.save(img_buf, format="JPEG")
+            full_text.append(perform_ocr(img_buf.getvalue()))
+        text = "\n\n--- Page ---\n\n".join(full_text)
     else:
-        image_bytes = file.read()
-        full_text = perform_ocr(image_bytes)
-    
-    return parse_clinical_data(full_text)
+        # png/jpg/jpeg/tiff, etc.
+        image_bytes = file_storage.read()
+        text = perform_ocr(image_bytes)
 
-@app.route('/api/parse-file', methods=['POST'])
+    return parse_clinical_data(text)
+
+
+@app.route("/api/parse-file", methods=["POST"])
 def parse_file_endpoint():
-    if 'file' not in request.files:
+    if "file" not in request.files:
         return jsonify({"error": "No file part"}), 400
-    file = request.files['file']
-    if file.filename == '':
+    file = request.files["file"]
+    if not file or file.filename == "":
         return jsonify({"error": "No selected file"}), 400
-    
+
     try:
-        structured_data = process_file_and_parse(file)
-        return jsonify(structured_data)
+        structured = process_file_and_parse(file)
+        return jsonify(structured)
     except Exception as e:
         print(f"Error in /api/parse-file: {e}")
         return jsonify({"error": str(e)}), 500
 
-# --- Frontend Serving Routes ---
 
-@app.route('/')
+# Basic front-end (optional template). If you don’t have templates, this still works.
+@app.route("/")
 def serve_app():
-    return render_template("index.html")
+    # If you have templates/index.html, this will render it.
+    # Otherwise, a tiny inline page to test the endpoint.
+    try:
+        return render_template("index.html")
+    except Exception:
+        return """
+        <html>
+          <body style="font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;">
+            <h2>/api/parse-file tester</h2>
+            <form action="/api/parse-file" method="post" enctype="multipart/form-data">
+              <input type="file" name="file" />
+              <button type="submit">Upload & Parse</button>
+            </form>
+            <p>Health: <a href="/api/health">/api/health</a></p>
+          </body>
+        </html>
+        """
 
-@app.route('/<path:path>')
+
+@app.route("/<path:path>")
 def serve_fallback(path):
-    return render_template('index.html')
+    try:
+        return render_template("index.html")
+    except Exception:
+        return jsonify({"ok": True, "route": path})
 
-# --- Main Execution ---
+
+# ---------------------------
+# Main
+# ---------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host="0.0.0.0", port=port)
