@@ -38,101 +38,62 @@ def perform_ocr(image_content):
 
 def parse_iol_master_700(text):
     """
-    VERSION 11.0: The Final Parser.
-    This version uses a context-aware method to split the text into OD and OS
-    blocks before parsing, ensuring data integrity.
+    VERSION 12.0: The 'Dumb' Parser.
+    This version abandons all complex logic and uses the simplest possible approach:
+    1. Find all values.
+    2. Find all eye markers.
+    3. Assign each value to the closest eye marker.
     """
-    
-    # --- Split text into OD and OS blocks ---
-    od_text = ""
-    os_text = ""
-    
-    # Find the start of the side-by-side section
-    match = re.search(r"OD\s+direita\s+OS\s+esquerda", text, re.IGNORECASE)
-    if match:
-        # Split the text based on the header
-        header_pos = match.start()
-        body_text = text[header_pos:]
-        
-        lines = body_text.split('\n')
-        midpoint = len(lines[0]) // 2 # Approximate midpoint
-        
-        for line in lines:
-            od_text += line[:midpoint].strip() + "\n"
-            os_text += line[midpoint:].strip() + "\n"
-    else:
-        # Fallback for single-eye pages
-        if "OD" in text:
-            od_text = text
-        if "OS" in text:
-            os_text = text
+    data = {
+        "OD": OrderedDict([("source", "IOL Master 700"), ("axial_length", None), ("acd", None), ("k1", None), ("k2", None), ("ak", None), ("wtw", None), ("cct", None), ("lt", None)]),
+        "OS": OrderedDict([("source", "IOL Master 700"), ("axial_length", None), ("acd", None), ("k1", None), ("k2", None), ("ak", None), ("wtw", None), ("cct", None), ("lt", None)])
+    }
 
-    def parse_eye_block(block_text):
-        """Helper function to parse a single block of text for one eye."""
-        eye_data = OrderedDict([("source", "IOL Master 700"), ("axial_length", None), ("acd", None), ("k1", None), ("k2", None), ("ak", None), ("wtw", None), ("cct", None), ("lt", None)])
-        
-        lines = block_text.split('\n')
-        
-        patterns = {
-            "axial_length": r"AL:\s*(-?[\d,.]+\s*mm)",
-            "acd": r"ACD:\s*(-?[\d,.]+\s*mm)",
-            "cct": r"CCT:\s*(-?[\d,.]+\s*μm)",
-            "lt": r"LT:\s*(-?[\d,.]+\s*mm)",
-            "wtw": r"WTW:\s*(-?[\d,.]+\s*mm)",
-            "k1_val": r"K1:\s*(-?[\d,.]+\s*D)",
-            "k2_val": r"K2:\s*(-?[\d,.]+\s*D)",
-            "ak_val": r"[ΔA]K:\s*(-?[\d,.]+\s*D)",
-            "axis": r"@\s*(\d+°)"
-        }
+    # --- Find all eye markers and their positions ---
+    eye_markers = []
+    for match in re.finditer(r"\b(OD|OS)\b", text):
+        eye_markers.append({"eye": match.group(1), "pos": match.start()})
 
-        temp_storage = {}
+    if not eye_markers:
+        return {"error": "No OD or OS markers found."}
 
-        for i, line in enumerate(lines):
-            # Simple values
-            for key, pattern in patterns.items():
-                if "_val" in key or key == "axis": continue
-                match = re.search(pattern, line)
-                if match and not eye_data[key]:
-                    eye_data[key] = match.group(1).strip()
+    # --- Define patterns for all values ---
+    patterns = {
+        "axial_length": r"AL:\s*(-?[\d,.]+\s*mm)",
+        "acd": r"ACD:\s*(-?[\d,.]+\s*mm)",
+        "cct": r"CCT:\s*(-?[\d,.]+\s*μm)",
+        "lt": r"LT:\s*(-?[\d,.]+\s*mm)",
+        "wtw": r"WTW:\s*(-?[\d,.]+\s*mm)",
+        "k1": r"K1:\s*(-?[\d,.]+\s*D(?:\s*@\s*\d+°)*)",
+        "k2": r"K2:\s*(-?[\d,.]+\s*D(?:\s*@\s*\d+°)*)",
+        "ak": r"[ΔA]K:\s*(-?[\d,.]+\s*D(?:\s*@\s*\d+°)*)"
+    }
 
-            # K-values
-            for key_val in ["k1_val", "k2_val", "ak_val"]:
-                match = re.search(patterns[key_val], line)
-                if match:
-                    simple_key = key_val.replace('_val', '')
-                    temp_storage[simple_key] = match.group(1).strip()
+    # --- Find all values and assign to the closest eye ---
+    for key, pattern in patterns.items():
+        for match in re.finditer(pattern, text):
+            value = match.group(1).strip()
+            value_pos = match.start()
 
-            # Axis
-            axis_match = re.search(patterns["axis"], line)
-            if axis_match:
-                axis_val = axis_match.group(0).strip()
-                if i > 0:
-                    prev_line = lines[i-1]
-                    for key_val in ["k1_val", "k2_val", "ak_val"]:
-                        if re.search(patterns[key_val], prev_line):
-                            simple_key = key_val.replace('_val', '')
-                            if simple_key in temp_storage:
-                                eye_data[simple_key] = f"{temp_storage[simple_key]} {axis_val}"
-                                del temp_storage[simple_key]
-        
-        for key, value in temp_storage.items():
-            if not eye_data[key]:
-                eye_data[key] = value
-        
-        # Clean up None values
-        for key, value in list(eye_data.items()):
+            # Find the closest eye marker
+            closest_eye = None
+            min_distance = float('inf')
+            for marker in eye_markers:
+                distance = abs(value_pos - marker["pos"])
+                if distance < min_distance:
+                    min_distance = distance
+                    closest_eye = marker["eye"]
+            
+            if closest_eye and not data[closest_eye][key]:
+                data[closest_eye][key] = value
+
+    # Clean up None values
+    for eye in ["OD", "OS"]:
+        for key, value in list(data[eye].items()):
             if value is None:
-                del eye_data[key]
-        
-        return eye_data
+                del data[eye][key]
 
-    final_data = {}
-    if od_text:
-        final_data["OD"] = parse_eye_block(od_text)
-    if os_text:
-        final_data["OS"] = parse_eye_block(os_text)
-
-    return final_data
+    return data
 
 def parse_pentacam(text):
     # This parser remains unchanged for now
@@ -154,7 +115,7 @@ def parse_clinical_data(text):
 
 @app.route('/api/health')
 def health_check():
-    return jsonify({"status": "running", "version": "11.0.0 (Final)", "ocr_enabled": bool(client)})
+    return jsonify({"status": "running", "version": "12.0.0 (Dumb Parser)", "ocr_enabled": bool(client)})
 
 def process_file_and_parse(file):
     if file.filename.lower().endswith('.pdf'):
@@ -191,7 +152,7 @@ def parse_file_endpoint():
 # --- Frontend Serving Routes ---
 
 @app.route('/')
-def serve__app():
+def serve_app():
     return render_template("index.html")
 
 @app.route('/<path:path>')
