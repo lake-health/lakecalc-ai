@@ -37,11 +37,13 @@ def perform_ocr(image_content):
 
 def parse_iol_master_700(text):
     """
-    Parses a ZEISS IOLMaster 700 report by isolating OD and OS sections
-    on each page using the universal 'OD' and 'OS' labels. This handles
-    all page types correctly. Returns data in a standardized order.
+    Parses a ZEISS IOLMaster 700 report using a "Line-by-Line" strategy.
+    It finds all occurrences of a parameter and assumes the first is OD and
+    the second is OS, which is robust for column-based layouts.
+    Returns the data in a standardized, logical order.
     """
     key_order = ["source", "axial_length", "acd", "k1", "k2", "ak", "wtw", "cct", "lt"]
+    
     data = {
         "OD": {key: None for key in key_order},
         "OS": {key: None for key in key_order}
@@ -55,40 +57,28 @@ def parse_iol_master_700(text):
         "lt": r"LT:\s*([\d,.]+\s*mm)",
         "cct": r"CCT:\s*([\d,.]+\s*μm)",
         "wtw": r"WTW:\s*([\d,.]+\s*mm)",
-        "k1": r"K1:\s*([\d,.]+\s*D\s*@\s*\d+°)",
-        "k2": r"K2:\s*([\d,.]+\s*D\s*@\s*\d+°)",
+        "k1": r"K1:\s*([\d,.]+\s*@\s*\d+°)",
+        "k2": r"K2:\s*([\d,.]+\s*@\s*\d+°)",
         "ak": r"[ΔA]K:\s*(-?[\d,.]+\s*D\s*@\s*\d+°)"
     }
 
-    pages = text.split('--- Page ---')
+    # --- KEY CHANGE: Only use the text from the first page for primary biometry ---
+    first_page_text = text.split('--- Page ---')[0]
 
-    for page_text in pages:
-        # The OD section starts with 'OD' and ends right before 'OS'
-        od_section_match = re.search(r'\nOD\n(.*?)(?=\nOS\n)', page_text, re.DOTALL)
-        # The OS section starts with 'OS' and goes to the end of the relevant block
-        os_section_match = re.search(r'\nOS\n(.*)', page_text, re.DOTALL)
-
-        od_text = od_section_match.group(1) if od_section_match else ""
-        os_text = os_section_match.group(1) if os_section_match else ""
+    for key, pattern in patterns.items():
+        # Find all matches for the current pattern on the first page
+        matches = re.findall(pattern, first_page_text)
         
-        if not od_text and not os_text:
-            if '\nOD\n' in page_text: od_text = page_text
-            if '\nOS\n' in page_text: os_text = page_text
-
-        if od_text:
-            for key, pattern in patterns.items():
-                match = re.search(pattern, od_text)
-                if match:
-                    cleaned_value = ' '.join(match.group(1).strip().replace(',', '.').replace('\n', ' ').split())
-                    data["OD"][key] = cleaned_value
+        # Clean up the matches to a standard format
+        cleaned_matches = [' '.join(m.strip().replace(',', '.').replace('\n', ' ').split()) for m in matches]
         
-        if os_text:
-            for key, pattern in patterns.items():
-                match = re.search(pattern, os_text)
-                if match:
-                    cleaned_value = ' '.join(match.group(1).strip().replace(',', '.').replace('\n', ' ').split())
-                    data["OS"][key] = cleaned_value
+        # Assign the first found value to OD and the second to OS
+        if len(cleaned_matches) > 0:
+            data["OD"][key] = cleaned_matches[0]
+        if len(cleaned_matches) > 1:
+            data["OS"][key] = cleaned_matches[1]
 
+    # Rebuild the final dictionaries to ensure the requested key order
     ordered_data = {
         "OD": {key: data["OD"][key] for key in key_order if data["OD"].get(key) is not None},
         "OS": {key: data["OS"][key] for key in key_order if data["OS"].get(key) is not None}
@@ -96,6 +86,7 @@ def parse_iol_master_700(text):
     return ordered_data
 
 def parse_pentacam(text):
+    # This parser can also be updated to use the ordered dictionary approach
     data = {"OD": {"source": "Pentacam"}, "OS": {"source": "Pentacam"}}
     def find(p, t):
         m = re.search(p, t, re.MULTILINE)
@@ -133,7 +124,7 @@ def parse_clinical_data(text):
 
 @app.route('/api/health')
 def health_check():
-    return jsonify({"status": "running", "version": "2.10.0", "ocr_enabled": bool(client)})
+    return jsonify({"status": "running", "version": "3.0.0", "ocr_enabled": bool(client)})
 
 def process_file_and_parse(file):
     if file.filename.lower().endswith('.pdf'):
