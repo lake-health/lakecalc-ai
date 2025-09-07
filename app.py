@@ -37,45 +37,51 @@ def perform_ocr(image_content):
 
 def parse_iol_master_700(text):
     """
-    Parses text from a ZEISS IOLMaster 700 report by processing pages
-    and columns individually for higher accuracy.
+    Parses text from a ZEISS IOLMaster 700 report using a proximity-based
+    approach and returns the data in a standardized, logical order.
     """
-    data = {"OD": {"source": "IOL Master 700"}, "OS": {"source": "IOL Master 700"}}
-    
+    key_order = ["source", "axial_length", "acd", "k1", "k2", "ak", "wtw", "cct", "lt"]
+    data = {
+        "OD": {key: None for key in key_order},
+        "OS": {key: None for key in key_order}
+    }
+    data["OD"]["source"] = "IOL Master 700"
+    data["OS"]["source"] = "IOL Master 700"
+
     patterns = {
-        "axial_length": r"AL:\s*([\d,.]+\s*mm)", "acd": r"ACD:\s*([\d,.]+\s*mm)",
-        "lt": r"LT:\s*([\d,.]+\s*mm)", "cct": r"CCT:\s*([\d,.]+\s*μm)",
-        "wtw": r"WTW:\s*([\d,.]+\s*mm)", "k1": r"K1:\s*([\d,.]+\s*D\s*@\s*\d+°)",
-        "k2": r"K2:\s*([\d,.]+\s*D\s*@\s*\d+°)", "ak": r"AK:\s*(-?[\d,.]+\s*D)"
+        "axial_length": r"AL:\s*([\d,.]+\s*mm)",
+        "acd": r"ACD:\s*([\d,.]+\s*mm)",
+        "lt": r"LT:\s*([\d,.]+\s*mm)",
+        "cct": r"CCT:\s*([\d,.]+\s*μm)",
+        "wtw": r"WTW:\s*([\d,.]+\s*mm)",
+        "k1": r"K1:\s*([\d,.]+\s*D\s*@\s*\d+°)",
+        "k2": r"K2:\s*([\d,.]+\s*D\s*@\s*\d+°)",
+        "ak": r"[ΔA]K:\s*(-?[\d,.]+\s*D\s*@\s*\d+°)"
     }
 
-    pages = text.split('--- Page')
+    for key, pattern in patterns.items():
+        all_matches = re.finditer(pattern, text, re.DOTALL)
+        for match in all_matches:
+            search_area = text[:match.start()]
+            last_od = search_area.rfind('OD\n')
+            last_os = search_area.rfind('OS\n')
 
-    for page_text in pages:
-        od_column_match = re.search(r'OD\s*direita(.*?)(?=OS\s*esquerda)', page_text, re.DOTALL)
-        os_column_match = re.search(r'OS\s*esquerda(.*)', page_text, re.DOTALL)
+            cleaned_value = match.group(1).strip().replace(',', '.').replace('\n', ' ')
+            final_value = ' '.join(cleaned_value.split())
 
-        od_column_text = od_column_match.group(1) if od_column_match else ''
-        os_column_text = os_column_match.group(1) if os_column_match else ''
-
-        if not od_column_text and 'OD\n' in page_text:
-             od_column_text = page_text
-        if not os_column_text and 'OS\n' in page_text:
-             os_column_text = page_text
-
-        for key, pattern in patterns.items():
-            od_match = re.search(pattern, od_column_text)
-            if od_match:
-                cleaned_value = od_match.group(1).strip().replace(',', '.').replace('\n', ' ')
-                data["OD"][key] = ' '.join(cleaned_value.split())
-
-            os_match = re.search(pattern, os_column_text)
-            if os_match:
-                cleaned_value = os_match.group(1).strip().replace(',', '.').replace('\n', ' ')
-                data["OS"][key] = ' '.join(cleaned_value.split())
-    return data
+            if last_od > last_os:
+                data["OD"][key] = final_value
+            elif last_os > last_od:
+                data["OS"][key] = final_value
+    
+    ordered_data = {
+        "OD": {key: data["OD"][key] for key in key_order if data["OD"].get(key) is not None},
+        "OS": {key: data["OS"][key] for key in key_order if data["OS"].get(key) is not None}
+    }
+    return ordered_data
 
 def parse_pentacam(text):
+    # This parser can also be updated to use the ordered dictionary approach
     data = {"OD": {"source": "Pentacam"}, "OS": {"source": "Pentacam"}}
     def find(p, t):
         m = re.search(p, t, re.MULTILINE)
@@ -113,7 +119,7 @@ def parse_clinical_data(text):
 
 @app.route('/api/health')
 def health_check():
-    return jsonify({"status": "running", "version": "2.4.0", "ocr_enabled": bool(client)})
+    return jsonify({"status": "running", "version": "2.6.0", "ocr_enabled": bool(client)})
 
 def process_file_and_parse(file):
     if file.filename.lower().endswith('.pdf'):
