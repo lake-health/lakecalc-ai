@@ -4,45 +4,43 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>LakeCalc.ai</title>
-    <link rel="stylesheet" href="/static/style.css">
     <style>
-        /* Basic Styling */
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
             background-color: #f0f2f5;
             color: #1c1e21;
             margin: 0;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            min-height: 100vh;
-            text-align: center;
+            padding: 1rem;
         }
         .container {
             background-color: #ffffff;
             padding: 2rem 3rem;
             border-radius: 12px;
             box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
-            max-width: 600px;
-            width: 90%;
+            max-width: 800px;
+            margin: 2rem auto;
         }
         h1 {
             color: #0b57d0;
             margin-bottom: 0.5rem;
+            text-align: center;
         }
         p {
             color: #606770;
             margin-bottom: 2rem;
+            text-align: center;
         }
         .upload-area {
             border: 2px dashed #ccd0d5;
             border-radius: 8px;
             padding: 2rem;
             cursor: pointer;
-            transition: background-color 0.2s ease;
+            transition: background-color 0.2s ease, border-color 0.2s ease;
+            text-align: center;
         }
-        .upload-area:hover {
-            background-color: #f7f8fa;
+        .upload-area.active {
+            background-color: #e7f3ff;
+            border-color: #1877f2;
         }
         .upload-area p {
             margin: 0;
@@ -50,6 +48,9 @@
         }
         input[type="file"] {
             display: none;
+        }
+        .button-container {
+            text-align: center;
         }
         button {
             background-color: #1877f2;
@@ -70,118 +71,104 @@
         button:hover:not(:disabled) {
             background-color: #166fe5;
         }
-        .results {
+        #file-list {
+            margin-top: 1rem;
+            font-style: italic;
+            color: #606770;
+        }
+        #results-area {
             margin-top: 2rem;
+        }
+        .result-block {
+            margin-bottom: 1.5rem;
             text-align: left;
             background-color: #f7f8fa;
             padding: 1rem;
             border-radius: 8px;
-            white-space: pre-wrap; /* Preserve whitespace and newlines */
+            border: 1px solid #e9ebee;
+        }
+        .result-block .file-title {
+            font-weight: bold;
+            margin-bottom: 0.5rem;
+            color: #050505;
+        }
+        .result-block pre {
+            white-space: pre-wrap;
             word-wrap: break-word;
+            background-color: #fff;
+            padding: 0.5rem;
+            border-radius: 4px;
         }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>LakeCalc.ai</h1>
-        <p>Upload an image or PDF to extract text using OCR.</p>
+        <p>Upload images or PDFs to extract and structure clinical data.</p>
 
-        <form id="upload-form" enctype="multipart/form-data">
+        <form id="upload-form">
             <div class="upload-area" id="drop-zone">
-                <p>Drag & drop a file here, or click to select a file.</p>
-                <input type="file" id="file-input" accept="image/*,application/pdf">
+                <p>Drag & drop files here, or click to select files.</p>
+                <input type="file" id="file-input" accept="image/*,application/pdf" multiple>
             </div>
-            <p id="file-name"></p>
-            <button type="submit" id="submit-button" disabled>Upload and Process</button>
+            <div id="file-list"></div>
+            <div class="button-container">
+                <button type="submit" id="submit-button" disabled>Upload and Process</button>
+            </div>
         </form>
 
-        <div class="results" id="results-container" style="display:none;">
-            <h2>Extracted Text:</h2>
-            <pre id="extracted-text"></pre>
-        </div>
+        <div id="results-area"></div>
     </div>
 
     <script>
         const form = document.getElementById('upload-form');
         const fileInput = document.getElementById('file-input');
         const dropZone = document.getElementById('drop-zone');
-        const fileNameDisplay = document.getElementById('file-name');
+        const fileListDisplay = document.getElementById('file-list');
         const submitButton = document.getElementById('submit-button');
-        const resultsContainer = document.getElementById('results-container');
-        const extractedText = document.getElementById('extracted-text');
+        const resultsArea = document.getElementById('results-area');
 
         // Handle file selection via click
         dropZone.addEventListener('click', () => fileInput.click());
 
         // Handle file selection
-        fileInput.addEventListener('change', () => {
-            if (fileInput.files.length > 0) {
-                handleFile(fileInput.files[0]);
-            }
+        fileInput.addEventListener('change', () => handleFiles(fileInput.files));
+
+        // --- Drag and Drop Event Handlers ---
+        ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
+            dropZone.addEventListener(eventName, preventDefaults, false);
         });
 
-        // Handle drag and drop
-        dropZone.addEventListener('dragover', (e) => {
+        function preventDefaults(e) {
             e.preventDefault();
-            dropZone.style.backgroundColor = '#e9ebee';
+            e.stopPropagation();
+        }
+
+        ['dragenter', 'dragover'].forEach(eventName => {
+            dropZone.addEventListener(eventName, () => dropZone.classList.add('active'), false);
         });
-        dropZone.addEventListener('dragleave', (e) => {
-            e.preventDefault();
-            dropZone.style.backgroundColor = 'transparent';
+
+        ['dragleave', 'drop'].forEach(eventName => {
+            dropZone.addEventListener(eventName, () => dropZone.classList.remove('active'), false);
         });
+
         dropZone.addEventListener('drop', (e) => {
-            e.preventDefault();
-            dropZone.style.backgroundColor = 'transparent';
-            if (e.dataTransfer.files.length > 0) {
-                fileInput.files = e.dataTransfer.files;
-                handleFile(e.dataTransfer.files[0]);
-            }
-        });
+            fileInput.files = e.dataTransfer.files;
+            handleFiles(fileInput.files);
+        }, false);
 
-        function handleFile(file) {
-            fileNameDisplay.textContent = `Selected file: ${file.name}`;
+
+        function handleFiles(files) {
+            if (files.length === 0) {
+                fileListDisplay.textContent = '';
+                submitButton.disabled = true;
+                return;
+            }
+            
+            let fileNames = Array.from(files).map(file => file.name).join(', ');
+            fileListDisplay.textContent = `Selected: ${fileNames}`;
             submitButton.disabled = false;
         }
 
         // Handle form submission
-        form.addEventListener('submit', async (e) => {
-            e.preventDefault();
-            if (!fileInput.files[0]) return;
-
-            submitButton.textContent = 'Processing...';
-            submitButton.disabled = true;
-            resultsContainer.style.display = 'none';
-
-            const formData = new FormData();
-            formData.append('file', fileInput.files[0]);
-
-            try {
-                // Determine the correct endpoint based on file type
-                const fileType = fileInput.files[0].type;
-                const endpoint = fileType === 'application/pdf' ? '/api/parse-pdf' : '/api/calculate-lol'; // Assuming calculate-lol is for images
-
-                const response = await fetch(endpoint, {
-                    method: 'POST',
-                    body: formData,
-                });
-
-                if (!response.ok) {
-                    const errorData = await response.json();
-                    throw new Error(errorData.error || 'An unknown error occurred.');
-                }
-
-                const data = await response.json();
-                extractedText.textContent = data.text || JSON.stringify(data, null, 2);
-                resultsContainer.style.display = 'block';
-
-            } catch (error) {
-                extractedText.textContent = `Error: ${error.message}`;
-                resultsContainer.style.display = 'block';
-            } finally {
-                submitButton.textContent = 'Upload and Process';
-                submitButton.disabled = false;
-            }
-        });
-    </script>
-</body>
-</html>
+        
