@@ -38,8 +38,7 @@ def perform_ocr(image_content):
 def parse_iol_master_700(text):
     """
     Parses a ZEISS IOLMaster 700 report using a "Line-by-Line" strategy
-    with refined, non-greedy patterns to correctly capture all data,
-    including the axis for K-values.
+    with corrected, non-destructive cleaning logic.
     """
     key_order = ["source", "axial_length", "acd", "k1", "k2", "ak", "wtw", "cct", "lt"]
     
@@ -51,11 +50,11 @@ def parse_iol_master_700(text):
     data["OS"]["source"] = "IOL Master 700"
 
     patterns = {
-        "axial_length": r"AL:\s*([^\n]+)",
-        "acd": r"ACD:\s*([^\n]+)",
-        "lt": r"LT:\s*([^\n]+)",
-        "cct": r"CCT:\s*([^\n]+)",
-        "wtw": r"WTW:\s*([^\n]+)",
+        "axial_length": r"AL:\s*([\d,.]+\s*mm)",
+        "acd": r"ACD:\s*([\d,.]+\s*mm)",
+        "lt": r"LT:\s*([\d,.]+\s*mm)",
+        "cct": r"CCT:\s*([\d,.]+\s*μm)",
+        "wtw": r"WTW:\s*([\d,.]+\s*mm)",
         "k1": r"K1:\s*([\d,.]+\s*D\s*@\s*\d+°)",
         "k2": r"K2:\s*([\d,.]+\s*D\s*@\s*\d+°)",
         "ak": r"[ΔA]K:\s*(-?[\d,.]+\s*D\s*@\s*\d+°)"
@@ -66,17 +65,9 @@ def parse_iol_master_700(text):
     for key, pattern in patterns.items():
         matches = re.findall(pattern, first_page_text)
         
-        def clean_value(val):
-            val = re.sub(r'\s*SD:.*', '', val)
-            return ' '.join(val.strip().replace(',', '.').split())
-
-        # This logic is for the non-K values that still use the broader pattern
-        if key not in ['k1', 'k2', 'ak']:
-             cleaned_matches = [clean_value(m) for m in matches]
-        else:
-            # For the specific K-patterns, the match is already clean
-             cleaned_matches = [' '.join(m.strip().replace(',', '.').split()) for m in matches]
-
+        # Simple, non-destructive cleaning
+        cleaned_matches = [' '.join(m.strip().replace(',', '.').split()) for m in matches]
+        
         if len(cleaned_matches) > 0:
             data["OD"][key] = cleaned_matches[0]
         if len(cleaned_matches) > 1:
@@ -126,7 +117,7 @@ def parse_clinical_data(text):
 
 @app.route('/api/health')
 def health_check():
-    return jsonify({"status": "running", "version": "3.2.0", "ocr_enabled": bool(client)})
+    return jsonify({"status": "running", "version": "3.3.0", "ocr_enabled": bool(client)})
 
 def process_file_and_parse(file):
     if file.filename.lower().endswith('.pdf'):
