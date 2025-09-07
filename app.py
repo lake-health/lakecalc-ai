@@ -38,9 +38,9 @@ def perform_ocr(image_content):
 
 def parse_iol_master_700(text):
     """
-    VERSION 16.0: The Final Definitive Parser.
-    Based on the user's superior logic, with one critical fix to the D_VAL
-    pattern to handle multi-line axis values.
+    VERSION 17.0: The User's Definitive 'Scavenger' Parser.
+    This version uses the user's superior logic to find the main value
+    and then 'scavenge' for the axis if it's on a different line.
     """
     from collections import OrderedDict
     import re
@@ -50,21 +50,17 @@ def parse_iol_master_700(text):
         "OS": OrderedDict([("source", "IOL Master 700"), ("axial_length", None), ("acd", None), ("k1", None), ("k2", None), ("ak", None), ("wtw", None), ("cct", None), ("lt", None)])
     }
 
-    # --- Find all eye markers and their positions ---
-    eye_markers = []
-    for m in re.finditer(r"\b(OD|OS)\b", text):
-        eye_markers.append({"eye": m.group(1), "pos": m.start()})
+    # --- Eye markers ---
+    eye_markers = [{"eye": m.group(1), "pos": m.start()} for m in re.finditer(r"\b(OD|OS)\b", text)]
     if not eye_markers:
         return {"error": "No OD or OS markers found."}
-
-    # Sort by position (just to be safe)
     eye_markers.sort(key=lambda x: x["pos"])
 
-    # --- Patterns for values (accepts commas and newlines before '@') ---
-    # THE CRITICAL FIX IS HERE: The D_VAL pattern now looks for the axis on the same line OR the next line.
-    D_VAL = r"-?[\d,.]+\s*D(?:\s*@\s*\d+°|(?:\s*\n\s*@\s*\d+°))?"
-    MM_VAL = r"-?[\d,.]+\s*mm"
-    UM_VAL = r"-?[\d,.]+\s*(?:µm|um)"
+    # --- Value patterns ---
+    AXIS_FLEX = r"(?:@?\s*\d{1,3}\s*(?:°|º|o)?)"
+    D_VAL     = rf"-?[\d,.]+\s*D(?:\s*{AXIS_FLEX})?"
+    MM_VAL    = r"-?[\d,.]+\s*mm"
+    UM_VAL    = r"-?[\d,.]+\s*(?:µm|um)"
 
     patterns = {
         "axial_length": rf"AL:\s*({MM_VAL})",
@@ -74,10 +70,10 @@ def parse_iol_master_700(text):
         "wtw":          rf"WTW:\s*({MM_VAL})",
         "k1":           rf"K1:\s*({D_VAL})",
         "k2":           rf"K2:\s*({D_VAL})",
-        "ak":           rf"(?:AK|ΔK):\s*({D_VAL})" # Removed plain K: to avoid capturing K1/K2 as AK
+        "ak":           rf"(?:AK|ΔK|K):\s*({D_VAL})"
     }
 
-    # helper: find last eye marker BEFORE this position
+    # Helper: last eye before this position
     def eye_before(pos):
         last_eye = None
         for marker in eye_markers:
@@ -87,17 +83,26 @@ def parse_iol_master_700(text):
                 break
         return last_eye or eye_markers[0]["eye"]
 
-    # --- Extract and assign ---
+    # If axis didn't land in the group, try to pull it from the following chars.
+    AXIS_SCAVENGE = re.compile(r"@\s*(\d{1,3})\s*(?:°|º|o)?")
+
     for key, pattern in patterns.items():
         for m in re.finditer(pattern, text, flags=re.IGNORECASE):
             raw = m.group(1)
-            # normalize internal whitespace/newlines like "D\n@ 75°"
             value = re.sub(r"\s+", " ", raw).strip()
             eye = eye_before(m.start())
+
+            # Try to attach a missing axis for keratometry/cylinder fields
+            if key in ("k1", "k2", "ak") and "@" not in value:
+                tail = text[m.end(1): m.end(1) + 40]
+                mt = AXIS_SCAVENGE.search(tail)
+                if mt:
+                    value = f"{value} @ {mt.group(1)}°"
+
             if eye and not data[eye][key]:
                 data[eye][key] = value
 
-    # remove missing keys
+    # prune None entries
     for eye in ("OD", "OS"):
         for k in list(data[eye].keys()):
             if data[eye][k] is None:
@@ -125,7 +130,7 @@ def parse_clinical_data(text):
 
 @app.route('/api/health')
 def health_check():
-    return jsonify({"status": "running", "version": "16.0.0 (Definitive)", "ocr_enabled": bool(client)})
+    return jsonify({"status": "running", "version": "17.0.0 (User's Scavenger)", "ocr_enabled": bool(client)})
 
 def process_file_and_parse(file):
     if file.filename.lower().endswith('.pdf'):
