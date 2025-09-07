@@ -38,7 +38,7 @@ def perform_ocr(image_content):
 def parse_iol_master_700(text):
     """
     Parses a ZEISS IOLMaster 700 report. This is the definitive version,
-    using a single, robust, multi-line pattern for each K-value.
+    using a robust negative lookahead to prevent greedy, cross-label matching.
     """
     key_order = ["source", "axial_length", "acd", "k1", "k2", "ak", "wtw", "cct", "lt"]
     
@@ -60,27 +60,26 @@ def parse_iol_master_700(text):
                 break
         return last_eye
 
-    # A single, powerful pattern for each value
+    # Negative lookahead to prevent matching across labels
+    stop_at = r"(?!AL:|ACD:|LT:|CCT:|WTW:|K1:|K2:|AK:|ΔK:)"
+    
     patterns = {
-        "axial_length": r"AL:\s*([\d,.]+\s*mm)",
-        "acd": r"ACD:\s*([\d,.]+\s*mm)",
-        "lt": r"LT:\s*([\d,.]+\s*mm)",
-        "cct": r"CCT:\s*([\d,.]+\s*μm)",
-        "wtw": r"WTW:\s*([\d,.]+\s*mm)",
-        # This pattern finds the label, allows any characters (including newlines)
-        # for a short distance, and then finds the value and axis together.
-        "k1": r"K1:[\s\S]{,30}?(-?[\d,.]+\s*D[\s\S]{,30}?@\s*\d+°)",
-        "k2": r"K2:[\s\S]{,30}?(-?[\d,.]+\s*D[\s\S]{,30}?@\s*\d+°)",
-        "ak": r"[ΔA]K:[\s\S]{,30}?(-?[\d,.]+\s*D[\s\S]{,30}?@\s*\d+°)"
+        "axial_length": r"AL:\s*(" + stop_at + r"[\s\S])*?([\d,.]+\s*mm)",
+        "acd": r"ACD:\s*(" + stop_at + r"[\s\S])*?([\d,.]+\s*mm)",
+        "lt": r"LT:\s*(" + stop_at + r"[\s\S])*?([\d,.]+\s*mm)",
+        "cct": r"CCT:\s*(" + stop_at + r"[\s\S])*?([\d,.]+\s*μm)",
+        "wtw": r"WTW:\s*(" + stop_at + r"[\s\S])*?([\d,.]+\s*mm)",
+        "k1": r"K1:\s*(" + stop_at + r"[\s\S])*?(-?[\d,.]+\s*D\s*@\s*\d+°)",
+        "k2": r"K2:\s*(" + stop_at + r"[\s\S])*?(-?[\d,.]+\s*D\s*@\s*\d+°)",
+        "ak": r"[ΔA]K:\s*(" + stop_at + r"[\s\S])*?(-?[\d,.]+\s*D\s*@\s*\d+°)"
     }
 
     for key, pattern in patterns.items():
         for match in re.finditer(pattern, text):
             eye = get_eye_for_pos(match.start())
             if eye and data[eye][key] is None:
-                # The value is now in group(1) for all patterns
-                value = match.group(1).strip().replace(',', '.').replace('\n', ' ')
-                # Consolidate whitespace
+                # The desired value is now in the last captured group
+                value = match.groups()[-1].strip().replace(',', '.').replace('\n', ' ')
                 data[eye][key] = ' '.join(value.split())
 
     ordered_data = {
@@ -127,7 +126,7 @@ def parse_clinical_data(text):
 
 @app.route('/api/health')
 def health_check():
-    return jsonify({"status": "running", "version": "5.3.0", "ocr_enabled": bool(client)})
+    return jsonify({"status": "running", "version": "5.4.0", "ocr_enabled": bool(client)})
 
 def process_file_and_parse(file):
     if file.filename.lower().endswith('.pdf'):
