@@ -4,6 +4,7 @@ import os
 import io
 import re
 from pdf2image import convert_from_bytes
+from collections import OrderedDict
 
 # Initialize Flask App
 app = Flask(__name__, static_folder='static', template_folder='templates')
@@ -37,20 +38,97 @@ def perform_ocr(image_content):
 
 def parse_iol_master_700(text):
     """
-    AUDITOR VERSION 9.0: This is a diagnostic tool, not a parser.
-    It extracts the raw lines containing K-values to audit the OCR source data.
+    VERSION 10.0: The Definitive Parser.
+    This version uses a line-by-line analysis to correctly associate
+    values with their labels, even when they are on separate lines.
     """
-    audit_results = []
+    data = {
+        "OD": OrderedDict([("source", "IOL Master 700"), ("axial_length", None), ("acd", None), ("k1", None), ("k2", None), ("ak", None), ("wtw", None), ("cct", None), ("lt", None)]),
+        "OS": OrderedDict([("source", "IOL Master 700"), ("axial_length", None), ("acd", None), ("k1", None), ("k2", None), ("ak", None), ("wtw", None), ("cct", None), ("lt", None)])
+    }
+    
     lines = text.split('\n')
+    
+    # --- Find Eye Markers ---
+    eye_markers = []
     for i, line in enumerate(lines):
-        if re.search(r"(K1:|K2:|[ΔA]K:)", line):
-            # Grab the line with the label and the very next line
-            line_pair = line
-            if i + 1 < len(lines):
-                line_pair += " | " + lines[i+1] # Use a clear separator
-            audit_results.append(line_pair)
-            
-    return {"AUDIT_RESULTS": audit_results}
+        if "OD" in line and "OS" not in line:
+            eye_markers.append({"eye": "OD", "line": i})
+        elif "OS" in line and "OD" not in line:
+            eye_markers.append({"eye": "OS", "line": i})
+
+    def get_eye_for_line(line_index):
+        last_eye = None
+        for marker in eye_markers:
+            if marker["line"] <= line_index:
+                last_eye = marker["eye"]
+            else:
+                break
+        return last_eye
+
+    # --- Define Patterns ---
+    patterns = {
+        "axial_length": r"AL:\s*(-?[\d,.]+\s*mm)",
+        "acd": r"ACD:\s*(-?[\d,.]+\s*mm)",
+        "cct": r"CCT:\s*(-?[\d,.]+\s*μm)",
+        "lt": r"LT:\s*(-?[\d,.]+\s*mm)",
+        "wtw": r"WTW:\s*(-?[\d,.]+\s*mm)",
+        "k1_val": r"K1:\s*(-?[\d,.]+\s*D)",
+        "k2_val": r"K2:\s*(-?[\d,.]+\s*D)",
+        "ak_val": r"[ΔA]K:\s*(-?[\d,.]+\s*D)",
+        "axis": r"@\s*(\d+°)"
+    }
+
+    # --- Line-by-Line Extraction ---
+    temp_storage = {} # To hold values like K1 before we find their axis
+
+    for i, line in enumerate(lines):
+        eye = get_eye_for_line(i)
+        if not eye:
+            continue
+
+        # Check for simple values first
+        for key, pattern in patterns.items():
+            if "_val" in key or key == "axis": continue # Skip complex patterns for now
+            match = re.search(pattern, line)
+            if match and not data[eye][key]:
+                data[eye][key] = match.group(1).strip()
+
+        # Handle K-values (value part)
+        for key_val in ["k1_val", "k2_val", "ak_val"]:
+            match = re.search(patterns[key_val], line)
+            if match:
+                simple_key = key_val.replace('_val', '')
+                temp_storage[f"{eye}_{simple_key}"] = match.group(1).strip()
+
+        # Handle Axis (the "look behind" logic)
+        axis_match = re.search(patterns["axis"], line)
+        if axis_match:
+            axis_val = axis_match.group(0).strip() # Get the full "@ ...°"
+            # Look at the previous line to see what this axis belongs to
+            if i > 0:
+                prev_line = lines[i-1]
+                for key_val in ["k1_val", "k2_val", "ak_val"]:
+                    if re.search(patterns[key_val], prev_line):
+                        simple_key = key_val.replace('_val', '')
+                        # Combine the stored value with the new axis
+                        if f"{eye}_{simple_key}" in temp_storage:
+                            data[eye][simple_key] = f"{temp_storage[f'{eye}_{simple_key}']} {axis_val}"
+                            del temp_storage[f"{eye}_{simple_key}"] # Clean up
+
+    # Final check: if any K-values were found without an axis, assign them
+    for temp_key, value in temp_storage.items():
+        eye, key = temp_key.split('_')
+        if not data[eye][key]:
+            data[eye][key] = value
+
+    # Clean up None values
+    for eye in ["OD", "OS"]:
+        for key, value in list(data[eye].items()):
+            if value is None:
+                del data[eye][key]
+
+    return data
 
 def parse_pentacam(text):
     # This parser remains unchanged for now
@@ -64,8 +142,7 @@ def parse_clinical_data(text):
     if "IOLMaster 700" in text:
         return parse_iol_master_700(text)
     elif "OCULUS PENTACAM" in text:
-        # For this test, we are only auditing the IOL Master
-        return {"error": "Pentacam audit not implemented in this version."}
+        return parse_pentacam(text)
     else:
         return {"error": "Unknown device or format", "raw_text": text}
 
@@ -73,7 +150,7 @@ def parse_clinical_data(text):
 
 @app.route('/api/health')
 def health_check():
-    return jsonify({"status": "running", "version": "9.0.0 (AUDITOR)", "ocr_enabled": bool(client)})
+    return jsonify({"status": "running", "version": "10.0.0 (Definitive)", "ocr_enabled": bool(client)})
 
 def process_file_and_parse(file):
     if file.filename.lower().endswith('.pdf'):
