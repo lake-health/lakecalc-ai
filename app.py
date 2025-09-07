@@ -38,8 +38,8 @@ def perform_ocr(image_content):
 def parse_iol_master_700(text):
     """
     Parses a ZEISS IOLMaster 700 report using a robust 'Search from Label'
-    strategy. This is the final, definitive parser, abandoning all
-    previous failed methods.
+    strategy with a two-step pattern for K-values to handle multi-line OCR data.
+    This is the definitive, final parser.
     """
     key_order = ["source", "axial_length", "acd", "k1", "k2", "ak", "wtw", "cct", "lt"]
     
@@ -50,47 +50,61 @@ def parse_iol_master_700(text):
     data["OD"]["source"] = "IOL Master 700"
     data["OS"]["source"] = "IOL Master 700"
 
-    # Define the patterns for each piece of data. Now they are simpler.
-    patterns = {
+    # Find all eye markers and their positions
+    eye_markers = list(re.finditer(r'\b(OD|OS)\b', text))
+
+    def get_eye_for_pos(pos):
+        last_eye = None
+        for marker in eye_markers:
+            if marker.start() < pos:
+                last_eye = marker.group(1)
+            else:
+                break
+        return last_eye
+
+    # --- Process Simple, Single-Line Values First ---
+    simple_patterns = {
         "axial_length": r"AL:\s*([\d,.]+\s*mm)",
         "acd": r"ACD:\s*([\d,.]+\s*mm)",
         "lt": r"LT:\s*([\d,.]+\s*mm)",
         "cct": r"CCT:\s*([\d,.]+\s*μm)",
         "wtw": r"WTW:\s*([\d,.]+\s*mm)",
-        "k1": r"K1:\s*([\d,.]+\s*D\s*@\s*\d+°)",
-        "k2": r"K2:\s*([\d,.]+\s*D\s*@\s*\d+°)",
-        "ak": r"[ΔA]K:\s*(-?[\d,.]+\s*D\s*@\s*\d+°)"
     }
 
-    # Find all eye markers and their positions
-    eye_markers = list(re.finditer(r'\b(OD|OS)\b', text))
+    for key, pattern in simple_patterns.items():
+        for match in re.finditer(pattern, text):
+            eye = get_eye_for_pos(match.start())
+            if eye and data[eye][key] is None:
+                value = match.group(1).strip().replace(',', '.')
+                data[eye][key] = ' '.join(value.split())
 
-    for key, pattern in patterns.items():
-        # Find all matches for the current data type
-        matches = list(re.finditer(pattern, text))
-        
-        for match in matches:
-            # For each match, find the most recent eye marker that appeared before it
-            current_pos = match.start()
-            last_eye = None
-            for marker in eye_markers:
-                if marker.start() < current_pos:
-                    last_eye = marker.group(1)
-                else:
-                    break 
-            
-            if last_eye:
-                # Only store the first value we find for each eye to avoid duplicates
-                if data[last_eye][key] is None:
-                    value = match.group(1).strip().replace(',', '.')
-                    data[last_eye][key] = ' '.join(value.split())
+    # --- Process Complex, Multi-Line K-Values ---
+    k_labels = {
+        "k1": r"K1:",
+        "k2": r"K2:",
+        "ak": r"[ΔA]K:"
+    }
+
+    for key, label_pattern in k_labels.items():
+        for label_match in re.finditer(label_pattern, text):
+            eye = get_eye_for_pos(label_match.start())
+            if eye and data[eye][key] is None:
+                # Define a search area after the label to find the value and axis
+                search_area = text[label_match.end():label_match.end() + 100] # Look in the next 100 chars
+                
+                value_match = re.search(r"(-?[\d,.]+\s*D)", search_area)
+                axis_match = re.search(r"(@\s*\d+°)", search_area)
+                
+                if value_match and axis_match:
+                    value = value_match.group(1).strip().replace(',', '.')
+                    axis = axis_match.group(1).strip()
+                    data[eye][key] = f"{value} {axis}"
 
     ordered_data = {
         "OD": {key: data["OD"][key] for key in key_order if data["OD"].get(key) is not None},
         "OS": {key: data["OS"][key] for key in key_order if data["OS"].get(key) is not None}
     }
     return ordered_data
-
 
 def parse_pentacam(text):
     data = {"OD": {"source": "Pentacam"}, "OS": {"source": "Pentacam"}}
@@ -130,7 +144,7 @@ def parse_clinical_data(text):
 
 @app.route('/api/health')
 def health_check():
-    return jsonify({"status": "running", "version": "5.0.0", "ocr_enabled": bool(client)})
+    return jsonify({"status": "running", "version": "5.1.0", "ocr_enabled": bool(client)})
 
 def process_file_and_parse(file):
     if file.filename.lower().endswith('.pdf'):
