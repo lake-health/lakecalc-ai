@@ -38,7 +38,7 @@ def perform_ocr(image_content):
 def parse_iol_master_700(text):
     """
     Parses a ZEISS IOLMaster 700 report. This is the definitive version,
-    using a robust "Full Line" strategy with a non-greedy axis match.
+    using a robust "Two-Pass" strategy to correctly parse all values.
     """
     key_order = ["source", "axial_length", "acd", "k1", "k2", "ak", "wtw", "cct", "lt"]
     
@@ -60,12 +60,11 @@ def parse_iol_master_700(text):
                 break
         return last_eye
 
-    # Process Simple, Single-Line Values First
+    # --- First Pass: Simple Values ---
     simple_patterns = {
         "axial_length": r"AL:\s*([\d,.]+\s*mm)", "acd": r"ACD:\s*([\d,.]+\s*mm)",
         "lt": r"LT:\s*([\d,.]+\s*mm)", "cct": r"CCT:\s*([\d,.]+\s*μm)", "wtw": r"WTW:\s*([\d,.]+\s*mm)",
     }
-
     for key, pattern in simple_patterns.items():
         for match in re.finditer(pattern, text):
             eye = get_eye_for_pos(match.start())
@@ -73,29 +72,29 @@ def parse_iol_master_700(text):
                 value = match.group(1).strip().replace(',', '.')
                 data[eye][key] = ' '.join(value.split())
 
-    # Process Complex, Multi-Line K-Values using the "Full Line" method
-    lines = text.split('\n')
-    for i, line in enumerate(lines):
-        k_match = re.search(r"(K1:|K2:|[ΔA]K:)", line)
-        if k_match:
-            key_label = k_match.group(1)
-            key = {"K1:": "k1", "K2:": "k2"}.get(key_label, "ak")
-            
-            search_area = line
-            if i + 1 < len(lines):
-                search_area += " " + lines[i+1]
-            
-            eye = get_eye_for_pos(text.find(line))
+    # --- Second Pass: K-Values (Two-Pass Method) ---
+    k_patterns = {
+        "k1_val": r"K1:\s*(-?[\d,.]+\s*D)", "k2_val": r"K2:\s*(-?[\d,.]+\s*D)", "ak_val": r"[ΔA]K:\s*(-?[\d,.]+\s*D)",
+        "k1_axis": r"K1:(?:[\s\S]*?)(@\s*\d+°)", "k2_axis": r"K2:(?:[\s\S]*?)(@\s*\d+°)", "ak_axis": r"[ΔA]K:(?:[\s\S]*?)(@\s*\d+°)"
+    }
+    
+    temp_values = {"OD": {}, "OS": {}}
 
-            if eye and data[eye][key] is None:
-                # THE FINAL FIX: Make the axis search non-greedy with `?`
-                value_match = re.search(r"(-?[\d,.]+\s*D)", search_area)
-                axis_match = re.search(r"(@\s*?\d+°)", search_area) # Added '?' here
+    for key, pattern in k_patterns.items():
+        for match in re.finditer(pattern, text, re.DOTALL):
+            eye = get_eye_for_pos(match.start())
+            if eye:
+                if key not in temp_values[eye]:
+                    temp_values[eye][key] = match.group(1).strip().replace(',', '.')
 
-                if value_match and axis_match:
-                    value = value_match.group(1).strip().replace(',', '.')
-                    axis = axis_match.group(1).strip()
-                    data[eye][key] = f"{value} {axis}"
+    # Combine the values and axes
+    for eye in ["OD", "OS"]:
+        if temp_values[eye].get("k1_val") and temp_values[eye].get("k1_axis"):
+            data[eye]["k1"] = f"{temp_values[eye]['k1_val']} {temp_values[eye]['k1_axis']}"
+        if temp_values[eye].get("k2_val") and temp_values[eye].get("k2_axis"):
+            data[eye]["k2"] = f"{temp_values[eye]['k2_val']} {temp_values[eye]['k2_axis']}"
+        if temp_values[eye].get("ak_val") and temp_values[eye].get("ak_axis"):
+            data[eye]["ak"] = f"{temp_values[eye]['ak_val']} {temp_values[eye]['ak_axis']}"
 
     ordered_data = {
         "OD": {key: data["OD"][key] for key in key_order if data["OD"].get(key) is not None},
@@ -141,7 +140,7 @@ def parse_clinical_data(text):
 
 @app.route('/api/health')
 def health_check():
-    return jsonify({"status": "running", "version": "7.1.0", "ocr_enabled": bool(client)})
+    return jsonify({"status": "running", "version": "8.0.0", "ocr_enabled": bool(client)})
 
 def process_file_and_parse(file):
     if file.filename.lower().endswith('.pdf'):
