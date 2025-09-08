@@ -7,9 +7,6 @@ import re
 from pdf2image import convert_from_bytes
 from collections import OrderedDict
 
-# ---------------------------
-# Flask
-# ---------------------------
 app = Flask(__name__, static_folder='static', template_folder='templates')
 
 # ---------------------------
@@ -48,18 +45,15 @@ def perform_ocr(image_content: bytes) -> str:
     return response.text_annotations[0].description if response.text_annotations else ""
 
 # ---------------------------
-# Parsers
+# Parser
 # ---------------------------
-
 def parse_iol_master_700(text: str) -> dict:
     """
-    Robust parser for IOLMaster 700.
+    Robust IOLMaster 700 parser.
 
-    - Assign each metric to the last eye marker (OD/OS) BEFORE it.
-    - Capture K1/K2/AK with inline axes; if OCR splits axis, scavenge it
-      from the same line (or up to next label) and allow digits with spaces
-      (e.g., '1 0°' -> '10°').
-    - Accept degree variants (°/º/o) and an optional trailing quote.
+    - Assigns metrics to the last eye marker (OD/OS) appearing *before* them.
+    - K1/K2/AK axis: tolerant to OCR quirks like '1 0°', '1°0', '16°5', missing '@', extra quotes.
+    - Axis harvester collects up to 3 digits while ignoring non-digits, then prefers 3>2>1 digits.
     """
     data = {
         "OD": OrderedDict([
@@ -74,7 +68,7 @@ def parse_iol_master_700(text: str) -> dict:
         ])
     }
 
-    # --- Eye markers (OD/OS)
+    # Eye markers
     eye_markers = [{"eye": m.group(1), "pos": m.start()} for m in re.finditer(r"\b(OD|OS)\b", text)]
     if not eye_markers:
         return {"error": "No OD or OS markers found."}
@@ -89,17 +83,12 @@ def parse_iol_master_700(text: str) -> dict:
                 break
         return last or eye_markers[0]["eye"]
 
-    # --- Regex building blocks
+    # Value patterns
     DEG = r"(?:°|º|o)"
-    QUO = r'["”]?'  # OCR sometimes leaves an extra quote
-    # digits allowing a single optional space between each digit (1 to 3 total digits)
-    DIG1_2 = r"\d(?:\s?\d)?"          # 1–2 digits, possibly spaced: '10' or '1 0'
-    DIG3   = r"\d(?:\s?\d){2}"        # exactly 3 digits, possibly spaced: '1 0 0' or '165'
-    AXIS_INLINE = rf"\s*@\s*(?:{DIG1_2}|{DIG3})\s*{DEG}?{QUO}"
-
-    D_VAL = rf"-?[\d,.]+\s*D(?:{AXIS_INLINE})?"  # diopters with optional inline axis
-    MM_VAL = r"-?[\d,.]+\s*mm"
-    UM_VAL = r"-?[\d,.]+\s*(?:µm|um)"
+    AXIS_INLINE = rf"\s*@\s*\d{{1,3}}\s*{DEG}?"   # inline when OCR keeps it grouped
+    D_VAL   = rf"-?[\d,.]+\s*D(?:{AXIS_INLINE})?"
+    MM_VAL  = r"-?[\d,.]+\s*mm"
+    UM_VAL  = r"-?[\d,.]+\s*(?:µm|um)"
 
     patterns = {
         "axial_length": rf"AL:\s*({MM_VAL})",
@@ -109,59 +98,87 @@ def parse_iol_master_700(text: str) -> dict:
         "wtw":          rf"WTW:\s*({MM_VAL})",
         "k1":           rf"K1:\s*({D_VAL})",
         "k2":           rf"K2:\s*({D_VAL})",
-        "ak":           rf"(?:AK|ΔK|K):\s*({D_VAL})",  # cylinder line label variants
+        "ak":           rf"(?:AK|ΔK|K):\s*({D_VAL})",  # cylinder label variants
     }
 
-    # Stop scavenging at newline OR at the next metric label
-    LABEL_STOP = re.compile(
-        r"(?:\r?\n|(?=(?:AL|ACD|CCT|LT|WTW|K1|K2|K|AK|ΔK)\s*:))",
-        re.IGNORECASE
-    )
+    # Where to stop scavenging: newline or the next metric label
+    LABEL_STOP = re.compile(r"(?:\r?\n|(?=(?:AL|ACD|CCT|LT|WTW|K1|K2|K|AK|ΔK)\s*:))", re.IGNORECASE)
 
-    # Axis tokens with/without '@' & degree, allowing spaced digits
-    AXIS_1_2_ANY = re.compile(rf"(?:@?\s*)({DIG1_2})\s*{DEG}?{QUO}\b")
-    AXIS_3_ANY   = re.compile(rf"(?:@?\s*)({DIG3})\s*{DEG}?{QUO}\b")
+    # --- Axis harvesting ---
+    # Grab a loose token that *starts near an axis*: optional @, then a run containing digits,
+    # spaces, degree marks, or quotes. We'll strip non-digits afterwards.
+    AXIS_TOKEN = re.compile(r"@?\s*([0-9][0-9\s\"”°ºo]{0,6})")
 
-    def normalize_axis(num_str: str) -> str:
-        # remove spaces between digits: '1 0' -> '10'
-        return re.sub(r"\s+", "", num_str)
+    def best_axis_from(token: str) -> str | None:
+        # Keep only digits, cap at 3
+        digits = re.sub(r"\D", "", token)[:3]
+        if not digits:
+            return None
+        # Prefer 3-digit (e.g., 165) over 2-digit (e.g., 10) over 1-digit
+        if len(digits) == 3:
+            return digits
+        if len(digits) == 2:
+            return digits
+        # Single-digit axis is almost always an OCR fragment; keep only if nothing better exists.
+        return digits
+
+    def scan_window(s: str) -> str | None:
+        # Try all tokens; choose the "best" by length (3>2>1). If ties, take the first.
+        best = None
+        for m in AXIS_TOKEN.finditer(s):
+            candidate = best_axis_from(m.group(1))
+            if not candidate:
+                continue
+            if best is None or len(candidate) > len(best):
+                best = candidate
+                if len(best) == 3:
+                    break
+        return best
 
     def scavenge_axis_forward(tail: str) -> str | None:
         mstop = LABEL_STOP.search(tail)
         segment = tail[:mstop.start()] if mstop else tail
-        window = segment[:80]  # local, but generous
-        m = AXIS_1_2_ANY.search(window)
-        if m:
-            return normalize_axis(m.group(1))
-        m = AXIS_3_ANY.search(window)
-        return normalize_axis(m.group(1)) if m else None
+        window = segment[:120]  # local but generous
+        return scan_window(window)
 
     def scavenge_axis_backward(head: str) -> str | None:
-        start_limit = max(0, len(head) - 60)
+        # look left from the start of the numeric D value
+        start_limit = max(0, len(head) - 120)
         slice_ = head[start_limit:]
-        # cut back to after the last newline if present
+        # keep only the last line to avoid crossing fields
         nl = slice_.rfind("\n")
         if nl != -1:
             slice_ = slice_[nl + 1:]
-        # prefer 1–2 digits, then 3
-        cands = list(AXIS_1_2_ANY.finditer(slice_)) or list(AXIS_3_ANY.finditer(slice_))
-        if cands:
-            return normalize_axis(cands[-1].group(1))
-        return None
+        return scan_window(slice_)
 
-    # --- Extract & assign
+    # Extract & assign
     for key, pattern in patterns.items():
         for m in re.finditer(pattern, text, flags=re.IGNORECASE):
             raw = m.group(1)
             value = re.sub(r"\s+", " ", raw).strip()
             eye = eye_before(m.start())
 
-            # If inline axis isn't present, try forward then backward scavenging
-            if key in ("k1", "k2", "ak") and "@" not in value:
-                axis = scavenge_axis_forward(text[m.end(1): m.end(1) + 160]) or \
-                       scavenge_axis_backward(text[:m.start(1)])
+            if key in ("k1", "k2", "ak"):
+                # If inline didn't include a clean axis, harvest around it
+                # (even if '@' in value, OCR may have split digits awkwardly).
+                fwd = scavenge_axis_forward(text[m.end(1): m.end(1) + 200])
+                bwd = scavenge_axis_backward(text[:m.start(1)])
+                # Choose the better (longer) axis; prefer 3 > 2 > 1
+                axis = None
+                if fwd and bwd:
+                    axis = fwd if len(fwd) >= len(bwd) else bwd
+                else:
+                    axis = fwd or bwd
                 if axis:
-                    value = f"{value} @ {axis}°"
+                    # If value already has an @-axis but it's clearly too short (1 digit),
+                    # replace it with the harvested axis.
+                    if "@" in value:
+                        value = re.sub(r"@[^,;]+$", f"@ {axis}°", value)
+                        if "@ " not in value:
+                            # fallback replace any '@'...tail pattern
+                            value = re.sub(r"@\s*.*", f"@ {axis}°", value)
+                    else:
+                        value = f"{value} @ {axis}°"
 
             if eye and not data[eye][key]:
                 data[eye][key] = value
@@ -174,11 +191,8 @@ def parse_iol_master_700(text: str) -> dict:
 
     return data
 
-
 def parse_pentacam(text: str) -> dict:
-    # Minimal stub; extend as needed
     return {"OD": {"source": "Pentacam"}, "OS": {"source": "Pentacam"}}
-
 
 def parse_clinical_data(text: str) -> dict:
     if "IOLMaster 700" in text or "IOL Master 700" in text:
@@ -190,31 +204,28 @@ def parse_clinical_data(text: str) -> dict:
 # ---------------------------
 # Routes
 # ---------------------------
-
 @app.route("/api/health")
 def health_check():
     return jsonify({
         "status": "running",
-        "version": "20.3.0 (axis tolerates spaced digits)",
+        "version": "21.0.0 (robust axis harvester)",
         "ocr_enabled": bool(client)
     })
-
 
 def process_file_and_parse(file_storage) -> dict:
     filename = (file_storage.filename or "").lower()
     if filename.endswith(".pdf"):
         pdf_bytes = file_storage.read()
         images = convert_from_bytes(pdf_bytes, fmt="jpeg")
-        full_text_parts = []
+        parts = []
         for page_image in images:
             buf = io.BytesIO()
             page_image.save(buf, format="JPEG")
-            full_text_parts.append(perform_ocr(buf.getvalue()))
-        text = "\n\n--- Page ---\n\n".join(full_text_parts)
+            parts.append(perform_ocr(buf.getvalue()))
+        text = "\n\n--- Page ---\n\n".join(parts)
     else:
         text = perform_ocr(file_storage.read())
     return parse_clinical_data(text)
-
 
 @app.route("/api/parse-file", methods=["POST"])
 def parse_file_endpoint():
@@ -229,7 +240,6 @@ def parse_file_endpoint():
     except Exception as e:
         print(f"Error in /api/parse-file: {e}")
         return jsonify({"error": str(e)}), 500
-
 
 @app.route("/")
 def serve_app():
@@ -249,7 +259,6 @@ def serve_app():
         </html>
         """
 
-
 @app.route("/<path:path>")
 def serve_fallback(path):
     try:
@@ -257,10 +266,6 @@ def serve_fallback(path):
     except Exception:
         return jsonify({"ok": True, "route": path})
 
-
-# ---------------------------
-# Main
-# ---------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
