@@ -1,3 +1,4 @@
+# app.py
 import os, io, re
 from collections import OrderedDict
 from io import BytesIO
@@ -5,6 +6,7 @@ from io import BytesIO
 from flask import Flask, request, jsonify, render_template
 from pdfminer.high_level import extract_text as pdfminer_extract_text
 
+# Google Vision is only used as a fallback if the PDF has no text layer
 from google.cloud import vision
 from pdf2image import convert_from_bytes
 
@@ -25,19 +27,20 @@ try:
     elif os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
         vision_client = vision.ImageAnnotatorClient()
     else:
-        print("WARNING: Vision credentials not set. OCR fallback will be unavailable.")
+        # OK: we can still parse born-digital PDFs without OCR
+        print("INFO: Vision credentials not set. OCR fallback disabled (pdfminer will still work).")
 except Exception as e:
     print(f"Vision init error: {e}")
 
 
 # ---------------------------
-# Text extraction (PDF-first, OCR fallback)
+# Text extraction (PDF-first, with optional force modes)
 # ---------------------------
 def try_pdf_text_extract(pdf_bytes: bytes) -> str:
     """Extract native text from a born-digital PDF (no OCR)."""
     try:
         text = pdfminer_extract_text(BytesIO(pdf_bytes)) or ""
-        # mild whitespace normalization only
+        # Mild whitespace normalization
         text = re.sub(r"[ \t]+\n", "\n", text)
         return text.strip()
     except Exception as e:
@@ -60,44 +63,47 @@ def ocr_pdf_to_text(pdf_bytes: bytes) -> str:
         pages.append(resp.text_annotations[0].description if resp.text_annotations else "")
     return "\n\n--- Page ---\n\n".join(pages).strip()
 
-def get_text_from_upload(fs):
+def get_text_from_upload(fs, force_mode: str | None = None):
     """
-    Returns (text, source_tag):
-      - text: full string (pages joined)
-      - source_tag: 'pdf_text' | 'ocr_pdf' | 'ocr_image'
+    Returns (text, source_tag) where source_tag in {'pdf_text','ocr_pdf','ocr_image'}.
+    force_mode: 'pdf' to force pdfminer, 'ocr' to force OCR (when possible).
     """
     name = (fs.filename or "").lower()
-    if name.endswith(".pdf"):
+    is_pdf = name.endswith(".pdf")
+
+    if is_pdf:
         pdf_bytes = fs.read()
-        # 1) PDF text layer first
+
+        if force_mode == "pdf":
+            return try_pdf_text_extract(pdf_bytes), "pdf_text"
+        if force_mode == "ocr":
+            return ocr_pdf_to_text(pdf_bytes), "ocr_pdf"
+
+        # Default behavior: PDF text first, OCR fallback
         text = try_pdf_text_extract(pdf_bytes)
         if text:
             return text, "pdf_text"
-        # 2) OCR fallback
         return ocr_pdf_to_text(pdf_bytes), "ocr_pdf"
-    else:
-        if not vision_client:
-            raise RuntimeError("Vision client not initialized; cannot OCR image.")
-        image_bytes = fs.read()
-        image = vision.Image(content=image_bytes)
-        resp = vision_client.text_detection(image=image)
-        if resp.error.message:
-            raise RuntimeError(f"Vision API Error: {resp.error.message}")
-        text = resp.text_annotations[0].description if resp.text_annotations else ""
-        return text.strip(), "ocr_image"
+
+    # Not a PDF (image): OCR is required
+    if not vision_client:
+        raise RuntimeError("Vision client not initialized; cannot OCR image.")
+    image_bytes = fs.read()
+    image = vision.Image(content=image_bytes)
+    resp = vision_client.text_detection(image=image)
+    if resp.error.message:
+        raise RuntimeError(f"Vision API Error: {resp.error.message}")
+    text = resp.text_annotations[0].description if resp.text_annotations else ""
+    return text.strip(), "ocr_image"
 
 
 # ---------------------------
-# Parser for IOL Master 700 (and similar layouts)
+# Parser for IOLMaster (ordered fields)
 # ---------------------------
 def parse_iol_master_text(text: str) -> dict:
     """
-    Extracts, for each eye (OD/OS), in this order:
-    source, axial_length, acd, k1 (D+axis), k2 (D+axis), ak (D+axis), wtw, cct, lt
-    Notes:
-      - Axis digits tolerate degree variants and spaced digits; prefer 3>2>1 digits when harvesting.
-      - Values are assigned to the LAST 'OD'/'OS' marker BEFORE the metric.
-      - 'ak' will match lines labeled 'K:', 'AK:' or 'ΔK:' (the device uses 'K:' for cylinder).
+    For each eye (OD/OS), returns these fields IN ORDER:
+      source, axial_length, acd, k1 (D+axis), k2 (D+axis), ak (D+axis), wtw, cct, lt
     """
     # Device/source detection
     source_label = None
@@ -106,35 +112,32 @@ def parse_iol_master_text(text: str) -> dict:
     elif re.search(r"OCULUS\s+PENTACAM", text, re.IGNORECASE):
         source_label = "Pentacam"
     else:
-        # fallback: first non-empty header-ish line
         head_line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "Unknown")
         source_label = head_line[:60]
 
-    # Prepare data with required order
     def fresh_eye():
         return OrderedDict([
             ("source", source_label),
-            ("axial_length", None),
-            ("acd", None),
-            ("k1", None),
-            ("k2", None),
-            ("ak", None),
-            ("wtw", None),
-            ("cct", None),
-            ("lt", None),
+            ("axial_length", ""),
+            ("acd", ""),
+            ("k1", ""),
+            ("k2", ""),
+            ("ak", ""),
+            ("wtw", ""),
+            ("cct", ""),
+            ("lt", ""),
         ])
 
     data = {"OD": fresh_eye(), "OS": fresh_eye()}
 
-    # Find all OD/OS markers with positions
+    # Eye markers
     eye_marks = [{"eye": m.group(1), "pos": m.start()} for m in re.finditer(r"\b(OD|OS)\b", text)]
-    if not eye_marks:
-        # still return ordered structure with source filled
-        return data
-    eye_marks.sort(key=lambda d: d["pos"])
+    eye_marks.sort(key=lambda d: d["pos"]) if eye_marks else None
 
     def eye_before(pos: int) -> str:
         last = "OD"
+        if not eye_marks:
+            return last
         for mark in eye_marks:
             if mark["pos"] <= pos:
                 last = mark["eye"]
@@ -142,81 +145,60 @@ def parse_iol_master_text(text: str) -> dict:
                 break
         return last
 
-    # Common token regexes
-    # Accept both comma and dot decimals; keep raw text (you can normalize later)
+    # Tokens
     MM   = r"-?\d[\d.,]*\s*mm"
     UM   = r"-?\d[\d.,]*\s*(?:µm|um)"
     DVAL = r"-?\d[\d.,]*\s*D"
 
-    # Axis harvesting helpers (robust to spaces/degree/quotes)
-    DEG_QUOTE = r'(?:°|º|o)?["”\']?'  # degree optional, stray quote tolerated
-
-    # tight label stop (stop scanning at newline or next known label)
+    # Stop scanning axis at newline or next label
     LABEL_STOP = re.compile(r"(?:\r?\n|(?=(?:AL|ACD|CCT|LT|WTW|K1|K2|K|AK|ΔK)\s*:))", re.IGNORECASE)
 
-    def harvest_axis(field_tail: str) -> str | None:
-        """Harvest up to 3 digits for axis within same field; prefer 3>2>1 digits."""
-        # Trim to same line / before next label
+    def harvest_axis(field_tail: str) -> str:
+        """Harvest up to 3 digits for axis within same field."""
         mstop = LABEL_STOP.search(field_tail)
         seg = field_tail[:mstop.start()] if mstop else field_tail
-        seg = seg[:120]  # local window
+        seg = seg[:120]
 
         # 1) If '@' present, grab digits after it
         if "@" in seg:
             after = seg.split("@", 1)[1]
             digits = re.findall(r"\d", after)
             axis = "".join(digits)[:3]
-            return axis or None
+            return f" @ {axis}°" if axis else ""
 
-        # 2) Otherwise, look for digits near a degree symbol (digits can be spaced/split)
-        m = re.search(r"(\d(?:\D{0,2}\d){0,2})\s*" + DEG_QUOTE, seg)
+        # 2) Otherwise, look for digits near a degree mark
+        m = re.search(r"(\d{1,3})\s*(?:°|º|o)\b", seg)
         if m:
-            axis = re.sub(r"\D", "", m.group(1))[:3]
-            return axis or None
+            return f" @ {m.group(1)}°"
+        return ""
 
-        return None
-
-    # Patterns for metrics (capture diopters without axis; we'll attach axis with harvester)
     patterns = {
         "axial_length": re.compile(rf"AL:\s*({MM})", re.IGNORECASE),
         "acd":          re.compile(rf"ACD:\s*({MM})", re.IGNORECASE),
         "cct":          re.compile(rf"CCT:\s*({UM})", re.IGNORECASE),
         "lt":           re.compile(rf"LT:\s*({MM})", re.IGNORECASE),
         "wtw":          re.compile(rf"WTW:\s*({MM})", re.IGNORECASE),
+
+        # Capture diopters; axis will be appended from tail if present
         "k1":           re.compile(rf"K1:\s*({DVAL})", re.IGNORECASE),
         "k2":           re.compile(rf"K2:\s*({DVAL})", re.IGNORECASE),
-        # cylinder line: device often prints just "K:"; include AK and ΔK too
         "ak":           re.compile(rf"(?:AK|ΔK|K):\s*({DVAL})", re.IGNORECASE),
     }
 
-    # Extract/assign in a single pass per metric type
     for key, pat in patterns.items():
         for m in pat.finditer(text):
-            raw_val = m.group(1)
-            clean_val = re.sub(r"\s+", " ", raw_val).strip()
-            pos = m.start()
-            eye = eye_before(pos)
+            raw = re.sub(r"\s+", " ", m.group(1)).strip()
+            eye = eye_before(m.start())
 
-            # add axis for K1/K2/AK if available in the same field
             if key in ("k1", "k2", "ak"):
                 tail = text[m.end(1): m.end(1) + 200]
                 axis = harvest_axis(tail)
-                if axis:
-                    if "@" in clean_val:
-                        # normalize any weird inline axis
-                        clean_val = re.sub(r"@\s*\d[\d\s\"”°ºo]*", f"@ {axis}°", clean_val)
-                    else:
-                        clean_val = f"{clean_val} @ {axis}°"
+                # Normalize any odd inline axis (overwrite with harvested)
+                raw = re.sub(r"@\s*\d[\d\s\"”°ºo]*", "", raw)  # remove existing inline axis if garbled
+                raw = (raw + axis).strip()
 
-            # write once
-            if data[eye][key] is None:
-                data[eye][key] = clean_val
-
-    # Final tidy: ensure keys exist in requested order and None replaced by ""
-    for eye in ("OD", "OS"):
-        for k in list(data[eye].keys()):
-            if data[eye][k] is None:
-                data[eye][k] = ""
+            if not data[eye][key]:
+                data[eye][key] = raw
 
     return data
 
@@ -228,7 +210,7 @@ def parse_iol_master_text(text: str) -> dict:
 def health():
     return jsonify({
         "status": "running",
-        "version": "PDF-first parsing (axes robust) v1.0",
+        "version": "LakeCalc.ai PDF-first parser v1.1 (force modes)",
         "ocr_enabled": bool(vision_client)
     })
 
@@ -242,9 +224,13 @@ def parse_file():
 
     include_raw = request.args.get("include_raw") == "1"
     raw_only    = request.args.get("raw_only") == "1"
+    force_pdf   = request.args.get("force_pdf") == "1"   # force pdfminer
+    force_ocr   = request.args.get("force_ocr") == "1"   # force OCR
+
+    force_mode = "pdf" if force_pdf else ("ocr" if force_ocr else None)
 
     try:
-        text, source_tag = get_text_from_upload(fs)
+        text, source_tag = get_text_from_upload(fs, force_mode=force_mode)
 
         if raw_only:
             return jsonify({
@@ -273,19 +259,8 @@ def parse_file():
 
 @app.route("/")
 def root():
-    return """
-    <html><body style="font-family:system-ui;max-width:900px;margin:2rem auto;">
-      <h2>LakeCalc.ai — IOL Parser</h2>
-      <form action="/api/parse-file" method="post" enctype="multipart/form-data">
-        <p><input type="file" name="file" required /></p>
-        <button type="submit">Upload & Parse</button>
-      </form>
-      <p style="margin-top:1rem">
-        Debug options: append <code>?include_raw=1</code> to see a text preview, or <code>?raw_only=1</code> to dump text only.
-      </p>
-      <p>Health: <a href="/api/health">/api/health</a></p>
-    </body></html>
-    """
+    # Renders templates/index.html (drag & drop UI)
+    return render_template("index.html")
 
 @app.route("/<path:path>")
 def fallback(path):
@@ -295,5 +270,5 @@ def fallback(path):
         return jsonify({"ok": True, "route": path})
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+    port = int(os.environ.get("PORT", os.environ.get("PORT", 8080)))
+    app.run(host="0.0.0.0", port=int(port))
