@@ -79,7 +79,7 @@ def get_text_from_upload(fs, force_mode: str | None = None):
         if force_mode == "ocr":
             return ocr_pdf_to_text(pdf_bytes), "ocr_pdf"
 
-        # Default behavior: PDF text first, OCR fallback
+        # Default: PDF text first, OCR fallback
         text = try_pdf_text_extract(pdf_bytes)
         if text:
             return text, "pdf_text"
@@ -98,15 +98,15 @@ def get_text_from_upload(fs, force_mode: str | None = None):
 
 
 # ---------------------------
-# Parser for IOLMaster (ordered fields)
+# Parser for IOLMaster (ordered fields) — OD/OS block-based
 # ---------------------------
 def parse_iol_master_text(text: str) -> dict:
     """
     For each eye (OD/OS), returns these fields IN ORDER:
       source, axial_length, acd, k1 (D+axis), k2 (D+axis), ak (D+axis), wtw, cct, lt
+    Robust to PDF text reordering by first slicing OD/OS blocks, then parsing inside each block.
     """
-    # Device/source detection
-    source_label = None
+    # --- Source label ---
     if re.search(r"IOL\s*Master\s*700", text, re.IGNORECASE):
         source_label = "IOL Master 700"
     elif re.search(r"OCULUS\s+PENTACAM", text, re.IGNORECASE):
@@ -115,7 +115,7 @@ def parse_iol_master_text(text: str) -> dict:
         head_line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "Unknown")
         source_label = head_line[:60]
 
-    def fresh_eye():
+    def blank_eye():
         return OrderedDict([
             ("source", source_label),
             ("axial_length", ""),
@@ -128,49 +128,44 @@ def parse_iol_master_text(text: str) -> dict:
             ("lt", ""),
         ])
 
-    data = {"OD": fresh_eye(), "OS": fresh_eye()}
+    result = {"OD": blank_eye(), "OS": blank_eye()}
 
-    # Eye markers
-    eye_marks = [{"eye": m.group(1), "pos": m.start()} for m in re.finditer(r"\b(OD|OS)\b", text)]
-    eye_marks.sort(key=lambda d: d["pos"]) if eye_marks else None
+    # --- Find OD/OS headers and slice blocks ---
+    header_re = re.compile(r"\b(OD|OS)\b\s*:?", re.IGNORECASE)
+    marks = [{"eye": m.group(1).upper(), "pos": m.start()} for m in header_re.finditer(text)]
+    if not marks:
+        return result
 
-    def eye_before(pos: int) -> str:
-        last = "OD"
-        if not eye_marks:
-            return last
-        for mark in eye_marks:
-            if mark["pos"] <= pos:
-                last = mark["eye"]
-            else:
-                break
-        return last
+    marks.sort(key=lambda x: x["pos"])
+    blocks = []
+    for i, mark in enumerate(marks):
+        start = mark["pos"]
+        end = marks[i + 1]["pos"] if i + 1 < len(marks) else len(text)
+        blocks.append((mark["eye"], text[start:end]))
 
-    # Tokens
+    # --- Common patterns ---
     MM   = r"-?\d[\d.,]*\s*mm"
     UM   = r"-?\d[\d.,]*\s*(?:µm|um)"
     DVAL = r"-?\d[\d.,]*\s*D"
 
-    # Stop scanning axis at newline or next label
     LABEL_STOP = re.compile(r"(?:\r?\n|(?=(?:AL|ACD|CCT|LT|WTW|K1|K2|K|AK|ΔK)\s*:))", re.IGNORECASE)
 
     def harvest_axis(field_tail: str) -> str:
-        """Harvest up to 3 digits for axis within same field."""
+        """Harvest up to 3 digits for axis within the same field (line), then format ' @ XX°'."""
         mstop = LABEL_STOP.search(field_tail)
         seg = field_tail[:mstop.start()] if mstop else field_tail
         seg = seg[:120]
 
-        # 1) If '@' present, grab digits after it
+        # Prefer '@ ###'
         if "@" in seg:
             after = seg.split("@", 1)[1]
             digits = re.findall(r"\d", after)
             axis = "".join(digits)[:3]
             return f" @ {axis}°" if axis else ""
 
-        # 2) Otherwise, look for digits near a degree mark
+        # Fallback: digits near a degree sign
         m = re.search(r"(\d{1,3})\s*(?:°|º|o)\b", seg)
-        if m:
-            return f" @ {m.group(1)}°"
-        return ""
+        return f" @ {m.group(1)}°" if m else ""
 
     patterns = {
         "axial_length": re.compile(rf"AL:\s*({MM})", re.IGNORECASE),
@@ -178,29 +173,29 @@ def parse_iol_master_text(text: str) -> dict:
         "cct":          re.compile(rf"CCT:\s*({UM})", re.IGNORECASE),
         "lt":           re.compile(rf"LT:\s*({MM})", re.IGNORECASE),
         "wtw":          re.compile(rf"WTW:\s*({MM})", re.IGNORECASE),
-
-        # Capture diopters; axis will be appended from tail if present
         "k1":           re.compile(rf"K1:\s*({DVAL})", re.IGNORECASE),
         "k2":           re.compile(rf"K2:\s*({DVAL})", re.IGNORECASE),
+        # cylinder: device often prints just "K:"
         "ak":           re.compile(rf"(?:AK|ΔK|K):\s*({DVAL})", re.IGNORECASE),
     }
 
-    for key, pat in patterns.items():
-        for m in pat.finditer(text):
-            raw = re.sub(r"\s+", " ", m.group(1)).strip()
-            eye = eye_before(m.start())
+    # --- Parse each eye block independently ---
+    for eye, block in blocks:
+        for key, pat in patterns.items():
+            for m in pat.finditer(block):
+                raw = re.sub(r"\s+", " ", m.group(1)).strip()
 
-            if key in ("k1", "k2", "ak"):
-                tail = text[m.end(1): m.end(1) + 200]
-                axis = harvest_axis(tail)
-                # Normalize any odd inline axis (overwrite with harvested)
-                raw = re.sub(r"@\s*\d[\d\s\"”°ºo]*", "", raw)  # remove existing inline axis if garbled
-                raw = (raw + axis).strip()
+                if key in ("k1", "k2", "ak"):
+                    # strip any inline axis completely, then add our harvested one
+                    raw = re.sub(r"@\s*.*$", "", raw)
+                    tail = block[m.end(1): m.end(1) + 200]
+                    axis = harvest_axis(tail)
+                    raw = (raw + axis).strip()
 
-            if not data[eye][key]:
-                data[eye][key] = raw
+                if not result[eye][key]:
+                    result[eye][key] = raw
 
-    return data
+    return result
 
 
 # ---------------------------
@@ -210,7 +205,7 @@ def parse_iol_master_text(text: str) -> dict:
 def health():
     return jsonify({
         "status": "running",
-        "version": "LakeCalc.ai PDF-first parser v1.1 (force modes)",
+        "version": "LakeCalc.ai PDF-first parser v1.2 (OD/OS block parsing)",
         "ocr_enabled": bool(vision_client)
     })
 
