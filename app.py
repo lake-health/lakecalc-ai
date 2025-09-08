@@ -136,12 +136,9 @@ def normalize_for_ocr(text: str) -> str:
 # ---------------------------
 def parse_iol_master_text(text: str) -> dict:
     """
-    For each eye (OD/OS), returns fields IN ORDER:
+    Returns, per eye and IN ORDER:
       source, axial_length, acd, k1 (D+axis), k2 (D+axis), ak (D+axis), wtw, cct, lt
-
-    Eye headers are detected per-line using uppercase tokens to avoid Portuguese "os" false-positives:
-      - OD:   OD / O D / repeated ODOD... or keywords DIREITA / RIGHT
-      - OS:   OS / O S / OE / O E / repeated OSOS... or keywords ESQUERDA/ESQUERDO / LEFT
+    Header detection is conservative to avoid false OS from 'Olhos' and 'OD: Cilindro' lines.
     """
     # Source label
     if re.search(r"IOL\s*Master\s*700", text, re.IGNORECASE):
@@ -167,42 +164,54 @@ def parse_iol_master_text(text: str) -> dict:
 
     result = {"OD": blank_eye(), "OS": blank_eye()}
 
-    # ---- Build eye blocks by scanning lines (uppercase token detection) ----
-    lines = text.splitlines(keepends=True)  # keepends so we can track offsets
-    # Precompute line start offsets
-    offsets = []
-    pos = 0
+    # ---------- Find OD/OS headers, conservatively ----------
+    lines = text.splitlines(keepends=True)
+    offsets, pos = [], 0
     for ln in lines:
         offsets.append(pos)
         pos += len(ln)
 
+    def is_metricy(u: str) -> bool:
+        # any label or obvious number present -> not a header
+        if re.search(r"\b(AL|ACD|CCT|LT|WTW|K1|K2|AK|ΔK|TK1|TK2|SE|SD|P:|Ix|Iy)\b", u): return True
+        if "CILINDRO" in u: return True
+        if re.search(r"\d", u): return True
+        return False
+
     markers = []
-    for idx, line in enumerate(lines):
-        U = line.upper()
+    for i, line in enumerate(lines):
+        u = line.upper()
+        if not u.strip(): 
+            continue
+        # never treat 'OLHOS' lines as headers
+        if re.search(r"\bOLHOS\b", u): 
+            continue
 
-        # strong word clues
-        is_od_word = bool(re.search(r'\bDIREITA\b|\bRIGHT\b', U))
-        is_os_word = bool(re.search(r'\bESQUERDA\b|\bESQUERDO\b|\bLEFT\b', U))
+        # strong word cues first
+        if ("DIREITA" in u or "RIGHT" in u) and not is_metricy(u):
+            markers.append({"eye": "OD", "pos": offsets[i]})
+            continue
+        if (("ESQUERDA" in u or "ESQUERDO" in u or "LEFT" in u) and not is_metricy(u)):
+            markers.append({"eye": "OS", "pos": offsets[i]})
+            continue
 
-        # token OD/OS/OE detection on uppercase line, as stand-alone tokens
-        # standalone: not preceded/followed by letters (avoid OLHOS -> ...OS)
-        is_od_token = bool(re.search(r'(?<![A-Z])(?:OD|O[^A-Z]*D)(?![A-Z])', U))
-        is_os_token = bool(re.search(r'(?<![A-Z])(?:OS|O[^A-Z]*S|OE|O[^A-Z]*E)(?![A-Z])', U))
+        # stand-alone tokens (reject 'OD:' note lines)
+        if re.search(r"\bOD\b|\bO\s*D\b", u) and not is_metricy(u) and not re.search(r"\bOD\s*:", u):
+            markers.append({"eye": "OD", "pos": offsets[i]})
+            continue
+        if re.search(r"\bOS\b|\bO\s*S\b|\bOE\b|\bO\s*E\b", u) and not is_metricy(u):
+            markers.append({"eye": "OS", "pos": offsets[i]})
+            continue
 
-        if is_od_word or is_od_token:
-            markers.append({"eye": "OD", "pos": offsets[idx]})
-        if is_os_word or is_os_token:
-            markers.append({"eye": "OS", "pos": offsets[idx]})
-
-    # sort and collapse near-duplicates
     markers.sort(key=lambda x: x["pos"])
+    # collapse near duplicates
     collapsed = []
     for m in markers:
         if not collapsed or (m["pos"] - collapsed[-1]["pos"]) > 6 or m["eye"] != collapsed[-1]["eye"]:
             collapsed.append(m)
     markers = collapsed
 
-    # Build contiguous blocks per detected header
+    # Build blocks; if none, treat whole as one OD block
     blocks = []
     if markers:
         for i, mark in enumerate(markers):
@@ -210,22 +219,18 @@ def parse_iol_master_text(text: str) -> dict:
             end = markers[i + 1]["pos"] if i + 1 < len(markers) else len(text)
             blocks.append((mark["eye"], text[start:end]))
     else:
-        # No markers found: treat whole text as one OD block (best effort)
         blocks = [("OD", text)]
 
-    # ---- Patterns & axis harvesting ----
+    # ---------- Patterns & axis harvesting ----------
     MM   = r"-?\d[\d.,]*\s*mm"
     UM   = r"-?\d[\d.,]*\s*(?:µm|um)"
     DVAL = r"-?\d[\d.,]*\s*D"
-
     LABEL_STOP = re.compile(r"(?:\r?\n|(?=(?:AL|ACD|CCT|LT|WTW|K1|K2|K|AK|ΔK)\s*:))", re.IGNORECASE)
 
     def harvest_axis(field_tail: str) -> str:
-        """Harvest up to 3 digits for axis within same field, format ' @ XX°'."""
         mstop = LABEL_STOP.search(field_tail)
         seg = field_tail[:mstop.start()] if mstop else field_tail
         seg = seg[:120]
-
         if "@" in seg:
             after = seg.split("@", 1)[1]
             digits = re.findall(r"\d", after)
@@ -251,7 +256,7 @@ def parse_iol_master_text(text: str) -> dict:
             for m in pat.finditer(block):
                 raw = re.sub(r"\s+", " ", m.group(1)).strip()
                 if key in ("k1", "k2", "ak"):
-                    raw = re.sub(r"@\s*.*$", "", raw)   # drop any inline axis tail
+                    raw = re.sub(r"@\s*.*$", "", raw)  # drop inline axis tail
                     tail = block[m.end(1): m.end(1) + 200]
                     axis = harvest_axis(tail)
                     raw = (raw + axis).strip()
@@ -261,30 +266,27 @@ def parse_iol_master_text(text: str) -> dict:
 
     parsed_blocks = [(eye, parse_block(block)) for eye, block in blocks]
 
-    # If exactly one block has measurements, map it to OD (safer default for single-eye exports)
+    # If exactly one block has measurements, map it to OD (single-eye export safety)
     def any_filled(d): return any(v for v in d.values())
-    blocks_with_data = [(e, d) for (e, d) in parsed_blocks if any_filled(d)]
-    if len(blocks_with_data) == 1:
-        e, d = blocks_with_data[0]
+    with_data = [(e, d) for (e, d) in parsed_blocks if any_filled(d)]
+    if len(with_data) == 1:
+        _, d = with_data[0]
         for k, v in d.items():
             if v: result["OD"][k] = v
         return result
 
-    # Otherwise merge per eye (first occurrence wins per field)
+    # Merge per eye (first occurrence wins)
     merged = {"OD": {}, "OS": {}}
     for e, d in parsed_blocks:
         if e not in merged: merged[e] = {}
         for k, v in d.items():
             if v and k not in merged[e]:
                 merged[e][k] = v
-
     for e in ("OD", "OS"):
-        if e in merged:
-            for k, v in merged[e].items():
-                if v: result[e][k] = v
+        for k, v in merged.get(e, {}).items():
+            if v: result[e][k] = v
 
     return result
-
 
 # ---------------------------
 # Routes
