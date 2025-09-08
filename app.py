@@ -25,9 +25,7 @@ try:
         credentials = service_account.Credentials.from_service_account_info(credentials_info)
         client = vision.ImageAnnotatorClient(credentials=credentials)
     else:
-        # If you’re running on GCP with a service account file on disk,
-        # set GOOGLE_APPLICATION_CREDENTIALS to the path and drop the JSON env var.
-        # Otherwise OCR will be disabled and the endpoint will raise a helpful error.
+        # If running on GCP with GOOGLE_APPLICATION_CREDENTIALS (path) set, this also works:
         if os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
             client = vision.ImageAnnotatorClient()
         else:
@@ -59,9 +57,10 @@ def parse_iol_master_700(text: str) -> dict:
     Robust parser for IOLMaster 700 blocks.
 
     - Assigns each metric to the last eye marker (OD/OS) that appears BEFORE it.
-    - Captures K1/K2/AK values with inline axes (when present), and
-      scavenges axis from the same line (or until next label) when OCR splits it.
-    - Accepts degree variants ° / º / o and commas for decimals (keeps raw text).
+    - Captures K1/K2/AK values with inline axes (when present).
+    - If OCR splits axis, scavenges it from the same line (or up to next label),
+      accepting axes with/without '@' and with/without a degree glyph.
+    - Prefers 1–2 digit axes to avoid confusing 10 with 100.
     """
     data = {
         "OD": OrderedDict([
@@ -76,7 +75,7 @@ def parse_iol_master_700(text: str) -> dict:
         ])
     }
 
-    # --- Find eye markers (OD/OS) and positions
+    # --- Eye markers (OD/OS)
     eye_markers = [{"eye": m.group(1), "pos": m.start()} for m in re.finditer(r"\b(OD|OS)\b", text)]
     if not eye_markers:
         return {"error": "No OD or OS markers found."}
@@ -92,8 +91,8 @@ def parse_iol_master_700(text: str) -> dict:
         return last or eye_markers[0]["eye"]
 
     # --- Patterns
-    AXIS_INLINE = r"\s*@\s*\d{1,3}\s*(?:°|º|o)"
-    D_VAL       = rf"-?[\d,.]+\s*D(?:{AXIS_INLINE})?"   # diopters with optional inline axis
+    AXIS_INLINE = r"\s*@\s*\d{1,3}\s*(?:°|º|o)"       # inline axis (when OCR keeps it)
+    D_VAL       = rf"-?[\d,.]+\s*D(?:{AXIS_INLINE})?" # diopters with optional inline axis
     MM_VAL      = r"-?[\d,.]+\s*mm"
     UM_VAL      = r"-?[\d,.]+\s*(?:µm|um)"
 
@@ -105,26 +104,45 @@ def parse_iol_master_700(text: str) -> dict:
         "wtw":          rf"WTW:\s*({MM_VAL})",
         "k1":           rf"K1:\s*({D_VAL})",
         "k2":           rf"K2:\s*({D_VAL})",
-        # On many IOLMaster printouts the cylinder line is "K:" (sometimes AK or ΔK)
+        # Cylinder line can be K:, AK:, or ΔK:
         "ak":           rf"(?:AK|ΔK|K):\s*({D_VAL})",
     }
 
     # Stop scavenging at newline OR at the next metric label
-    LABEL_STOP = re.compile(r"(?:\r?\n|(?=(?:AL|ACD|CCT|LT|WTW|K1|K2|K|AK|ΔK)\s*:))", re.IGNORECASE)
+    LABEL_STOP = re.compile(
+        r"(?:\r?\n|(?=(?:AL|ACD|CCT|LT|WTW|K1|K2|K|AK|ΔK)\s*:))",
+        re.IGNORECASE
+    )
 
-    # Accept axes with or without '@'
-    AXIS_PREFER_1_2 = re.compile(r"(?:@?\s*)(\d{1,2})\s*(?:°|º|o)\b")  # 0–99
-    AXIS_FALLBACK_3 = re.compile(r"(?:@?\s*)(\d{3})\s*(?:°|º|o)\b")    # 100–999 (rare, but robust)
+    # Axes with/without @ and with/without degree glyph:
+    AXIS_1_2_ANY = re.compile(r"(?:@?\s*)(\d{1,2})(?:\s*(?:°|º|o))?\b")  # prefer 1–2 digits
+    AXIS_3_ANY   = re.compile(r"(?:@?\s*)(\d{3})(?:\s*(?:°|º|o))?\b")    # fallback 3 digits
 
-    def scavenge_axis(tail: str) -> str | None:
+    def scavenge_axis_forward(tail: str) -> str | None:
+        # Trim to same line (or before next label), then cap window
         mstop = LABEL_STOP.search(tail)
         segment = tail[:mstop.start()] if mstop else tail
-        window = segment[:40]  # cap to stay on the same line / vicinity
-        m = AXIS_PREFER_1_2.search(window)
+        window = segment[:60]  # generous but still local
+        m = AXIS_1_2_ANY.search(window)
         if m:
             return m.group(1)
-        m = AXIS_FALLBACK_3.search(window)
+        m = AXIS_3_ANY.search(window)
         return m.group(1) if m else None
+
+    def scavenge_axis_backward(head: str) -> str | None:
+        # Look a little to the left of the value in case OCR placed axis first.
+        # Stop at previous newline/label to avoid crossing fields.
+        start_limit = max(0, len(head) - 40)
+        slice_ = head[start_limit:]
+        # Cut further back to last newline/label if present
+        nl = slice_.rfind("\n")
+        if nl != -1:
+            slice_ = slice_[nl+1:]
+        # Find the last axis-looking token
+        candidates = list(AXIS_1_2_ANY.finditer(slice_)) or list(AXIS_3_ANY.finditer(slice_))
+        if candidates:
+            return candidates[-1].group(1)
+        return None
 
     # --- Extract & assign
     for key, pattern in patterns.items():
@@ -133,9 +151,10 @@ def parse_iol_master_700(text: str) -> dict:
             value = re.sub(r"\s+", " ", raw).strip()
             eye = eye_before(m.start())
 
-            # If inline axis isn't present, try scavenging from same line/next chars
+            # If inline axis isn't present, try forward then backward scavenging
             if key in ("k1", "k2", "ak") and "@" not in value:
-                axis = scavenge_axis(text[m.end(1): m.end(1) + 100])
+                forward_axis = scavenge_axis_forward(text[m.end(1): m.end(1) + 120])
+                axis = forward_axis or scavenge_axis_backward(text[:m.start(1)])
                 if axis:
                     value = f"{value} @ {axis}°"
 
@@ -171,7 +190,7 @@ def parse_clinical_data(text: str) -> dict:
 def health_check():
     return jsonify({
         "status": "running",
-        "version": "20.0.0 (IOLMaster robust axis)",
+        "version": "20.1.0 (axis forward/backward scavenger)",
         "ocr_enabled": bool(client)
     })
 
@@ -212,11 +231,8 @@ def parse_file_endpoint():
         return jsonify({"error": str(e)}), 500
 
 
-# Basic front-end (optional template). If you don’t have templates, this still works.
 @app.route("/")
 def serve_app():
-    # If you have templates/index.html, this will render it.
-    # Otherwise, a tiny inline page to test the endpoint.
     try:
         return render_template("index.html")
     except Exception:
