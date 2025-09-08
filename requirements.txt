@@ -1,9 +1,11 @@
-Flask
-Flask-Cors
-google-cloud-vision
-Pillow
-PyPDF2
-gunicorn
-# Use the headless version of OpenCV to avoid GUI dependencies
-opencv-python-headless
-pdf2image
+Flask==3.0.3
+gunicorn==21.2.0
+
+pdfminer.six==20231228
+pdf2image==1.17.0
+
+google-cloud-vision==3.7.2
+google-auth==2.33.0
+google-auth-oauthlib==1.2.0
+
+Pillow==10.3.0
