@@ -6,11 +6,12 @@ from io import BytesIO
 from flask import Flask, request, jsonify, render_template
 from pdfminer.high_level import extract_text as pdfminer_extract_text
 
-# Google Vision is only used as a fallback if the PDF has no text layer
+# Google Vision used only as fallback when there's no text layer / for images
 from google.cloud import vision
 from pdf2image import convert_from_bytes
 
 app = Flask(__name__, static_folder='static', template_folder='templates')
+
 
 # ---------------------------
 # Google Cloud Vision (OCR fallback)
@@ -27,7 +28,8 @@ try:
     elif os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
         vision_client = vision.ImageAnnotatorClient()
     else:
-        print("INFO: Vision credentials not set. OCR fallback disabled (pdfminer will still work).")
+        # OK: born-digital PDFs still work via pdfminer
+        print("INFO: Vision credentials not set. OCR fallback disabled.")
 except Exception as e:
     print(f"Vision init error: {e}")
 
@@ -36,11 +38,10 @@ except Exception as e:
 # Text extraction (PDF-first, with optional force modes)
 # ---------------------------
 def try_pdf_text_extract(pdf_bytes: bytes) -> str:
-    """Extract native text from a born-digital PDF (no OCR)."""
+    """Extract native text from born-digital PDF (no OCR)."""
     try:
         text = pdfminer_extract_text(BytesIO(pdf_bytes)) or ""
-        # Mild whitespace normalization
-        text = re.sub(r"[ \t]+\n", "\n", text)
+        text = re.sub(r"[ \t]+\n", "\n", text)  # mild cleanup
         return text.strip()
     except Exception as e:
         print(f"pdfminer error: {e}")
@@ -64,7 +65,7 @@ def ocr_pdf_to_text(pdf_bytes: bytes) -> str:
 
 def get_text_from_upload(fs, force_mode: str | None = None):
     """
-    Returns (text, source_tag) where source_tag in {'pdf_text','ocr_pdf','ocr_image'}.
+    Returns (text, source_tag): 'pdf_text' | 'ocr_pdf' | 'ocr_image'
     force_mode: 'pdf' to force pdfminer, 'ocr' to force OCR (when possible).
     """
     name = (fs.filename or "").lower()
@@ -97,15 +98,53 @@ def get_text_from_upload(fs, force_mode: str | None = None):
 
 
 # ---------------------------
-# Parser for IOLMaster (ordered fields) — robust OD/OS block detection
+# Normalization to fix OCR/PDF line break quirks
+# ---------------------------
+def normalize_for_ocr(text: str) -> str:
+    """
+    Fix common fragmentation:
+      - Join label/value/unit splits (AL/ACD/LT/WTW/CCT)
+      - Join K-lines split across value and 'D'
+      - Normalize scattered '@', '°', and digits into '@ XX°'
+      - Collapse excessive whitespace
+    """
+    t = text.replace("\u00A0", " ")
+
+    # AL/ACD/LT/WTW/CCT on 3 lines -> single line
+    t = re.sub(r"(?mi)^(AL|ACD|LT|WTW|CCT)\s*:\s*\n\s*([-\d.,]+)\s*\n\s*(mm|µm|um)\b",
+               r"\1: \2 \3", t)
+
+    # K lines: value on one line, 'D' on next
+    t = re.sub(r"(?mi)^(K1|K2|K|AK|ΔK)\s*:\s*\n\s*([-\d.,]+)\s*\n\s*D\b",
+               r"\1: \2 D", t)
+
+    # Normalize axis patterns: "@ \n ° \n 10" or "@ \n 10 \n °" -> "@ 10°"
+    t = re.sub(r"@\s*(?:\r?\n|\s)*(?:[°ºo])\s*(?:\r?\n|\s)*?(\d{1,3})\b", r"@ \1°", t)
+    t = re.sub(r"@\s*(?:\r?\n|\s)*(\d{1,3})\s*(?:\r?\n|\s)*(?:[°ºo])\b", r"@ \1°", t)
+
+    # Lone degree+digits split across lines -> " 10°"
+    t = re.sub(r"(?:[°ºo])\s*(?:\r?\n|\s)*?(\d{1,3})\b", r" \1°", t)
+
+    # Collapse internal whitespace
+    t = re.sub(r"[ \t]+", " ", t)
+
+    return t
+
+
+# ---------------------------
+# Parser for IOLMaster (ordered fields) — robust OD/OS detection
 # ---------------------------
 def parse_iol_master_text(text: str) -> dict:
     """
-    For each eye (OD/OS), returns these fields IN ORDER:
+    For each eye (OD/OS), returns fields IN ORDER:
       source, axial_length, acd, k1 (D+axis), k2 (D+axis), ak (D+axis), wtw, cct, lt
-    Uses line-anchored OD/OS (and localized) headers to avoid false matches inside words.
+
+    Robust to localized headers and embedded tokens:
+      - OD headers on a line: tokens anywhere: OD / O D / repeated (ODOD...) / direita / right
+      - OS headers on a line: OS / O S / OE / O E / repeated (OSOS...) / esquerda/esquerdo / left
+      - Slices into blocks by header lines; parses each block independently.
     """
-    # --- Source label ---
+    # Source label
     if re.search(r"IOL\s*Master\s*700", text, re.IGNORECASE):
         source_label = "IOL Master 700"
     elif re.search(r"OCULUS\s+PENTACAM", text, re.IGNORECASE):
@@ -129,10 +168,9 @@ def parse_iol_master_text(text: str) -> dict:
 
     result = {"OD": blank_eye(), "OS": blank_eye()}
 
-    # --- Robust, line-anchored eye headers ---
-    # Only match at the **start of a line** to avoid 'OS' inside words like 'Olhos'
-    OD_HDR = re.compile(r"(?mi)^[ \t]*(?:OD|O[ \t]*D|direita|right)\s*:?", re.IGNORECASE)
-    OS_HDR = re.compile(r"(?mi)^[ \t]*(?:OS|O[ \t]*S|OE|O[ \t]*E|esquerdo|esquerda|left)\s*:?", re.IGNORECASE)
+    # Line-based eye headers: token can appear anywhere on the line (handles "AnáliseODOD...")
+    OD_HDR = re.compile(r"(?mi)^[^\r\n]*?(?:\bO\s*D\b|(?:O\s*D){2,}|\bdireita\b|\bright\b)\s*:?")
+    OS_HDR = re.compile(r"(?mi)^[^\r\n]*?(?:\bO\s*S\b|(?:O\s*S){2,}|\bO\s*E\b|\besquerda\b|\besquerdo\b|\bleft\b)\s*:?")
 
     markers = []
     for m in OD_HDR.finditer(text):
@@ -140,36 +178,35 @@ def parse_iol_master_text(text: str) -> dict:
     for m in OS_HDR.finditer(text):
         markers.append({"eye": "OS", "pos": m.start()})
 
-    if not markers:
-        # No explicit eye headers found — return empty shells with source
-        return result
-
     markers.sort(key=lambda x: x["pos"])
 
-    # Collapse near-duplicate headers (pdfminer sometimes repeats tokens)
+    # Collapse near-duplicates (e.g., ODODOD… yields multiple close matches)
     collapsed = []
     for m in markers:
         if not collapsed or (m["pos"] - collapsed[-1]["pos"]) > 6 or m["eye"] != collapsed[-1]["eye"]:
             collapsed.append(m)
     markers = collapsed
 
-    # Build contiguous blocks per eye
+    # Build contiguous blocks per detected header
     blocks = []
     for i, mark in enumerate(markers):
         start = mark["pos"]
         end = markers[i + 1]["pos"] if i + 1 < len(markers) else len(text)
         blocks.append((mark["eye"], text[start:end]))
 
-    # --- Patterns ---
+    # If none detected, treat whole text as one OD block (best-effort)
+    if not blocks:
+        blocks = [("OD", text)]
+
+    # Patterns
     MM   = r"-?\d[\d.,]*\s*mm"
     UM   = r"-?\d[\d.,]*\s*(?:µm|um)"
     DVAL = r"-?\d[\d.,]*\s*D"
 
-    # Stop axis at newline or next label
     LABEL_STOP = re.compile(r"(?:\r?\n|(?=(?:AL|ACD|CCT|LT|WTW|K1|K2|K|AK|ΔK)\s*:))", re.IGNORECASE)
 
     def harvest_axis(field_tail: str) -> str:
-        """Harvest up to 3 digits for axis within the same field, then format ' @ XX°'."""
+        """Harvest up to 3 digits for axis within same field, format ' @ XX°'."""
         mstop = LABEL_STOP.search(field_tail)
         seg = field_tail[:mstop.start()] if mstop else field_tail
         seg = seg[:120]
@@ -179,7 +216,6 @@ def parse_iol_master_text(text: str) -> dict:
             digits = re.findall(r"\d", after)
             axis = "".join(digits)[:3]
             return f" @ {axis}°" if axis else ""
-
         m = re.search(r"(\d{1,3})\s*(?:°|º|o)\b", seg)
         return f" @ {m.group(1)}°" if m else ""
 
@@ -191,25 +227,48 @@ def parse_iol_master_text(text: str) -> dict:
         "wtw":          re.compile(rf"WTW:\s*({MM})", re.IGNORECASE),
         "k1":           re.compile(rf"K1:\s*({DVAL})", re.IGNORECASE),
         "k2":           re.compile(rf"K2:\s*({DVAL})", re.IGNORECASE),
-        # cylinder line can be 'K:', 'AK:', or 'ΔK:'
         "ak":           re.compile(rf"(?:AK|ΔK|K):\s*({DVAL})", re.IGNORECASE),
     }
 
-    # --- Parse each eye block independently ---
-    for eye, block in blocks:
+    # Parse each block independently
+    def parse_block(block: str) -> dict:
+        out = {"axial_length":"", "acd":"", "k1":"", "k2":"", "ak":"", "wtw":"", "cct":"", "lt":""}
         for key, pat in patterns.items():
             for m in pat.finditer(block):
                 raw = re.sub(r"\s+", " ", m.group(1)).strip()
-
                 if key in ("k1", "k2", "ak"):
-                    # Remove any inline axis then add harvested one (avoids '@ 1000°' remnants)
-                    raw = re.sub(r"@\s*.*$", "", raw)
+                    raw = re.sub(r"@\s*.*$", "", raw)   # drop any inline axis tail
                     tail = block[m.end(1): m.end(1) + 200]
                     axis = harvest_axis(tail)
                     raw = (raw + axis).strip()
+                if not out[key]:
+                    out[key] = raw
+        return out
 
-                if not result[eye][key]:
-                    result[eye][key] = raw
+    parsed_blocks = [(eye, parse_block(block)) for eye, block in blocks]
+
+    # If exactly one block has measurements, map it to OD (safer default)
+    def any_filled(d): return any(v for v in d.values())
+    blocks_with_data = [(e, d) for (e, d) in parsed_blocks if any_filled(d)]
+    if len(blocks_with_data) == 1:
+        e, d = blocks_with_data[0]
+        # Force OD if only one eye has data (covers single-eye exports)
+        for k, v in d.items():
+            if v: result["OD"][k] = v
+        return result
+
+    # Otherwise merge per eye (first occurrence wins per field)
+    merged = {"OD": {}, "OS": {}}
+    for e, d in parsed_blocks:
+        if e not in merged: merged[e] = {}
+        for k, v in d.items():
+            if v and k not in merged[e]:
+                merged[e][k] = v
+
+    for e in ("OD", "OS"):
+        if e in merged:
+            for k, v in merged[e].items():
+                if v: result[e][k] = v
 
     return result
 
@@ -221,7 +280,7 @@ def parse_iol_master_text(text: str) -> dict:
 def health():
     return jsonify({
         "status": "running",
-        "version": "LakeCalc.ai PDF-first parser v1.3 (localized OD/OS headers)",
+        "version": "LakeCalc.ai parser v2.0 (PDF-first + OCR normalize + robust OD/OS)",
         "ocr_enabled": bool(vision_client)
     })
 
@@ -242,6 +301,7 @@ def parse_file():
 
     try:
         text, source_tag = get_text_from_upload(fs, force_mode=force_mode)
+        text = normalize_for_ocr(text)  # <<< normalize before parsing
 
         if raw_only:
             return jsonify({
