@@ -103,12 +103,7 @@ def parse_iol_master_text(text: str) -> dict:
     """
     For each eye (OD/OS), returns these fields IN ORDER:
       source, axial_length, acd, k1 (D+axis), k2 (D+axis), ak (D+axis), wtw, cct, lt
-
-    Robust to localized headers and duplicated tokens by:
-      - detecting OD with:  OD, O D, direita, right
-      - detecting OS with:  OS, O S, OE, O E, esquerdo/esquerda, left
-      - collapsing consecutive/near-duplicate headers (e.g., 'ODODODODdireita')
-      - slicing text into eye blocks, then parsing each block independently
+    Uses line-anchored OD/OS (and localized) headers to avoid false matches inside words.
     """
     # --- Source label ---
     if re.search(r"IOL\s*Master\s*700", text, re.IGNORECASE):
@@ -134,28 +129,24 @@ def parse_iol_master_text(text: str) -> dict:
 
     result = {"OD": blank_eye(), "OS": blank_eye()}
 
-    # --- Eye header detection (localized & tolerant) ---
-    # Build two independent regexes so we can label matches as OD/OS.
-    OD_HDR = re.compile(
-        r"(?i)\b(?:OD|O\s*D|direita|right)\b"
-    )
-    OS_HDR = re.compile(
-        r"(?i)\b(?:OS|O\s*S|OE|O\s*E|esquerdo|esquerda|left)\b"
-    )
+    # --- Robust, line-anchored eye headers ---
+    # Only match at the **start of a line** to avoid 'OS' inside words like 'Olhos'
+    OD_HDR = re.compile(r"(?mi)^[ \t]*(?:OD|O[ \t]*D|direita|right)\s*:?", re.IGNORECASE)
+    OS_HDR = re.compile(r"(?mi)^[ \t]*(?:OS|O[ \t]*S|OE|O[ \t]*E|esquerdo|esquerda|left)\s*:?", re.IGNORECASE)
 
-    # Scan for both and collect markers
     markers = []
     for m in OD_HDR.finditer(text):
         markers.append({"eye": "OD", "pos": m.start()})
     for m in OS_HDR.finditer(text):
         markers.append({"eye": "OS", "pos": m.start()})
+
     if not markers:
+        # No explicit eye headers found — return empty shells with source
         return result
 
-    # Sort by position
     markers.sort(key=lambda x: x["pos"])
 
-    # Collapse near-duplicate markers (pdfminer sometimes prints ODODOD...)
+    # Collapse near-duplicate headers (pdfminer sometimes repeats tokens)
     collapsed = []
     for m in markers:
         if not collapsed or (m["pos"] - collapsed[-1]["pos"]) > 6 or m["eye"] != collapsed[-1]["eye"]:
@@ -169,7 +160,7 @@ def parse_iol_master_text(text: str) -> dict:
         end = markers[i + 1]["pos"] if i + 1 < len(markers) else len(text)
         blocks.append((mark["eye"], text[start:end]))
 
-    # --- Common patterns ---
+    # --- Patterns ---
     MM   = r"-?\d[\d.,]*\s*mm"
     UM   = r"-?\d[\d.,]*\s*(?:µm|um)"
     DVAL = r"-?\d[\d.,]*\s*D"
@@ -200,6 +191,7 @@ def parse_iol_master_text(text: str) -> dict:
         "wtw":          re.compile(rf"WTW:\s*({MM})", re.IGNORECASE),
         "k1":           re.compile(rf"K1:\s*({DVAL})", re.IGNORECASE),
         "k2":           re.compile(rf"K2:\s*({DVAL})", re.IGNORECASE),
+        # cylinder line can be 'K:', 'AK:', or 'ΔK:'
         "ak":           re.compile(rf"(?:AK|ΔK|K):\s*({DVAL})", re.IGNORECASE),
     }
 
@@ -210,7 +202,7 @@ def parse_iol_master_text(text: str) -> dict:
                 raw = re.sub(r"\s+", " ", m.group(1)).strip()
 
                 if key in ("k1", "k2", "ak"):
-                    # strip any inline axis completely, then add our harvested one
+                    # Remove any inline axis then add harvested one (avoids '@ 1000°' remnants)
                     raw = re.sub(r"@\s*.*$", "", raw)
                     tail = block[m.end(1): m.end(1) + 200]
                     axis = harvest_axis(tail)
