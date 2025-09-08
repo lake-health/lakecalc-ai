@@ -139,10 +139,9 @@ def parse_iol_master_text(text: str) -> dict:
     For each eye (OD/OS), returns fields IN ORDER:
       source, axial_length, acd, k1 (D+axis), k2 (D+axis), ak (D+axis), wtw, cct, lt
 
-    Robust to localized headers and embedded tokens:
-      - OD headers on a line: tokens anywhere: OD / O D / repeated (ODOD...) / direita / right
-      - OS headers on a line: OS / O S / OE / O E / repeated (OSOS...) / esquerda/esquerdo / left
-      - Slices into blocks by header lines; parses each block independently.
+    Eye headers are detected per-line using uppercase tokens to avoid Portuguese "os" false-positives:
+      - OD:   OD / O D / repeated ODOD... or keywords DIREITA / RIGHT
+      - OS:   OS / O S / OE / O E / repeated OSOS... or keywords ESQUERDA/ESQUERDO / LEFT
     """
     # Source label
     if re.search(r"IOL\s*Master\s*700", text, re.IGNORECASE):
@@ -168,19 +167,35 @@ def parse_iol_master_text(text: str) -> dict:
 
     result = {"OD": blank_eye(), "OS": blank_eye()}
 
-    # Line-based eye headers: token can appear anywhere on the line (handles "AnáliseODOD...")
-    OD_HDR = re.compile(r"(?mi)^[^\r\n]*?(?:\bO\s*D\b|(?:O\s*D){2,}|\bdireita\b|\bright\b)\s*:?")
-    OS_HDR = re.compile(r"(?mi)^[^\r\n]*?(?:\bO\s*S\b|(?:O\s*S){2,}|\bO\s*E\b|\besquerda\b|\besquerdo\b|\bleft\b)\s*:?")
+    # ---- Build eye blocks by scanning lines (uppercase token detection) ----
+    lines = text.splitlines(keepends=True)  # keepends so we can track offsets
+    # Precompute line start offsets
+    offsets = []
+    pos = 0
+    for ln in lines:
+        offsets.append(pos)
+        pos += len(ln)
 
     markers = []
-    for m in OD_HDR.finditer(text):
-        markers.append({"eye": "OD", "pos": m.start()})
-    for m in OS_HDR.finditer(text):
-        markers.append({"eye": "OS", "pos": m.start()})
+    for idx, line in enumerate(lines):
+        U = line.upper()
 
+        # strong word clues
+        is_od_word = bool(re.search(r'\bDIREITA\b|\bRIGHT\b', U))
+        is_os_word = bool(re.search(r'\bESQUERDA\b|\bESQUERDO\b|\bLEFT\b', U))
+
+        # token OD/OS/OE detection on uppercase line, as stand-alone tokens
+        # standalone: not preceded/followed by letters (avoid OLHOS -> ...OS)
+        is_od_token = bool(re.search(r'(?<![A-Z])(?:OD|O[^A-Z]*D)(?![A-Z])', U))
+        is_os_token = bool(re.search(r'(?<![A-Z])(?:OS|O[^A-Z]*S|OE|O[^A-Z]*E)(?![A-Z])', U))
+
+        if is_od_word or is_od_token:
+            markers.append({"eye": "OD", "pos": offsets[idx]})
+        if is_os_word or is_os_token:
+            markers.append({"eye": "OS", "pos": offsets[idx]})
+
+    # sort and collapse near-duplicates
     markers.sort(key=lambda x: x["pos"])
-
-    # Collapse near-duplicates (e.g., ODODOD… yields multiple close matches)
     collapsed = []
     for m in markers:
         if not collapsed or (m["pos"] - collapsed[-1]["pos"]) > 6 or m["eye"] != collapsed[-1]["eye"]:
@@ -189,16 +204,16 @@ def parse_iol_master_text(text: str) -> dict:
 
     # Build contiguous blocks per detected header
     blocks = []
-    for i, mark in enumerate(markers):
-        start = mark["pos"]
-        end = markers[i + 1]["pos"] if i + 1 < len(markers) else len(text)
-        blocks.append((mark["eye"], text[start:end]))
-
-    # If none detected, treat whole text as one OD block (best-effort)
-    if not blocks:
+    if markers:
+        for i, mark in enumerate(markers):
+            start = mark["pos"]
+            end = markers[i + 1]["pos"] if i + 1 < len(markers) else len(text)
+            blocks.append((mark["eye"], text[start:end]))
+    else:
+        # No markers found: treat whole text as one OD block (best effort)
         blocks = [("OD", text)]
 
-    # Patterns
+    # ---- Patterns & axis harvesting ----
     MM   = r"-?\d[\d.,]*\s*mm"
     UM   = r"-?\d[\d.,]*\s*(?:µm|um)"
     DVAL = r"-?\d[\d.,]*\s*D"
@@ -230,7 +245,6 @@ def parse_iol_master_text(text: str) -> dict:
         "ak":           re.compile(rf"(?:AK|ΔK|K):\s*({DVAL})", re.IGNORECASE),
     }
 
-    # Parse each block independently
     def parse_block(block: str) -> dict:
         out = {"axial_length":"", "acd":"", "k1":"", "k2":"", "ak":"", "wtw":"", "cct":"", "lt":""}
         for key, pat in patterns.items():
@@ -247,12 +261,11 @@ def parse_iol_master_text(text: str) -> dict:
 
     parsed_blocks = [(eye, parse_block(block)) for eye, block in blocks]
 
-    # If exactly one block has measurements, map it to OD (safer default)
+    # If exactly one block has measurements, map it to OD (safer default for single-eye exports)
     def any_filled(d): return any(v for v in d.values())
     blocks_with_data = [(e, d) for (e, d) in parsed_blocks if any_filled(d)]
     if len(blocks_with_data) == 1:
         e, d = blocks_with_data[0]
-        # Force OD if only one eye has data (covers single-eye exports)
         for k, v in d.items():
             if v: result["OD"][k] = v
         return result
@@ -280,7 +293,7 @@ def parse_iol_master_text(text: str) -> dict:
 def health():
     return jsonify({
         "status": "running",
-        "version": "LakeCalc.ai parser v2.0 (PDF-first + OCR normalize + robust OD/OS)",
+        "version": "LakeCalc.ai parser v2.1 (token-OD/OS; PDF-first + OCR normalize)",
         "ocr_enabled": bool(vision_client)
     })
 
@@ -301,7 +314,7 @@ def parse_file():
 
     try:
         text, source_tag = get_text_from_upload(fs, force_mode=force_mode)
-        text = normalize_for_ocr(text)  # <<< normalize before parsing
+        text = normalize_for_ocr(text)  # normalize before parsing
 
         if raw_only:
             return jsonify({
