@@ -27,7 +27,6 @@ try:
     elif os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
         vision_client = vision.ImageAnnotatorClient()
     else:
-        # OK: we can still parse born-digital PDFs without OCR
         print("INFO: Vision credentials not set. OCR fallback disabled (pdfminer will still work).")
 except Exception as e:
     print(f"Vision init error: {e}")
@@ -98,13 +97,18 @@ def get_text_from_upload(fs, force_mode: str | None = None):
 
 
 # ---------------------------
-# Parser for IOLMaster (ordered fields) — OD/OS block-based
+# Parser for IOLMaster (ordered fields) — robust OD/OS block detection
 # ---------------------------
 def parse_iol_master_text(text: str) -> dict:
     """
     For each eye (OD/OS), returns these fields IN ORDER:
       source, axial_length, acd, k1 (D+axis), k2 (D+axis), ak (D+axis), wtw, cct, lt
-    Robust to PDF text reordering by first slicing OD/OS blocks, then parsing inside each block.
+
+    Robust to localized headers and duplicated tokens by:
+      - detecting OD with:  OD, O D, direita, right
+      - detecting OS with:  OS, O S, OE, O E, esquerdo/esquerda, left
+      - collapsing consecutive/near-duplicate headers (e.g., 'ODODODODdireita')
+      - slicing text into eye blocks, then parsing each block independently
     """
     # --- Source label ---
     if re.search(r"IOL\s*Master\s*700", text, re.IGNORECASE):
@@ -130,17 +134,39 @@ def parse_iol_master_text(text: str) -> dict:
 
     result = {"OD": blank_eye(), "OS": blank_eye()}
 
-    # --- Find OD/OS headers and slice blocks ---
-    header_re = re.compile(r"\b(OD|OS)\b\s*:?", re.IGNORECASE)
-    marks = [{"eye": m.group(1).upper(), "pos": m.start()} for m in header_re.finditer(text)]
-    if not marks:
+    # --- Eye header detection (localized & tolerant) ---
+    # Build two independent regexes so we can label matches as OD/OS.
+    OD_HDR = re.compile(
+        r"(?i)\b(?:OD|O\s*D|direita|right)\b"
+    )
+    OS_HDR = re.compile(
+        r"(?i)\b(?:OS|O\s*S|OE|O\s*E|esquerdo|esquerda|left)\b"
+    )
+
+    # Scan for both and collect markers
+    markers = []
+    for m in OD_HDR.finditer(text):
+        markers.append({"eye": "OD", "pos": m.start()})
+    for m in OS_HDR.finditer(text):
+        markers.append({"eye": "OS", "pos": m.start()})
+    if not markers:
         return result
 
-    marks.sort(key=lambda x: x["pos"])
+    # Sort by position
+    markers.sort(key=lambda x: x["pos"])
+
+    # Collapse near-duplicate markers (pdfminer sometimes prints ODODOD...)
+    collapsed = []
+    for m in markers:
+        if not collapsed or (m["pos"] - collapsed[-1]["pos"]) > 6 or m["eye"] != collapsed[-1]["eye"]:
+            collapsed.append(m)
+    markers = collapsed
+
+    # Build contiguous blocks per eye
     blocks = []
-    for i, mark in enumerate(marks):
+    for i, mark in enumerate(markers):
         start = mark["pos"]
-        end = marks[i + 1]["pos"] if i + 1 < len(marks) else len(text)
+        end = markers[i + 1]["pos"] if i + 1 < len(markers) else len(text)
         blocks.append((mark["eye"], text[start:end]))
 
     # --- Common patterns ---
@@ -148,22 +174,21 @@ def parse_iol_master_text(text: str) -> dict:
     UM   = r"-?\d[\d.,]*\s*(?:µm|um)"
     DVAL = r"-?\d[\d.,]*\s*D"
 
+    # Stop axis at newline or next label
     LABEL_STOP = re.compile(r"(?:\r?\n|(?=(?:AL|ACD|CCT|LT|WTW|K1|K2|K|AK|ΔK)\s*:))", re.IGNORECASE)
 
     def harvest_axis(field_tail: str) -> str:
-        """Harvest up to 3 digits for axis within the same field (line), then format ' @ XX°'."""
+        """Harvest up to 3 digits for axis within the same field, then format ' @ XX°'."""
         mstop = LABEL_STOP.search(field_tail)
         seg = field_tail[:mstop.start()] if mstop else field_tail
         seg = seg[:120]
 
-        # Prefer '@ ###'
         if "@" in seg:
             after = seg.split("@", 1)[1]
             digits = re.findall(r"\d", after)
             axis = "".join(digits)[:3]
             return f" @ {axis}°" if axis else ""
 
-        # Fallback: digits near a degree sign
         m = re.search(r"(\d{1,3})\s*(?:°|º|o)\b", seg)
         return f" @ {m.group(1)}°" if m else ""
 
@@ -175,7 +200,6 @@ def parse_iol_master_text(text: str) -> dict:
         "wtw":          re.compile(rf"WTW:\s*({MM})", re.IGNORECASE),
         "k1":           re.compile(rf"K1:\s*({DVAL})", re.IGNORECASE),
         "k2":           re.compile(rf"K2:\s*({DVAL})", re.IGNORECASE),
-        # cylinder: device often prints just "K:"
         "ak":           re.compile(rf"(?:AK|ΔK|K):\s*({DVAL})", re.IGNORECASE),
     }
 
@@ -205,7 +229,7 @@ def parse_iol_master_text(text: str) -> dict:
 def health():
     return jsonify({
         "status": "running",
-        "version": "LakeCalc.ai PDF-first parser v1.2 (OD/OS block parsing)",
+        "version": "LakeCalc.ai PDF-first parser v1.3 (localized OD/OS headers)",
         "ocr_enabled": bool(vision_client)
     })
 
