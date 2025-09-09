@@ -1,4 +1,4 @@
-# app.py  — LakeCalc.ai parser v3.2 (layout split + OCR normalize + PT→EN header localization + debug)
+# app.py — LakeCalc.ai parser v3.3
 import os, io, re, unicodedata
 from collections import OrderedDict
 from io import BytesIO
@@ -7,7 +7,9 @@ from flask import Flask, request, jsonify, render_template
 
 # PDF text & geometry
 from pdfminer.high_level import extract_text as pdfminer_extract_text, extract_pages
-from pdfminer.layout import LTTextBox, LTTextBoxHorizontal, LTTextLine, LTTextLineHorizontal, LAParams
+from pdfminer.layout import (
+    LTTextBox, LTTextBoxHorizontal, LTTextLine, LTTextLineHorizontal, LAParams
+)
 
 # OCR fallback
 from google.cloud import vision
@@ -49,8 +51,7 @@ def ocr_pdf_to_text(pdf_bytes: bytes) -> str:
     if not vision_client:
         raise RuntimeError("Vision client not initialized for OCR fallback.")
     pages_txt = []
-    images = convert_from_bytes(pdf_bytes, fmt="jpeg")
-    for img in images:
+    for img in convert_from_bytes(pdf_bytes, fmt="jpeg"):
         buf = io.BytesIO(); img.save(buf, format="JPEG")
         image = vision.Image(content=buf.getvalue())
         resp = vision_client.text_detection(image=image)
@@ -98,12 +99,18 @@ def normalize_for_ocr(text: str) -> str:
     t = text.replace("\u00A0", " ")
 
     # Join AL/ACD/LT/WTW/CCT split across lines: "AL:\n23,73\nmm" -> "AL: 23,73 mm"
-    t = re.sub(r"(?mi)^(AL|ACD|LT|WTW|CCT)\s*:\s*\n\s*([-\d.,]+)\s*\n\s*(mm|µm|um)\b",
-               r"\1: \2 \3", t)
+    t = re.sub(
+        r"(?mi)^(AL|ACD|LT|WTW|CCT)\s*:\s*\n\s*([-\d.,]+)\s*\n\s*(mm|[µμ]m|um)\b",
+        r"\1: \2 \3",
+        t
+    )
 
     # Join K* value + 'D' split across lines
-    t = re.sub(r"(?mi)^(K1|K2|K|AK|ΔK)\s*:\s*\n\s*([-\d.,]+)\s*\n\s*D\b",
-               r"\1: \2 D", t)
+    t = re.sub(
+        r"(?mi)^(K1|K2|K|AK|ΔK)\s*:\s*\n\s*([-\d.,]+)\s*\n\s*D\b",
+        r"\1: \2 D",
+        t
+    )
 
     # Normalize axes like "@ \n ° \n 10" / "@ \n 10 \n °" -> "@ 10°"
     t = re.sub(r"@\s*(?:\r?\n|\s)*(?:[°ºo])\s*(?:\r?\n|\s)*?(\d{1,3})\b", r"@ \1°", t)
@@ -126,21 +133,17 @@ def localize_pt_to_en(text: str) -> str:
     Does NOT touch OD/OS/OE tokens, numbers, labels, or units.
     """
     t = text
-
-    # Build patterns (case-insensitive). Avoid 'OLHOS' entirely.
     replacements = [
         (r"\b(direita|olho\s+direito)\b", "RIGHT"),
         (r"\b(esquerda|esquerdo|olho\s+esquerdo)\b", "LEFT"),
-        # Optional UI words (harmless for parsing)
+        # (optional) benign UI words
         (r"\bpaciente\b", "PATIENT"),
         (r"\ban[aá]lise\b", "ANALYSIS"),
         (r"\bbranco a branco\b", "WHITE TO WHITE"),
     ]
-
     for pat, repl in replacements:
         t = re.sub(pat, repl, t, flags=re.IGNORECASE)
-
-    # DO NOT replace 'os' or 'olhos' — we rely on OD/OS/OE tokens and EN hints above
+    # Never replace 'os' or 'olhos'
     return t
 
 # =========================
@@ -170,16 +173,13 @@ def pdf_split_left_right(pdf_bytes: bytes) -> dict:
                     x0, y0, x1, y1 = el.bbox
                     x_center = (x0 + x1) / 2.0
                     txt = el.get_text()
-                    if not txt or not txt.strip(): 
+                    if not txt or not txt.strip():
                         continue
                     blobs.append((y1, txt, x_center < midx))
 
-            # top->bottom order
-            blobs.sort(key=lambda t: -t[0])
-
+            blobs.sort(key=lambda t: -t[0])  # top→bottom
             left_txt = "".join([b[1] for b in blobs if b[2]])
             right_txt = "".join([b[1] for b in blobs if not b[2]])
-
             left_chunks.append(left_txt)
             right_chunks.append(right_txt)
     except Exception as e:
@@ -191,7 +191,7 @@ def pdf_split_left_right(pdf_bytes: bytes) -> dict:
 # Patterns & parsing helpers
 # =========================
 MM   = r"-?\d[\d.,]*\s*mm"
-UM   = r"-?\d[\d.,]*\s*(?:µm|um)"
+UM   = r"-?\d[\d.,]*\s*(?:[µμ]m|um)"  # accept µm and μm and um
 DVAL = r"-?\d[\d.,]*\s*D"
 LABEL_STOP = re.compile(r"(?:\r?\n|(?=(?:AL|ACD|CCT|LT|WTW|K1|K2|K|AK|ΔK)\s*:))", re.IGNORECASE)
 
@@ -203,7 +203,8 @@ PATTERNS = {
     "wtw":          re.compile(rf"(?mi)\bWTW\s*:\s*({MM})"),
     "k1":           re.compile(rf"(?mi)\bK1\s*:\s*({DVAL})"),
     "k2":           re.compile(rf"(?mi)\bK2\s*:\s*({DVAL})"),
-    "ak":           re.compile(rf"(?mi)\b(?:AK|ΔK|K)\s*:\s*({DVAL})"),
+    # ΔK / AK / K (but NOT K1/K2)
+    "ak":           re.compile(rf"(?mi)\b(?:Δ\s*K|AK|K(?!\s*1|\s*2))\s*:\s*({DVAL})"),
 }
 
 def harvest_axis(field_tail: str) -> str:
@@ -244,6 +245,13 @@ def detect_source_label(text: str) -> str:
     if re.search(r"OCULUS\s+PENTACAM", text, re.IGNORECASE):   return "Pentacam"
     first = next((ln.strip() for ln in text.splitlines() if ln.strip()), "Unknown")
     return first[:60]
+
+# =========================
+# Output ordering
+# =========================
+FIELD_ORDER = ["source", "axial_length", "acd", "k1", "k2", "ak", "wtw", "cct", "lt"]
+def enforce_field_order(eye_dict: dict) -> OrderedDict:
+    return OrderedDict((k, eye_dict.get(k, "")) for k in FIELD_ORDER)
 
 # =========================
 # Core controller (with debug)
@@ -304,13 +312,22 @@ def parse_iol(norm_text: str, pdf_bytes: bytes | None, source_label: str, want_d
             for k,v in mapping[eye].items():
                 if v: result[eye][k] = v
 
+        # Enforce output order
+        result["OD"] = enforce_field_order(result["OD"])
+        result["OS"] = enforce_field_order(result["OS"])
+
         return (result, debug) if want_debug else result
 
-    # OCR image or PDF without layout info → single block → OD
+    # OCR image or no layout info → single block → OD
     single = localize_pt_to_en(normalize_for_ocr(norm_text))
     parsed = parse_eye_block(single)
     for k,v in parsed.items():
         if v: result["OD"][k] = v
+
+    # Enforce output order
+    result["OD"] = enforce_field_order(result["OD"])
+    result["OS"] = enforce_field_order(result["OS"])
+
     debug["strategy"] = "ocr_single_block_to_OD"
     return (result, debug) if want_debug else result
 
@@ -321,7 +338,7 @@ def parse_iol(norm_text: str, pdf_bytes: bytes | None, source_label: str, want_d
 def health():
     return jsonify({
         "status": "running",
-        "version": "LakeCalc.ai parser v3.2 (layout split + PT→EN header localization + debug)",
+        "version": "LakeCalc.ai parser v3.3 (layout split + PT→EN + µ/μ + ΔK/AK/K + ordered)",
         "ocr_enabled": bool(vision_client)
     })
 
@@ -343,12 +360,10 @@ def parse_file():
 
     try:
         text, source_tag, pdf_bytes = get_text_from_upload(fs, force_mode=force_mode)
-        # Normalize overall text (helps raw preview and fallback path)
         norm_text = normalize_for_ocr(text)
         source_label = detect_source_label(norm_text)
 
         if raw_only:
-            # Also apply localization in the raw preview so you can see RIGHT/LEFT hints
             loc_preview = localize_pt_to_en(norm_text)
             return jsonify({
                 "filename": fs.filename,
