@@ -1,21 +1,23 @@
-# app.py
-import os, io, re
+# app.py  — LakeCalc.ai parser v3.2 (layout split + OCR normalize + PT→EN header localization + debug)
+import os, io, re, unicodedata
 from collections import OrderedDict
 from io import BytesIO
 
 from flask import Flask, request, jsonify, render_template
-from pdfminer.high_level import extract_text as pdfminer_extract_text
 
-# Google Vision used only as fallback when there's no text layer / for images
+# PDF text & geometry
+from pdfminer.high_level import extract_text as pdfminer_extract_text, extract_pages
+from pdfminer.layout import LTTextBox, LTTextBoxHorizontal, LTTextLine, LTTextLineHorizontal, LAParams
+
+# OCR fallback
 from google.cloud import vision
 from pdf2image import convert_from_bytes
 
 app = Flask(__name__, static_folder='static', template_folder='templates')
 
-
-# ---------------------------
-# Google Cloud Vision (OCR fallback)
-# ---------------------------
+# =========================
+# Google Vision (OCR)
+# =========================
 vision_client = None
 try:
     creds_json = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
@@ -28,101 +30,86 @@ try:
     elif os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
         vision_client = vision.ImageAnnotatorClient()
     else:
-        # OK: born-digital PDFs still work via pdfminer
-        print("INFO: Vision credentials not set. OCR fallback disabled.")
+        print("INFO: Vision credentials not set. OCR fallback disabled for images.")
 except Exception as e:
     print(f"Vision init error: {e}")
 
-
-# ---------------------------
-# Text extraction (PDF-first, with optional force modes)
-# ---------------------------
+# =========================
+# Text extraction (PDF-first, OCR fallback)
+# =========================
 def try_pdf_text_extract(pdf_bytes: bytes) -> str:
-    """Extract native text from born-digital PDF (no OCR)."""
     try:
         text = pdfminer_extract_text(BytesIO(pdf_bytes)) or ""
-        text = re.sub(r"[ \t]+\n", "\n", text)  # mild cleanup
-        return text.strip()
+        return re.sub(r"[ \t]+\n", "\n", text).strip()
     except Exception as e:
-        print(f"pdfminer error: {e}")
+        print(f"pdfminer text error: {e}")
         return ""
 
 def ocr_pdf_to_text(pdf_bytes: bytes) -> str:
-    """Render pages to images and OCR each page (fallback)."""
     if not vision_client:
         raise RuntimeError("Vision client not initialized for OCR fallback.")
-    pages = []
+    pages_txt = []
     images = convert_from_bytes(pdf_bytes, fmt="jpeg")
     for img in images:
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG")
+        buf = io.BytesIO(); img.save(buf, format="JPEG")
         image = vision.Image(content=buf.getvalue())
         resp = vision_client.text_detection(image=image)
         if resp.error.message:
             raise RuntimeError(f"Vision API Error: {resp.error.message}")
-        pages.append(resp.text_annotations[0].description if resp.text_annotations else "")
-    return "\n\n--- Page ---\n\n".join(pages).strip()
+        pages_txt.append(resp.text_annotations[0].description if resp.text_annotations else "")
+    return "\n\n--- Page ---\n\n".join(pages_txt).strip()
+
+def ocr_image_to_text(image_bytes: bytes) -> str:
+    if not vision_client:
+        raise RuntimeError("Vision client not initialized; cannot OCR image.")
+    image = vision.Image(content=image_bytes)
+    resp = vision_client.text_detection(image=image)
+    if resp.error.message:
+        raise RuntimeError(f"Vision API Error: {resp.error.message}")
+    return (resp.text_annotations[0].description if resp.text_annotations else "").strip()
 
 def get_text_from_upload(fs, force_mode: str | None = None):
     """
-    Returns (text, source_tag): 'pdf_text' | 'ocr_pdf' | 'ocr_image'
-    force_mode: 'pdf' to force pdfminer, 'ocr' to force OCR (when possible).
+    Returns (text, source_tag, pdf_bytes_or_None).
+    source_tag: 'pdf_text'|'ocr_pdf'|'ocr_image'
     """
     name = (fs.filename or "").lower()
     is_pdf = name.endswith(".pdf")
 
     if is_pdf:
         pdf_bytes = fs.read()
-
         if force_mode == "pdf":
-            return try_pdf_text_extract(pdf_bytes), "pdf_text"
+            return try_pdf_text_extract(pdf_bytes), "pdf_text", pdf_bytes
         if force_mode == "ocr":
-            return ocr_pdf_to_text(pdf_bytes), "ocr_pdf"
-
-        # Default: PDF text first, OCR fallback
+            return ocr_pdf_to_text(pdf_bytes), "ocr_pdf", pdf_bytes
         text = try_pdf_text_extract(pdf_bytes)
         if text:
-            return text, "pdf_text"
-        return ocr_pdf_to_text(pdf_bytes), "ocr_pdf"
+            return text, "pdf_text", pdf_bytes
+        return ocr_pdf_to_text(pdf_bytes), "ocr_pdf", pdf_bytes
 
-    # Not a PDF (image): OCR is required
-    if not vision_client:
-        raise RuntimeError("Vision client not initialized; cannot OCR image.")
+    # images
     image_bytes = fs.read()
-    image = vision.Image(content=image_bytes)
-    resp = vision_client.text_detection(image=image)
-    if resp.error.message:
-        raise RuntimeError(f"Vision API Error: {resp.error.message}")
-    text = resp.text_annotations[0].description if resp.text_annotations else ""
-    return text.strip(), "ocr_image"
+    return ocr_image_to_text(image_bytes), "ocr_image", None
 
-
-# ---------------------------
-# Normalization to fix OCR/PDF line break quirks
-# ---------------------------
+# =========================
+# Normalization (OCR/PDF quirks)
+# =========================
 def normalize_for_ocr(text: str) -> str:
-    """
-    Fix common fragmentation:
-      - Join label/value/unit splits (AL/ACD/LT/WTW/CCT)
-      - Join K-lines split across value and 'D'
-      - Normalize scattered '@', '°', and digits into '@ XX°'
-      - Collapse excessive whitespace
-    """
     t = text.replace("\u00A0", " ")
 
-    # AL/ACD/LT/WTW/CCT on 3 lines -> single line
+    # Join AL/ACD/LT/WTW/CCT split across lines: "AL:\n23,73\nmm" -> "AL: 23,73 mm"
     t = re.sub(r"(?mi)^(AL|ACD|LT|WTW|CCT)\s*:\s*\n\s*([-\d.,]+)\s*\n\s*(mm|µm|um)\b",
                r"\1: \2 \3", t)
 
-    # K lines: value on one line, 'D' on next
+    # Join K* value + 'D' split across lines
     t = re.sub(r"(?mi)^(K1|K2|K|AK|ΔK)\s*:\s*\n\s*([-\d.,]+)\s*\n\s*D\b",
                r"\1: \2 D", t)
 
-    # Normalize axis patterns: "@ \n ° \n 10" or "@ \n 10 \n °" -> "@ 10°"
+    # Normalize axes like "@ \n ° \n 10" / "@ \n 10 \n °" -> "@ 10°"
     t = re.sub(r"@\s*(?:\r?\n|\s)*(?:[°ºo])\s*(?:\r?\n|\s)*?(\d{1,3})\b", r"@ \1°", t)
     t = re.sub(r"@\s*(?:\r?\n|\s)*(\d{1,3})\s*(?:\r?\n|\s)*(?:[°ºo])\b", r"@ \1°", t)
 
-    # Lone degree+digits split across lines -> " 10°"
+    # Degree then digits split across lines -> " 10°"
     t = re.sub(r"(?:[°ºo])\s*(?:\r?\n|\s)*?(\d{1,3})\b", r" \1°", t)
 
     # Collapse internal whitespace
@@ -130,172 +117,211 @@ def normalize_for_ocr(text: str) -> str:
 
     return t
 
-
-# ---------------------------
-# Parser for IOLMaster (ordered fields) — robust OD/OS detection
-# ---------------------------
-def parse_iol_master_text(text: str) -> dict:
+# =========================
+# Controlled PT→EN localization (header clues only)
+# =========================
+def localize_pt_to_en(text: str) -> str:
     """
-    Returns, per eye and IN ORDER:
-      source, axial_length, acd, k1 (D+axis), k2 (D+axis), ak (D+axis), wtw, cct, lt
-    Header detection is conservative to avoid false OS from 'Olhos' and 'OD: Cilindro' lines.
+    Controlled localization: Portuguese → English for header clues ONLY.
+    Does NOT touch OD/OS/OE tokens, numbers, labels, or units.
     """
-    # Source label
-    if re.search(r"IOL\s*Master\s*700", text, re.IGNORECASE):
-        source_label = "IOL Master 700"
-    elif re.search(r"OCULUS\s+PENTACAM", text, re.IGNORECASE):
-        source_label = "Pentacam"
-    else:
-        head_line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "Unknown")
-        source_label = head_line[:60]
+    t = text
 
-    def blank_eye():
+    # Build patterns (case-insensitive). Avoid 'OLHOS' entirely.
+    replacements = [
+        (r"\b(direita|olho\s+direito)\b", "RIGHT"),
+        (r"\b(esquerda|esquerdo|olho\s+esquerdo)\b", "LEFT"),
+        # Optional UI words (harmless for parsing)
+        (r"\bpaciente\b", "PATIENT"),
+        (r"\ban[aá]lise\b", "ANALYSIS"),
+        (r"\bbranco a branco\b", "WHITE TO WHITE"),
+    ]
+
+    for pat, repl in replacements:
+        t = re.sub(pat, repl, t, flags=re.IGNORECASE)
+
+    # DO NOT replace 'os' or 'olhos' — we rely on OD/OS/OE tokens and EN hints above
+    return t
+
+# =========================
+# PDF layout split: left/right columns
+# =========================
+def pdf_split_left_right(pdf_bytes: bytes) -> dict:
+    """
+    Return {"left": "...", "right": "..."} by splitting each page using its mid X.
+    Concatenate left texts for all pages, same for right.
+    """
+    left_chunks, right_chunks = [], []
+    laparams = LAParams(all_texts=True)
+    try:
+        for page_layout in extract_pages(BytesIO(pdf_bytes), laparams=laparams):
+            page_width = getattr(page_layout, "width", None)
+            if page_width is None:
+                xs = []
+                for el in page_layout:
+                    if hasattr(el, "bbox"):
+                        xs += [el.bbox[0], el.bbox[2]]
+                page_width = max(xs) if xs else 1000.0
+            midx = page_width / 2.0
+
+            blobs = []
+            for el in page_layout:
+                if isinstance(el, (LTTextBox, LTTextBoxHorizontal, LTTextLine, LTTextLineHorizontal)):
+                    x0, y0, x1, y1 = el.bbox
+                    x_center = (x0 + x1) / 2.0
+                    txt = el.get_text()
+                    if not txt or not txt.strip(): 
+                        continue
+                    blobs.append((y1, txt, x_center < midx))
+
+            # top->bottom order
+            blobs.sort(key=lambda t: -t[0])
+
+            left_txt = "".join([b[1] for b in blobs if b[2]])
+            right_txt = "".join([b[1] for b in blobs if not b[2]])
+
+            left_chunks.append(left_txt)
+            right_chunks.append(right_txt)
+    except Exception as e:
+        print(f"pdf layout split error: {e}")
+
+    return {"left": "\n".join(left_chunks).strip(), "right": "\n".join(right_chunks).strip()}
+
+# =========================
+# Patterns & parsing helpers
+# =========================
+MM   = r"-?\d[\d.,]*\s*mm"
+UM   = r"-?\d[\d.,]*\s*(?:µm|um)"
+DVAL = r"-?\d[\d.,]*\s*D"
+LABEL_STOP = re.compile(r"(?:\r?\n|(?=(?:AL|ACD|CCT|LT|WTW|K1|K2|K|AK|ΔK)\s*:))", re.IGNORECASE)
+
+PATTERNS = {
+    "axial_length": re.compile(rf"(?mi)\bAL\s*:\s*({MM})"),
+    "acd":          re.compile(rf"(?mi)\bACD\s*:\s*({MM})"),
+    "cct":          re.compile(rf"(?mi)\bCCT\s*:\s*({UM})"),
+    "lt":           re.compile(rf"(?mi)\bLT\s*:\s*({MM})"),
+    "wtw":          re.compile(rf"(?mi)\bWTW\s*:\s*({MM})"),
+    "k1":           re.compile(rf"(?mi)\bK1\s*:\s*({DVAL})"),
+    "k2":           re.compile(rf"(?mi)\bK2\s*:\s*({DVAL})"),
+    "ak":           re.compile(rf"(?mi)\b(?:AK|ΔK|K)\s*:\s*({DVAL})"),
+}
+
+def harvest_axis(field_tail: str) -> str:
+    mstop = LABEL_STOP.search(field_tail)
+    seg = field_tail[:mstop.start()] if mstop else field_tail
+    seg = seg[:120]
+    if "@" in seg:
+        after = seg.split("@", 1)[1]
+        digits = re.findall(r"\d", after)
+        axis = "".join(digits)[:3]
+        return f" @ {axis}°" if axis else ""
+    m = re.search(r"(\d{1,3})\s*(?:°|º|o)\b", seg)
+    return f" @ {m.group(1)}°" if m else ""
+
+def parse_eye_block(txt: str) -> dict:
+    out = {"axial_length":"", "acd":"", "k1":"", "k2":"", "ak":"", "wtw":"", "cct":"", "lt":""}
+    if not txt or not txt.strip():
+        return out
+    for key, pat in PATTERNS.items():
+        for m in pat.finditer(txt):
+            raw = re.sub(r"\s+", " ", m.group(1)).strip()
+            if key in ("k1", "k2", "ak"):
+                raw = re.sub(r"@\s*.*$", "", raw)  # drop trailing axis blob
+                tail = txt[m.end(1): m.end(1) + 200]
+                raw = (raw + harvest_axis(tail)).strip()
+            if not out[key]:
+                out[key] = raw
+    return out
+
+def has_measurements(d: dict) -> bool:
+    return any(d.values())
+
+# =========================
+# Source detection
+# =========================
+def detect_source_label(text: str) -> str:
+    if re.search(r"IOL\s*Master\s*700", text, re.IGNORECASE): return "IOL Master 700"
+    if re.search(r"OCULUS\s+PENTACAM", text, re.IGNORECASE):   return "Pentacam"
+    first = next((ln.strip() for ln in text.splitlines() if ln.strip()), "Unknown")
+    return first[:60]
+
+# =========================
+# Core controller (with debug)
+# =========================
+def parse_iol(norm_text: str, pdf_bytes: bytes | None, source_label: str, want_debug: bool = False):
+    def fresh():
         return OrderedDict([
             ("source", source_label),
-            ("axial_length", ""),
-            ("acd", ""),
-            ("k1", ""),
-            ("k2", ""),
-            ("ak", ""),
-            ("wtw", ""),
-            ("cct", ""),
-            ("lt", ""),
+            ("axial_length", ""), ("acd", ""), ("k1", ""), ("k2", ""),
+            ("ak", ""), ("wtw", ""), ("cct", ""), ("lt", "")
         ])
+    result = {"OD": fresh(), "OS": fresh()}
+    debug = {"strategy": "", "left_len": 0, "right_len": 0, "left_preview": "", "right_preview": "", "mapping": ""}
 
-    result = {"OD": blank_eye(), "OS": blank_eye()}
+    left_txt = right_txt = None
+    if pdf_bytes:
+        try:
+            cols = pdf_split_left_right(pdf_bytes)
+            left_txt, right_txt = cols.get("left", ""), cols.get("right", "")
+            debug["strategy"] = "pdf_layout_split"
+            debug["left_len"] = len(left_txt or "")
+            debug["right_len"] = len(right_txt or "")
+        except Exception as e:
+            print(f"layout split failed: {e}")
 
-    # ---------- Find OD/OS headers, conservatively ----------
-    lines = text.splitlines(keepends=True)
-    offsets, pos = [], 0
-    for ln in lines:
-        offsets.append(pos)
-        pos += len(ln)
+    if left_txt is not None and right_txt is not None:
+        # Normalize & localize columns
+        left_norm  = localize_pt_to_en(normalize_for_ocr(left_txt))
+        right_norm = localize_pt_to_en(normalize_for_ocr(right_txt))
+        if want_debug:
+            debug["left_preview"]  = left_norm[:600]
+            debug["right_preview"] = right_norm[:600]
 
-    def is_metricy(u: str) -> bool:
-        # any label or obvious number present -> not a header
-        if re.search(r"\b(AL|ACD|CCT|LT|WTW|K1|K2|AK|ΔK|TK1|TK2|SE|SD|P:|Ix|Iy)\b", u): return True
-        if "CILINDRO" in u: return True
-        if re.search(r"\d", u): return True
-        return False
+        left_data  = parse_eye_block(left_norm)
+        right_data = parse_eye_block(right_norm)
 
-    markers = []
-    for i, line in enumerate(lines):
-        u = line.upper()
-        if not u.strip(): 
-            continue
-        # never treat 'OLHOS' lines as headers
-        if re.search(r"\bOLHOS\b", u): 
-            continue
+        def looks_od(s: str) -> bool:
+            u = s.upper(); return bool(re.search(r"\bOD\b|\bO\s*D\b|RIGHT\b", u))
+        def looks_os(s: str) -> bool:
+            u = s.upper(); return bool(re.search(r"\bOS\b|\bO\s*S\b|\bOE\b|\bO\s*E\b|LEFT\b", u))
 
-        # strong word cues first
-        if ("DIREITA" in u or "RIGHT" in u) and not is_metricy(u):
-            markers.append({"eye": "OD", "pos": offsets[i]})
-            continue
-        if (("ESQUERDA" in u or "ESQUERDO" in u or "LEFT" in u) and not is_metricy(u)):
-            markers.append({"eye": "OS", "pos": offsets[i]})
-            continue
+        left_is_od, left_is_os = looks_od(left_txt), looks_os(left_txt)
+        right_is_od, right_is_os = looks_od(right_txt), looks_os(right_txt)
 
-        # stand-alone tokens (reject 'OD:' note lines)
-        if re.search(r"\bOD\b|\bO\s*D\b", u) and not is_metricy(u) and not re.search(r"\bOD\s*:", u):
-            markers.append({"eye": "OD", "pos": offsets[i]})
-            continue
-        if re.search(r"\bOS\b|\bO\s*S\b|\bOE\b|\bO\s*E\b", u) and not is_metricy(u):
-            markers.append({"eye": "OS", "pos": offsets[i]})
-            continue
+        if left_is_od and right_is_os:
+            mapping = {"OD": left_data, "OS": right_data}; debug["mapping"] = "OD<-left, OS<-right (labels)"
+        elif left_is_os and right_is_od:
+            mapping = {"OD": right_data, "OS": left_data}; debug["mapping"] = "OD<-right, OS<-left (labels)"
+        else:
+            mapping = {"OD": left_data, "OS": right_data};  debug["mapping"] = "OD<-left, OS<-right (default)"
 
-    markers.sort(key=lambda x: x["pos"])
-    # collapse near duplicates
-    collapsed = []
-    for m in markers:
-        if not collapsed or (m["pos"] - collapsed[-1]["pos"]) > 6 or m["eye"] != collapsed[-1]["eye"]:
-            collapsed.append(m)
-    markers = collapsed
+        # Only one side has data → assign to OD
+        if not has_measurements(mapping["OD"]) and has_measurements(mapping["OS"]):
+            mapping = {"OD": mapping["OS"], "OS": {"axial_length":"", "acd":"", "k1":"", "k2":"", "ak":"", "wtw":"", "cct":"", "lt":""}}
+            debug["mapping"] += " | fallback: only one side had data → assigned to OD"
 
-    # Build blocks; if none, treat whole as one OD block
-    blocks = []
-    if markers:
-        for i, mark in enumerate(markers):
-            start = mark["pos"]
-            end = markers[i + 1]["pos"] if i + 1 < len(markers) else len(text)
-            blocks.append((mark["eye"], text[start:end]))
-    else:
-        blocks = [("OD", text)]
+        for eye in ("OD","OS"):
+            for k,v in mapping[eye].items():
+                if v: result[eye][k] = v
 
-    # ---------- Patterns & axis harvesting ----------
-    MM   = r"-?\d[\d.,]*\s*mm"
-    UM   = r"-?\d[\d.,]*\s*(?:µm|um)"
-    DVAL = r"-?\d[\d.,]*\s*D"
-    LABEL_STOP = re.compile(r"(?:\r?\n|(?=(?:AL|ACD|CCT|LT|WTW|K1|K2|K|AK|ΔK)\s*:))", re.IGNORECASE)
+        return (result, debug) if want_debug else result
 
-    def harvest_axis(field_tail: str) -> str:
-        mstop = LABEL_STOP.search(field_tail)
-        seg = field_tail[:mstop.start()] if mstop else field_tail
-        seg = seg[:120]
-        if "@" in seg:
-            after = seg.split("@", 1)[1]
-            digits = re.findall(r"\d", after)
-            axis = "".join(digits)[:3]
-            return f" @ {axis}°" if axis else ""
-        m = re.search(r"(\d{1,3})\s*(?:°|º|o)\b", seg)
-        return f" @ {m.group(1)}°" if m else ""
+    # OCR image or PDF without layout info → single block → OD
+    single = localize_pt_to_en(normalize_for_ocr(norm_text))
+    parsed = parse_eye_block(single)
+    for k,v in parsed.items():
+        if v: result["OD"][k] = v
+    debug["strategy"] = "ocr_single_block_to_OD"
+    return (result, debug) if want_debug else result
 
-    patterns = {
-        "axial_length": re.compile(rf"AL:\s*({MM})", re.IGNORECASE),
-        "acd":          re.compile(rf"ACD:\s*({MM})", re.IGNORECASE),
-        "cct":          re.compile(rf"CCT:\s*({UM})", re.IGNORECASE),
-        "lt":           re.compile(rf"LT:\s*({MM})", re.IGNORECASE),
-        "wtw":          re.compile(rf"WTW:\s*({MM})", re.IGNORECASE),
-        "k1":           re.compile(rf"K1:\s*({DVAL})", re.IGNORECASE),
-        "k2":           re.compile(rf"K2:\s*({DVAL})", re.IGNORECASE),
-        "ak":           re.compile(rf"(?:AK|ΔK|K):\s*({DVAL})", re.IGNORECASE),
-    }
-
-    def parse_block(block: str) -> dict:
-        out = {"axial_length":"", "acd":"", "k1":"", "k2":"", "ak":"", "wtw":"", "cct":"", "lt":""}
-        for key, pat in patterns.items():
-            for m in pat.finditer(block):
-                raw = re.sub(r"\s+", " ", m.group(1)).strip()
-                if key in ("k1", "k2", "ak"):
-                    raw = re.sub(r"@\s*.*$", "", raw)  # drop inline axis tail
-                    tail = block[m.end(1): m.end(1) + 200]
-                    axis = harvest_axis(tail)
-                    raw = (raw + axis).strip()
-                if not out[key]:
-                    out[key] = raw
-        return out
-
-    parsed_blocks = [(eye, parse_block(block)) for eye, block in blocks]
-
-    # If exactly one block has measurements, map it to OD (single-eye export safety)
-    def any_filled(d): return any(v for v in d.values())
-    with_data = [(e, d) for (e, d) in parsed_blocks if any_filled(d)]
-    if len(with_data) == 1:
-        _, d = with_data[0]
-        for k, v in d.items():
-            if v: result["OD"][k] = v
-        return result
-
-    # Merge per eye (first occurrence wins)
-    merged = {"OD": {}, "OS": {}}
-    for e, d in parsed_blocks:
-        if e not in merged: merged[e] = {}
-        for k, v in d.items():
-            if v and k not in merged[e]:
-                merged[e][k] = v
-    for e in ("OD", "OS"):
-        for k, v in merged.get(e, {}).items():
-            if v: result[e][k] = v
-
-    return result
-
-# ---------------------------
+# =========================
 # Routes
-# ---------------------------
+# =========================
 @app.route("/api/health")
 def health():
     return jsonify({
         "status": "running",
-        "version": "LakeCalc.ai parser v2.1 (token-OD/OS; PDF-first + OCR normalize)",
+        "version": "LakeCalc.ai parser v3.2 (layout split + PT→EN header localization + debug)",
         "ocr_enabled": bool(vision_client)
     })
 
@@ -309,33 +335,41 @@ def parse_file():
 
     include_raw = request.args.get("include_raw") == "1"
     raw_only    = request.args.get("raw_only") == "1"
-    force_pdf   = request.args.get("force_pdf") == "1"   # force pdfminer
-    force_ocr   = request.args.get("force_ocr") == "1"   # force OCR
+    force_pdf   = request.args.get("force_pdf") == "1"
+    force_ocr   = request.args.get("force_ocr") == "1"
+    debug_flag  = request.args.get("debug") == "1"
 
     force_mode = "pdf" if force_pdf else ("ocr" if force_ocr else None)
 
     try:
-        text, source_tag = get_text_from_upload(fs, force_mode=force_mode)
-        text = normalize_for_ocr(text)  # normalize before parsing
+        text, source_tag, pdf_bytes = get_text_from_upload(fs, force_mode=force_mode)
+        # Normalize overall text (helps raw preview and fallback path)
+        norm_text = normalize_for_ocr(text)
+        source_label = detect_source_label(norm_text)
 
         if raw_only:
+            # Also apply localization in the raw preview so you can see RIGHT/LEFT hints
+            loc_preview = localize_pt_to_en(norm_text)
             return jsonify({
                 "filename": fs.filename,
                 "text_source": source_tag,
-                "raw_text": text,
-                "num_chars": len(text),
-                "num_lines": text.count("\n") + 1
+                "raw_text": loc_preview,
+                "num_chars": len(loc_preview),
+                "num_lines": loc_preview.count("\n") + 1
             })
 
-        parsed = parse_iol_master_text(text)
+        parsed, dbg = parse_iol(norm_text, pdf_bytes, source_label, want_debug=debug_flag) if debug_flag else (parse_iol(norm_text, pdf_bytes, source_label), None)
 
-        if include_raw:
-            return jsonify({
+        if include_raw or debug_flag:
+            payload = {
                 "filename": fs.filename,
                 "text_source": source_tag,
                 "structured": parsed,
-                "raw_text_preview": text[:1500]
-            })
+                "raw_text_preview": localize_pt_to_en(norm_text)[:1500]
+            }
+            if dbg is not None:
+                payload["debug"] = dbg
+            return jsonify(payload)
 
         return jsonify(parsed)
 
@@ -345,7 +379,6 @@ def parse_file():
 
 @app.route("/")
 def root():
-    # Renders templates/index.html (drag & drop UI)
     return render_template("index.html")
 
 @app.route("/<path:path>")
