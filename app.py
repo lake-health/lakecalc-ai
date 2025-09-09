@@ -1,4 +1,4 @@
-# app.py — LakeCalc.ai parser v3.3
+# app.py — LakeCalc.ai parser v3.4
 import os, io, re, unicodedata
 from collections import OrderedDict
 from io import BytesIO
@@ -124,36 +124,71 @@ def normalize_for_ocr(text: str) -> str:
 
     return t
 
+# ---- NEW: bind numbers printed above labels (e.g., 23,73 / 554 / 2,89 / 4,90 ... then AL: / CCT: / ACD: / LT:)
+def bind_disjoint_scalars(text: str) -> str:
+    """
+    Many IOLMaster exports print the numeric values, then the labels on later lines.
+    This binder looks *backwards* from bare labels (AL/ACD/LT/WTW/CCT) and injects
+    the nearest number (and unit if present). If the unit is not found, we infer:
+      - mm for AL/ACD/LT/WTW, µm for CCT.
+    """
+    t = text
+
+    def patch_label(label: str, unit_hint: str):
+        nonlocal t
+        # Match a label line that has no value on the same line
+        pattern = re.compile(rf"(?mi)^({label})\s*:\s*$")
+        def _repl(m):
+            idx = m.start()
+            window = t[max(0, idx-220): idx]  # look back ~220 chars
+
+            # 1) Prefer number with explicit unit within window (closest to label)
+            m2 = re.search(r"(-?\d[\d.,]*)\s*(mm|[µμ]m|um)\b", window, re.IGNORECASE)
+            if m2:
+                val = f"{m2.group(1)} {m2.group(2)}"
+                return f"{m.group(1)}: {val}"
+
+            # 2) Fallback: nearest bare number before label
+            m3 = re.search(r"(-?\d[\d.,]+)\s*$", window)
+            if m3:
+                unit = "mm" if unit_hint == "mm" else "µm"
+                val = f"{m3.group(1)} {unit}"
+                return f"{m.group(1)}: {val}"
+
+            # No patch found → keep as-is
+            return m.group(0)
+
+        t = pattern.sub(_repl, t)
+        return t
+
+    # Apply for all scalar labels that sometimes show values above labels
+    t = patch_label("AL",  "mm")
+    t = patch_label("ACD", "mm")
+    t = patch_label("LT",  "mm")
+    t = patch_label("WTW", "mm")
+    t = patch_label("CCT", "µm")
+    return t
+
 # =========================
 # Controlled PT→EN localization (header clues only)
 # =========================
 def localize_pt_to_en(text: str) -> str:
-    """
-    Controlled localization: Portuguese → English for header clues ONLY.
-    Does NOT touch OD/OS/OE tokens, numbers, labels, or units.
-    """
     t = text
     replacements = [
         (r"\b(direita|olho\s+direito)\b", "RIGHT"),
         (r"\b(esquerda|esquerdo|olho\s+esquerdo)\b", "LEFT"),
-        # (optional) benign UI words
         (r"\bpaciente\b", "PATIENT"),
         (r"\ban[aá]lise\b", "ANALYSIS"),
         (r"\bbranco a branco\b", "WHITE TO WHITE"),
     ]
     for pat, repl in replacements:
         t = re.sub(pat, repl, t, flags=re.IGNORECASE)
-    # Never replace 'os' or 'olhos'
-    return t
+    return t  # never touch 'os' or 'olhos'
 
 # =========================
 # PDF layout split: left/right columns
 # =========================
 def pdf_split_left_right(pdf_bytes: bytes) -> dict:
-    """
-    Return {"left": "...", "right": "..."} by splitting each page using its mid X.
-    Concatenate left texts for all pages, same for right.
-    """
     left_chunks, right_chunks = [], []
     laparams = LAParams(all_texts=True)
     try:
@@ -173,7 +208,7 @@ def pdf_split_left_right(pdf_bytes: bytes) -> dict:
                     x0, y0, x1, y1 = el.bbox
                     x_center = (x0 + x1) / 2.0
                     txt = el.get_text()
-                    if not txt or not txt.strip():
+                    if not txt or not txt.strip(): 
                         continue
                     blobs.append((y1, txt, x_center < midx))
 
@@ -278,9 +313,9 @@ def parse_iol(norm_text: str, pdf_bytes: bytes | None, source_label: str, want_d
             print(f"layout split failed: {e}")
 
     if left_txt is not None and right_txt is not None:
-        # Normalize & localize columns
-        left_norm  = localize_pt_to_en(normalize_for_ocr(left_txt))
-        right_norm = localize_pt_to_en(normalize_for_ocr(right_txt))
+        # Normalize → bind disjoint scalars → localize
+        left_norm  = localize_pt_to_en(bind_disjoint_scalars(normalize_for_ocr(left_txt)))
+        right_norm = localize_pt_to_en(bind_disjoint_scalars(normalize_for_ocr(right_txt)))
         if want_debug:
             debug["left_preview"]  = left_norm[:600]
             debug["right_preview"] = right_norm[:600]
@@ -319,7 +354,7 @@ def parse_iol(norm_text: str, pdf_bytes: bytes | None, source_label: str, want_d
         return (result, debug) if want_debug else result
 
     # OCR image or no layout info → single block → OD
-    single = localize_pt_to_en(normalize_for_ocr(norm_text))
+    single = localize_pt_to_en(bind_disjoint_scalars(normalize_for_ocr(norm_text)))
     parsed = parse_eye_block(single)
     for k,v in parsed.items():
         if v: result["OD"][k] = v
@@ -338,7 +373,7 @@ def parse_iol(norm_text: str, pdf_bytes: bytes | None, source_label: str, want_d
 def health():
     return jsonify({
         "status": "running",
-        "version": "LakeCalc.ai parser v3.3 (layout split + PT→EN + µ/μ + ΔK/AK/K + ordered)",
+        "version": "LakeCalc.ai parser v3.4 (layout split + binder for AL/ACD/LT/WTW/CCT + PT→EN + µ/μ + ΔK/AK/K + ordered)",
         "ocr_enabled": bool(vision_client)
     })
 
@@ -364,7 +399,7 @@ def parse_file():
         source_label = detect_source_label(norm_text)
 
         if raw_only:
-            loc_preview = localize_pt_to_en(norm_text)
+            loc_preview = localize_pt_to_en(bind_disjoint_scalars(norm_text))
             return jsonify({
                 "filename": fs.filename,
                 "text_source": source_tag,
@@ -380,7 +415,7 @@ def parse_file():
                 "filename": fs.filename,
                 "text_source": source_tag,
                 "structured": parsed,
-                "raw_text_preview": localize_pt_to_en(norm_text)[:1500]
+                "raw_text_preview": localize_pt_to_en(bind_disjoint_scalars(norm_text))[:1500]
             }
             if dbg is not None:
                 payload["debug"] = dbg
