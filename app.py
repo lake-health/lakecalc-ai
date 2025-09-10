@@ -1,7 +1,11 @@
-# app.py — LakeCalc.ai parser v3.9
-# v3.8 + global symbol normalization (µ/μ/um, º/°, OCR 'o'→° where appropriate)
-# coordinate harvester (per-column) + strict binder (+CCT special) + CCT sanity
-# + rescue + reconcile + plausibility + PT→EN (clues only) + enforced field order
+# app.py — LakeCalc.ai parser v4.0
+# - safe degree normalization (no '0'→'°')
+# - axis harvester prefers 2–3 digits and collapses '°°'
+# - coordinate harvester (per column, PDF geometry)
+# - strict binder (+CCT special) + CCT sanity + rescue + plausibility
+# - ALWAYS attach SD (value → 'value ± SD unit')
+# - NO copying of CCT between eyes (per your request)
+# - ordered output with 'source' first
 
 import os, io, re
 from collections import OrderedDict
@@ -47,10 +51,10 @@ except Exception as e:
 def normalize_symbols(text: str) -> str:
     """
     Normalize lookalike glyphs so regex sees consistent tokens.
-    - Greek mu (μ, U+03BC) → micro sign (µ, U+00B5)
-    - 'um' → 'µm' (when part of units)
+    - Greek mu (μ) → micro sign (µ)
+    - 'um' → 'µm' (when it denotes units)
     - masculine ordinal º → degree °
-    - OCR misread ' o ' right after @ as degree (conservative)
+    - collapse duplicated degree signs
     - normalize delta variants to 'Δ'
     """
     if not text:
@@ -58,22 +62,23 @@ def normalize_symbols(text: str) -> str:
 
     t = text
 
-    # Normalize micro/mu and um → µm (keep spacing stable)
+    # Normalize micro/mu and um → µm (unit context)
     t = t.replace("μ", "µ")
-    # Replace 'um' unit to µm when it's clearly a unit (word boundary or after number)
     t = re.sub(r"(?i)(\d)\s*um\b", r"\1 µm", t)
     t = re.sub(r"(?i)\bum\b", "µm", t)
 
     # Degree variants
     t = t.replace("º", "°")
-    # Common OCR: '@ 75 o' or '@75o' → '@ 75°'
+    # OCR variant: '@ 75 o' → '@ 75°'
     t = re.sub(r"@\s*(\d{1,3})\s*o\b", r"@ \1°", t, flags=re.IGNORECASE)
-    t = re.sub(r"@\s*(\d{1,3})\s*0\b", r"@ \1°", t)  # if '0' slips in for degree
+    # DO NOT: transform trailing '0' to '°' (caused '@ 10' → '@ 1°')
+    # Collapse duplicate degrees: '@ 10°°' → '@ 10°'
+    t = re.sub(r"°\s*°+", "°", t)
 
     # Normalize delta
     t = t.replace("∆", "Δ")
 
-    # Collapse excessive spaces
+    # Collapse spaces
     t = re.sub(r"[ \t]+", " ", t)
     return t
 
@@ -153,14 +158,13 @@ def normalize_for_ocr(text: str) -> str:
         r"(?mi)^(K1|K2|K|AK|ΔK)\s*:\s*\n\s*([-\d.,]+)\s*\n\s*D\b",
         r"\1: \2 D", t,
     )
-    # Axis repairs
+    # Axis repairs (newline-hopping)
     t = re.sub(r"@\s*(?:\r?\n|\s)*(?:[°ºo])\s*(?:\r?\n|\s)*?(\d{1,3})\b", r"@ \1°", t)
     t = re.sub(r"@\s*(?:\r?\n|\s)*(\d{1,3})\s*(?:\r?\n|\s)*(?:[°ºo])\b", r"@ \1°", t)
     t = re.sub(r"(?:[°ºo])\s*(?:\r?\n|\s)*?(\d{1,3})\b", r" \1°", t)
 
-    # Symbol normalization (after joins so we catch all variants)
+    # Symbol normalization & final spacing
     t = normalize_symbols(t)
-    # Final space collapse
     t = re.sub(r"[ \t]+", " ", t)
     return t
 
@@ -317,12 +321,6 @@ def _clean(s: str) -> str:
     return re.sub(r"[ \t]+", " ", normalize_symbols(s or "")).strip()
 
 def coordinate_harvest(pdf_bytes: bytes) -> Dict[str, Dict[str, str]]:
-    """
-    Harvest scalars by PDF coordinates per column:
-      - Prefer label-anchored search
-      - If a label (esp. CCT) is missing, fall back to any plausible µm in the column,
-        bound by proximity to the biometrics cluster (AL/ACD/LT/WTW).
-    """
     out_left  = {"axial_length":"", "acd":"", "lt":"", "wtw":"", "cct":"", "k1":"", "k2":"", "ak":""}
     out_right = {"axial_length":"", "acd":"", "lt":"", "wtw":"", "cct":"", "k1":"", "k2":"", "ak":""}
 
@@ -426,9 +424,10 @@ def coordinate_harvest(pdf_bytes: bytes) -> Dict[str, Dict[str, str]]:
                     um_hits = []
                     for x0,y0,x1,y1,txt in col_lines:
                         for m in re.finditer(rf"({_num_token})\s*(?:µm|[µμ]m|um)\b", txt, flags=re.IGNORECASE):
-                            v = to_num(m.group(1))
+                            try_val = m.group(1)
+                            v = to_num(try_val)
                             if v is not None and 350 <= v <= 800:
-                                um_hits.append(((x0,y0,x1,y1), f"{m.group(1)} µm"))
+                                um_hits.append(((x0,y0,x1,y1), f"{try_val} µm"))
                     anchor_candidates_y = []
                     for x0,y0,x1,y1,txt in label_rows:
                         if txt.upper().rstrip(":") in ("AL","ACD","LT","WTW"):
@@ -475,16 +474,36 @@ PATTERNS = {
 }
 
 def harvest_axis(field_tail: str) -> str:
+    """
+    Read an axis from the small tail after a diopter value.
+    Preferences:
+      1) match '@ <2-3 digits> °'
+      2) else match '@ <1 digit> °'
+      3) else '<digits>°' nearby (still prefer 2–3 digits)
+    """
     mstop = LABEL_STOP.search(field_tail)
     seg = field_tail[: mstop.start()] if mstop else field_tail
-    seg = seg[:120]
-    if "@" in seg:
-        after = seg.split("@", 1)[1]
-        digits = re.findall(r"\d", after)
-        axis = "".join(digits)[:3]
-        return f" @ {axis}°" if axis else ""
-    m = re.search(r"(\d{1,3})\s*(?:°|º|o)\b", seg)
-    return f" @ {m.group(1)}°" if m else ""
+    seg = seg[:160]
+
+    # 1) Prefer 2–3 digit axes
+    m = re.search(r"@\s*(\d{2,3})\s*(?:°|º|o)\b", seg)
+    if m:
+        return f" @ {m.group(1)}°"
+
+    # 2) Accept 1 digit (rare but seen)
+    m = re.search(r"@\s*(\d)\s*(?:°|º|o)\b", seg)
+    if m:
+        return f" @ {m.group(1)}°"
+
+    # 3) Fallback: any '<digits>°' nearby, prefer 2–3 digits
+    m = re.search(r"\b(\d{2,3})\s*(?:°|º|o)\b", seg)
+    if m:
+        return f" @ {m.group(1)}°"
+    m = re.search(r"\b(\d)\s*(?:°|º|o)\b", seg)
+    if m:
+        return f" @ {m.group(1)}°"
+
+    return ""
 
 def parse_eye_block(txt: str) -> dict:
     out = {"axial_length":"", "acd":"", "k1":"", "k2":"", "ak":"", "wtw":"", "cct":"", "lt":""}
@@ -544,21 +563,6 @@ def rescue_harvest(raw_text: str) -> dict:
             setv(k, val)
 
     return out
-
-# =========================
-# Reconcile
-# =========================
-def reconcile(base: dict, binder: dict | None, rescue: dict | None) -> dict:
-    res = dict(base)
-    if binder:
-        for k, v in binder.items():
-            if k in res and (not res[k]) and v:
-                res[k] = v
-    if rescue:
-        for k, v in rescue.items():
-            if k in res and (not res[k]) and v:
-                res[k] = v
-    return res
 
 # =========================
 # Plausibility re-score (final safety net)
@@ -656,6 +660,84 @@ def plausibility_rescore(eye_text: str, data: dict) -> dict:
     return out
 
 # =========================
+# SD attachment (always on)
+# =========================
+def _unit_of(key: str) -> str:
+    if key in ("k1", "k2", "ak"):
+        return "D"
+    if key == "cct":
+        return "µm"
+    return "mm"
+
+def _canon_dec(num: str) -> str:
+    return re.sub(r"\s+", "", num)
+
+def attach_sd(eye_text: str, data: dict) -> dict:
+    """
+    Always attach '± SD <unit>' to existing values by scanning forward from
+    label/value for the first SD with the same unit in a short window.
+    """
+    if not eye_text or not data:
+        return data
+
+    out = dict(data)
+
+    # Build indices of label/value positions
+    positions = {}
+    for lab, key in [("AL","axial_length"),("ACD","acd"),("LT","lt"),
+                     ("WTW","wtw"),("CCT","cct"),("K1","k1"),("K2","k2"),("AK","ak")]:
+        val = out.get(key, "")
+        if not val:
+            continue
+        m_lab = re.search(rf"(?mi)\b{lab}\s*:", eye_text)
+        pos = m_lab.end() if m_lab else None
+        if pos is None:
+            val_core = re.sub(r"\s*@\s*\d{1,3}\s*(?:°|º|o)\s*$", "", val).strip()
+            m_val = re.search(re.escape(val_core), eye_text)
+            pos = m_val.end() if m_val else None
+        positions[key] = pos
+
+    for key, start in positions.items():
+        if start is None:
+            continue
+        val = out.get(key, "")
+        if not val:
+            continue
+        unit = _unit_of(key)
+        win = eye_text[start : start + 220]
+
+        m = re.search(
+            rf"(?mi)\bSD\s*:\s*([-\d.,]+)\s*{('D' if unit=='D' else (r'(?:µm|[µμ]m|um)' if unit=='µm' else 'mm'))}\b",
+            win
+        )
+        if not m:
+            continue
+
+        sd_raw = _canon_dec(m.group(1))
+        try:
+            sd_num = float(sd_raw.replace(".", "").replace(",", "."))
+        except ValueError:
+            continue
+
+        plausible = True
+        if unit == "µm":
+            plausible = 1 <= sd_num <= 100
+        elif unit == "mm":
+            plausible = 0 <= sd_num <= 1.0
+        elif unit == "D":
+            plausible = 0 <= sd_num <= 2.0
+
+        if not plausible:
+            continue
+
+        if unit == "µm":
+            out[key] = re.sub(r"(?i)\bum\b", "µm", val) + f" ± {m.group(1)} µm"
+        else:
+            out[key] = val + f" ± {m.group(1)} {unit}"
+
+    return out
+
+# =========================
 # Detect device & ordering
 # =========================
 def detect_source_label(text: str) -> str:
@@ -721,10 +803,10 @@ def parse_iol(norm_text: str, pdf_bytes: Optional[bytes], source_label: str, wan
         left_rescue  = rescue_harvest(left_norm)
         right_rescue = rescue_harvest(right_norm)
 
-        left_final  = reconcile(left_data,  left_bound,  left_rescue)
-        right_final = reconcile(right_data, right_bound, right_rescue)
+        left_final  = plausibility_rescore(left_norm,  reconcile(left_data,  left_bound,  left_rescue))
+        right_final = plausibility_rescore(right_norm, reconcile(right_data, right_bound, right_rescue))
 
-        # Merge coordinate-based to fill empties (esp. OS CCT)
+        # Merge coordinate-based to fill empties (esp. CCT if present in that column)
         for k,v in coord_vals.get("left", {}).items():
             if v and not left_final.get(k):
                 left_final[k] = v
@@ -732,9 +814,9 @@ def parse_iol(norm_text: str, pdf_bytes: Optional[bytes], source_label: str, wan
             if v and not right_final.get(k):
                 right_final[k] = v
 
-        # Plausibility re-score pass
-        left_final  = plausibility_rescore(left_norm,  left_final)
-        right_final = plausibility_rescore(right_norm, right_final)
+        # ALWAYS attach SD
+        left_final  = attach_sd(left_norm,  left_final)
+        right_final = attach_sd(right_norm, right_final)
 
         # Map OD/OS by clues
         def looks_od(s: str) -> bool:
@@ -758,11 +840,6 @@ def parse_iol(norm_text: str, pdf_bytes: Optional[bytes], source_label: str, wan
             for k,v in mapping[eye].items():
                 if v: result[eye][k] = v
 
-        # Optional: copy OD→OS CCT if explicitly requested
-        assume_same_cct = request.args.get("assume_same_cct") == "1"
-        if assume_same_cct and not result["OS"].get("cct") and result["OD"].get("cct"):
-            result["OS"]["cct"] = result["OD"]["cct"]
-
         # Enforce output order (source first)
         result["OD"] = enforce_field_order(result["OD"])
         result["OS"] = enforce_field_order(result["OS"])
@@ -772,6 +849,8 @@ def parse_iol(norm_text: str, pdf_bytes: Optional[bytes], source_label: str, wan
     # No layout info → single block → OD
     single = localize_pt_to_en(smart_fix_cct_bound(bind_disjoint_scalars(normalize_for_ocr(norm_text))))
     parsed = parse_eye_block(single)
+    parsed = plausibility_rescore(single, parsed)
+    parsed = attach_sd(single, parsed)
     for k,v in parsed.items():
         if v: result["OD"][k] = v
 
@@ -781,13 +860,28 @@ def parse_iol(norm_text: str, pdf_bytes: Optional[bytes], source_label: str, wan
     return (result, debug) if want_debug else result
 
 # =========================
+# Reconcile (used above)
+# =========================
+def reconcile(base: dict, binder: dict | None, rescue: dict | None) -> dict:
+    res = dict(base)
+    if binder:
+        for k, v in binder.items():
+            if k in res and (not res[k]) and v:
+                res[k] = v
+    if rescue:
+        for k, v in rescue.items():
+            if k in res and (not res[k]) and v:
+                res[k] = v
+    return res
+
+# =========================
 # Routes
 # =========================
 @app.route("/api/health")
 def health():
     return jsonify({
         "status": "running",
-        "version": "LakeCalc.ai parser v3.9 (symbol-normalized + coord harvest + strict binder + sanity + rescue + plausibility + ordered)",
+        "version": "LakeCalc.ai parser v4.0 (symbol-normalized + coord harvest + strict binder + sanity + rescue + plausibility + SD attach + ordered, no CCT copy)",
         "ocr_enabled": bool(vision_client)
     })
 
