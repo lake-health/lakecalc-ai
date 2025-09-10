@@ -287,15 +287,38 @@ def _clean(s: str) -> str:
 def coordinate_harvest(pdf_bytes: bytes) -> Dict[str, Dict[str, str]]:
     """
     Harvest scalars by PDF coordinates per column:
-      - Find label lines (AL/ACD/LT/WTW/CCT, K1/K2/AK)
-      - Search a vertical window *above* each label within same column for number+unit
-      - Use plausibility ranges for tie-breaks (esp. CCT 400–700 µm)
-    Returns: {"left": {...fields...}, "right": {...fields...}}
+      - Prefer label-anchored search (AL/ACD/LT/WTW/CCT, K1/K2/AK)
+      - If a label is missing (esp. CCT on the right/OS), fall back to:
+          * find all plausible µm tokens (350–800 µm) within the column
+          * compute the biometrics 'anchor Y' for the column from AL/ACD/LT/WTW rows
+          * choose the µm closest in Y to that anchor
+    Returns per-column dicts with fields. (Merged later.)
     """
-    out_left = {"axial_length":"", "acd":"", "lt":"", "wtw":"", "cct":"", "k1":"", "k2":"", "ak":""}
+    out_left  = {"axial_length":"", "acd":"", "lt":"", "wtw":"", "cct":"", "k1":"", "k2":"", "ak":""}
     out_right = {"axial_length":"", "acd":"", "lt":"", "wtw":"", "cct":"", "k1":"", "k2":"", "ak":""}
 
+    def _clean(s: str) -> str:
+        return re.sub(r"[ \t]+", " ", (s or "")).strip()
+
+    def to_num(s: str) -> Optional[float]:
+        try:
+            s2 = s
+            for token in [" ", "µ", "μ", "um", "mm", "D", "°"]:
+                s2 = s2.replace(token, "")
+            s2 = s2.replace(".", "").replace(",", ".")
+            return float(s2)
+        except:
+            return None
+
+    def plaus_mm(v: float, key: str) -> bool:
+        if key == "axial_length": return 17.0 <= v <= 32.0
+        if key == "acd":          return 1.5  <= v <= 6.0
+        if key == "lt":           return 2.0  <= v <= 7.0
+        if key == "wtw":          return 9.0  <= v <= 15.0
+        return True
+
     laparams = LAParams(all_texts=True)
+
     try:
         for page_layout in extract_pages(BytesIO(pdf_bytes), laparams=laparams):
             width = getattr(page_layout, "width", 1000.0)
@@ -316,18 +339,17 @@ def coordinate_harvest(pdf_bytes: bytes) -> Dict[str, Dict[str, str]]:
                     except Exception:
                         continue
 
-            # Split per column
-            left_lines  = [ln for ln in lines if (ln[0]+ln[2])/2.0 <  midx]
-            right_lines = [ln for ln in lines if (ln[0]+ln[2])/2.0 >= midx]
+            # Split per column & sort top→bottom
+            def split_sort(col: List[tuple]) -> List[tuple]:
+                col.sort(key=lambda r: -r[3])
+                return col
 
-            # Sort top→bottom in each column
-            left_lines.sort(key=lambda r: -r[3])
-            right_lines.sort(key=lambda r: -r[3])
+            left_lines  = split_sort([ln for ln in lines if (ln[0]+ln[2])/2.0 <  midx])
+            right_lines = split_sort([ln for ln in lines if (ln[0]+ln[2])/2.0 >= midx])
 
             def harvest_column(col_lines: List[tuple]) -> Dict[str,str]:
                 found = {"axial_length":"", "acd":"", "lt":"", "wtw":"", "cct":"", "k1":"", "k2":"", "ak":""}
 
-                # Build quick search helpers
                 label_map = {
                     "AL":  "axial_length",
                     "ACD": "acd",
@@ -338,90 +360,91 @@ def coordinate_harvest(pdf_bytes: bytes) -> Dict[str, Dict[str, str]]:
                     "K2":  "k2",
                     "AK":  "ak",
                     "ΔK":  "ak",
-                    "K":   "ak",  # later we will ignore K1/K2 for this
+                    "K":   "ak",
                 }
-                # Capture label rows (text exactly the label or "LABEL:")
+
+                # Find label rows (text line equals a label or 'LABEL:')
                 label_rows = []
                 for x0,y0,x1,y1,txt in col_lines:
                     t = txt.upper().rstrip(":")
                     if t in ("AL","ACD","LT","WTW","CCT","K1","K2","AK","ΔK","K"):
                         label_rows.append((x0,y0,x1,y1,txt))
 
-                # For each label row, look upward within ~120 pts for value+unit in the same column box
-                def plaus_mm(v: float, key: str) -> bool:
-                    if key == "axial_length": return 17.0 <= v <= 32.0
-                    if key == "acd":          return 1.5  <= v <= 6.0
-                    if key == "lt":           return 2.0  <= v <= 7.0
-                    if key == "wtw":          return 9.0  <= v <= 15.0
-                    return True
-
-                def to_num(s: str) -> Optional[float]:
-                    try:
-                        s2 = s
-                        for token in [" ", "µ", "μ", "um", "mm", "D", "°"]:
-                            s2 = s2.replace(token, "")
-                        s2 = s2.replace(".", "").replace(",", ".")
-                        return float(s2)
-                    except:
-                        return None
-
-                # index lines by y to search above efficiently
+                # First pass: label-anchored search (wider window)
                 for lx0,ly0,lx1,ly1,lbl in label_rows:
                     L = lbl.upper().rstrip(":")
                     key = label_map.get(L)
-                    if not key: 
+                    if not key:
+                        continue
+                    if L == "K" and any(("K1" in r[4].upper()) or ("K2" in r[4].upper()) for r in col_lines):
                         continue
 
-                    # Skip K if it's actually K1 or K2; we handle AK as cylinder
-                    if L == "K" and any("K1" in r[4].upper() or "K2" in r[4].upper() for r in col_lines):
-                        continue
-
-                    # search window: from label baseline up by ~140 points
-                    top = ly1 + 140.0
-                    bot = ly0 - 4.0  # include same line slight overlap
+                    top = ly1 + 180.0   # widened
+                    bot = ly0 - 10.0
                     cand = []
 
                     for x0,y0,x1,y1,txt in col_lines:
-                        if y1 <= top and y0 >= bot:
-                            # same column region horizontally (loose overlap with label box)
-                            if not (x1 < lx0 - 5 or x0 > lx1 + 5):
-                                # collect candidates by unit
-                                if key == "cct":
-                                    # µm only
-                                    m = re.search(rf"({_num_token})\s*(?:[µμ]m|um)\b", txt, flags=re.IGNORECASE)
-                                    if m:
-                                        v = to_num(m.group(1))
-                                        if v is not None and 350 <= v <= 800:
-                                            dist = abs((ly0 + ly1)/2.0 - (y0 + y1)/2.0)
-                                            cand.append((dist, f"{m.group(1)} µm"))
-                                elif key in ("axial_length","acd","lt","wtw"):
-                                    m = re.search(rf"({_num_token})\s*mm\b", txt, flags=re.IGNORECASE)
-                                    if m:
-                                        v = to_num(m.group(1))
-                                        if v is not None and plaus_mm(v, key):
-                                            dist = abs((ly0 + ly1)/2.0 - (y0 + y1)/2.0)
-                                            cand.append((dist, f"{m.group(1)} mm"))
-                                elif key in ("k1","k2","ak"):
-                                    # diopters possibly with axis nearby on same line
-                                    md = re.search(rf"({_num_token})\s*D\b", txt, flags=re.IGNORECASE)
-                                    if md:
-                                        axis = ""
-                                        ma = re.search(r"@\s*(\d{1,3})\s*(?:°|º|o)\b", txt)
-                                        if ma:
-                                            axis = f" @ {ma.group(1)}°"
+                        if y1 <= top and y0 >= bot and not (x1 < lx0 - 5 or x0 > lx1 + 5):
+                            if key == "cct":
+                                m = re.search(rf"({_num_token})\s*(?:[µμ]m|um)\b", txt, flags=re.IGNORECASE)
+                                if m:
+                                    v = to_num(m.group(1))
+                                    if v is not None and 350 <= v <= 800:
                                         dist = abs((ly0 + ly1)/2.0 - (y0 + y1)/2.0)
-                                        cand.append((dist, f"{md.group(1)} D{axis}"))
+                                        cand.append((dist, f"{m.group(1)} µm"))
+                            elif key in ("axial_length","acd","lt","wtw"):
+                                m = re.search(rf"({_num_token})\s*mm\b", txt, flags=re.IGNORECASE)
+                                if m:
+                                    v = to_num(m.group(1))
+                                    if v is not None and plaus_mm(v, key):
+                                        dist = abs((ly0 + ly1)/2.0 - (y0 + y1)/2.0)
+                                        cand.append((dist, f"{m.group(1)} mm"))
+                            else:  # K1/K2/AK
+                                md = re.search(rf"({_num_token})\s*D\b", txt, flags=re.IGNORECASE)
+                                if md:
+                                    axis = ""
+                                    ma = re.search(r"@\s*(\d{1,3})\s*(?:°|º|o)\b", txt)
+                                    if ma:
+                                        axis = f" @ {ma.group(1)}°"
+                                    dist = abs((ly0 + ly1)/2.0 - (y0 + y1)/2.0)
+                                    cand.append((dist, f"{md.group(1)} D{axis}"))
 
                     if cand and not found[key]:
                         cand.sort(key=lambda t: t[0])
                         found[key] = cand[0][1]
+
+                # ---- CCT no-label fallback ----
+                if not found["cct"]:
+                    # 1) Collect plausible µm tokens across the column
+                    um_hits = []
+                    for x0,y0,x1,y1,txt in col_lines:
+                        for m in re.finditer(rf"({_num_token})\s*(?:[µμ]m|um)\b", txt, flags=re.IGNORECASE):
+                            v = to_num(m.group(1))
+                            if v is not None and 350 <= v <= 800:
+                                um_hits.append(((x0,y0,x1,y1), f"{m.group(1)} µm"))
+                    # 2) Compute biometrics anchor Y = median Y of AL/ACD/LT/WTW label rows
+                    anchor_candidates_y = []
+                    for x0,y0,x1,y1,txt in label_rows:
+                        if txt.upper().rstrip(":") in ("AL","ACD","LT","WTW"):
+                            anchor_candidates_y.append((y0+y1)/2.0)
+                    if not anchor_candidates_y:
+                        # If no label rows at all, use numeric mm lines as proxy
+                        for x0,y0,x1,y1,txt in col_lines:
+                            if re.search(rf"\b{_num_token}\s*mm\b", txt, flags=re.IGNORECASE):
+                                anchor_candidates_y.append((y0+y1)/2.0)
+                    anchor_y = (sorted(anchor_candidates_y)[len(anchor_candidates_y)//2]
+                                if anchor_candidates_y else (col_lines[0][3] if col_lines else 0.0))
+
+                    # 3) Pick the µm token closest to anchor_y (same column already enforced)
+                    if um_hits:
+                        um_hits.sort(key=lambda item: abs(((item[0][1]+item[0][3])/2.0) - anchor_y))
+                        found["cct"] = um_hits[0][1]
 
                 return found
 
             left_vals  = harvest_column(left_lines)
             right_vals = harvest_column(right_lines)
 
-            # Merge with page results (if multiple pages, first non-empty wins)
             for k,v in left_vals.items():
                 if v and not out_left[k]:
                     out_left[k] = v
@@ -433,7 +456,6 @@ def coordinate_harvest(pdf_bytes: bytes) -> Dict[str, Dict[str, str]]:
         print(f"coordinate_harvest error: {e}")
 
     return {"left": out_left, "right": out_right}
-
 
 # =========================
 # Patterns & parsing helpers (text-based)
