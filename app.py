@@ -127,39 +127,68 @@ def normalize_for_ocr(text: str) -> str:
 # ---- NEW: bind numbers printed above labels (e.g., 23,73 / 554 / 2,89 / 4,90 ... then AL: / CCT: / ACD: / LT:)
 def bind_disjoint_scalars(text: str) -> str:
     """
-    Many IOLMaster exports print the numeric values, then the labels on later lines.
-    This binder looks *backwards* from bare labels (AL/ACD/LT/WTW/CCT) and injects
-    the nearest number (and unit if present). If the unit is not found, we infer:
-      - mm for AL/ACD/LT/WTW, µm for CCT.
+    Devices sometimes print units, then numbers, then labels (AL/CCT/ACD/LT).
+    This binder looks *backwards* a short distance from each bare label line and
+    attaches the closest value with the *expected* unit. Handles both:
+      - number + unit   (e.g., '23,73 mm')
+      - unit then line break then number (e.g., 'mm\\n23,73')
+    If no explicit unit match is found, falls back to a nearby bare number ONLY
+    if no intervening labels like CVD:/SD:/WTW:/P:/TK* appear in between.
     """
-    t = text
 
-    def patch_label(label: str, unit_hint: str):
-        nonlocal t
-        # Match a label line that has no value on the same line
-        pattern = re.compile(rf"(?mi)^({label})\s*:\s*$")
+    def patch_label(t: str, label: str, unit_kind: str) -> str:
+        # unit regex by kind
+        if unit_kind == "mm":
+            unit_pat = r"mm"
+        elif unit_kind == "um":
+            unit_pat = r"(?:[µμ]m|um)"   # µm or μm or um
+        else:
+            unit_pat = r"(?:mm|[µμ]m|um)"
+
+        # Bare label line (no value on the same line)
+        lab_re = re.compile(rf"(?mi)^({label})\s*:\s*$")
+
         def _repl(m):
+            nonlocal t
             idx = m.start()
-            window = t[max(0, idx-220): idx]  # look back ~220 chars
+            # Keep window SHORT to avoid grabbing CVD: 12,00 mm etc.
+            win = t[max(0, idx-80): idx]
 
-            # 1) Prefer number with explicit unit within window (closest to label)
-            m2 = re.search(r"(-?\d[\d.,]*)\s*(mm|[µμ]m|um)\b", window, re.IGNORECASE)
+            # Guard: if window contains another label, abort
+            if re.search(r"(?mi)\b(?:CVD|SD|WTW|P|TK1|TK2|TSE)\s*:", win):
+                return m.group(0)
+
+            # 1) number + expected unit (nearest in window)
+            m1 = re.search(rf"(-?\d[\d.,]*)\s*{unit_pat}\b", win, flags=re.IGNORECASE)
+            if m1:
+                val = f"{m1.group(1)} {'mm' if unit_kind=='mm' else 'µm'}"
+                return f"{m.group(1)}: {val}"
+
+            # 2) expected unit then linebreak then number
+            m2 = re.search(rf"{unit_pat}\s*\n\s*(-?\d[\d.,]*)\b", win, flags=re.IGNORECASE)
             if m2:
-                val = f"{m2.group(1)} {m2.group(2)}"
+                val = f"{m2.group(1)} {'mm' if unit_kind=='mm' else 'µm'}"
                 return f"{m.group(1)}: {val}"
 
-            # 2) Fallback: nearest bare number before label
-            m3 = re.search(r"(-?\d[\d.,]+)\s*$", window)
-            if m3:
-                unit = "mm" if unit_hint == "mm" else "µm"
-                val = f"{m3.group(1)} {unit}"
+            # 3) bare number fallback (only if no foreign label and it's very close)
+            m3 = re.search(r"(-?\d[\d.,]+)\s*$", win)
+            if m3 and len(win) - m3.start() <= 30:
+                val = f"{m3.group(1)} {'mm' if unit_kind=='mm' else 'µm'}"
                 return f"{m.group(1)}: {val}"
 
-            # No patch found → keep as-is
             return m.group(0)
 
-        t = pattern.sub(_repl, t)
-        return t
+        return lab_re.sub(_repl, t)
+
+    # Apply in the order they appear there
+    t = text
+    t = patch_label(t, "AL",  "mm")
+    t = patch_label(t, "CCT", "um")
+    t = patch_label(t, "ACD", "mm")
+    t = patch_label(t, "LT",  "mm")
+    t = patch_label(t, "WTW", "mm")
+    return t
+
 
     # Apply for all scalar labels that sometimes show values above labels
     t = patch_label("AL",  "mm")
