@@ -1,5 +1,7 @@
-# app.py — LakeCalc.ai parser v3.6
-# layout split + strict binder + CCT sanity + rescue + reconcile + PT→EN + µ/μ + ΔK/AK/K + ordered + safe PDF extract
+# app.py — LakeCalc.ai parser v3.7
+# layout split + strict binder (+CCT special) + CCT sanity (fwd/back)
+# + rescue + reconcile + plausibility re-score + PT→EN (clues only)
+# + µ/μ + ΔK/AK/K + ordered + safe PDF extract
 
 import os, io, re
 from collections import OrderedDict
@@ -149,17 +151,16 @@ def normalize_for_ocr(text: str) -> str:
 
 
 # =========================
-# Strict binder: numbers/units above labels
+# Strict binder: numbers/units above labels (CCT special)
 # =========================
 def bind_disjoint_scalars(text: str) -> str:
     """
     Strict binder for AL/ACD/LT/WTW/CCT when numbers/units sit above labels.
     - Requires explicit unit (no bare-number fallback).
-    - Looks back a short window (<=180 chars), then *cuts off* any trailing noise
-      block (SD:, CVD:, WTW:, P:, TK*, etc.) so we don't grab '20/4/10/20'.
-    - Supports 'number + unit' and 'unit \\n number' layouts.
+    - Cuts off back-window at noise markers (SD:, CVD:, WTW:, P:, TK*, TSE:).
+    - For CCT: if the immediate number after the last µm is implausible,
+      scan the next few numbers after that same µm to find a plausible 400–700 µm.
     """
-
     NOISE = re.compile(r"(?mi)\b(?:CVD|SD|WTW|P|TK1|TK2|TSE)\s*:")
 
     def patch_label(t: str, label: str, unit_kind: str) -> str:
@@ -168,70 +169,96 @@ def bind_disjoint_scalars(text: str) -> str:
 
         def _repl(m):
             idx = m.start()
-            win = t[max(0, idx - 180): idx]  # wider but still local
-
-            # Cut back window at the last noise marker (closest to label)
+            win = t[max(0, idx - 180): idx]              # look back locally
             cut = NOISE.search(win)
             if cut:
-                win = win[: cut.start()]
+                win = win[: cut.start()]                # strip trailing noise
 
-            # 1) number + expected unit, choose the CLOSEST to the label
+            # ------- generic paths (number+unit OR unit\nnumber), choose closest -------
             m1_iter = list(re.finditer(rf"(-?\d[\d.,]*)\s*{unit_pat}\b", win, flags=re.IGNORECASE))
+            m2_iter = list(re.finditer(rf"{unit_pat}\s*\n\s*(-?\d[\d.,]*)\b", win, flags=re.IGNORECASE))
+
+            # ------- special handling for CCT -------
+            if label == "CCT":
+                # Find the LAST µm unit before the label:
+                last_um = None
+                for um in re.finditer(rf"{unit_pat}\b", win, flags=re.IGNORECASE):
+                    last_um = um
+                if last_um:
+                    tail_after_um = win[last_um.end():]
+                    # Look for the first plausible 400–700 µm number after that µm unit
+                    for mnum in re.finditer(r"(-?\d[\d.,]*)", tail_after_um):
+                        try:
+                            cand = float(mnum.group(1).replace('.', '').replace(',', '.'))
+                        except ValueError:
+                            continue
+                        if 400 <= cand <= 700:
+                            return f"{m.group(1)}: {mnum.group(1)} µm"
+                    # If none plausible were found, fall back to generic logic
+
+            # number + unit (closest)
             if m1_iter:
-                m1 = m1_iter[-1]  # closest
+                m1 = m1_iter[-1]
                 val = f"{m1.group(1)} {'mm' if unit_kind=='mm' else 'µm'}"
                 return f"{m.group(1)}: {val}"
 
-            # 2) expected unit then newline then number (choose the closest)
-            m2_iter = list(re.finditer(rf"{unit_pat}\s*\n\s*(-?\d[\d.,]*)\b", win, flags=re.IGNORECASE))
+            # unit \n number (closest)
             if m2_iter:
                 m2 = m2_iter[-1]
                 val = f"{m2.group(1)} {'mm' if unit_kind=='mm' else 'µm'}"
                 return f"{m.group(1)}: {val}"
 
-            # Strict: do NOT invent values without explicit unit
+            # strict: do not invent values without explicit unit
             return m.group(0)
 
         return lab_re.sub(_repl, t)
 
     t = text
-    t = patch_label(t, "AL", "mm")
+    t = patch_label(t, "AL",  "mm")
     t = patch_label(t, "CCT", "um")
     t = patch_label(t, "ACD", "mm")
-    t = patch_label(t, "LT", "mm")
+    t = patch_label(t, "LT",  "mm")
     t = patch_label(t, "WTW", "mm")
     return t
 
 
 # =========================
-# CCT sanity correction
+# CCT sanity correction (fwd & back)
 # =========================
 def smart_fix_cct_bound(text_with_bindings: str) -> str:
     """
-    If CCT got bound to something implausible (e.g., '23,73 µm'), look around the
-    CCT label for a more plausible 3-digit µm value (400–700) and replace it.
+    If CCT got bound to something implausible (e.g., '23,73 µm'), search both
+    forward AND backward near the label for a plausible 400–700 µm number.
     """
-    def replace(match: re.Match) -> str:
-        full = match.group(0)
-        val = match.group(1)
-        # Normalize decimal comma
+    def plausible_um(val: str) -> bool:
         try:
             num = float(val.replace('.', '').replace(',', '.'))
         except ValueError:
-            num = -1.0
-        # If it's already plausible (400–700), keep it
-        if 400 <= num <= 700:
+            return False
+        return 400 <= num <= 700
+
+    def replace(match: re.Match) -> str:
+        full = match.group(0)
+        val  = match.group(1)
+        if plausible_um(val):
             return full
-        # Search forward a little for a better µm number
-        tail = text_with_bindings[match.end(): match.end() + 200]
-        mnext = re.search(r"(-?\d[\d.,]*)\s*(?:[µμ]m|um)\b", tail)
-        if mnext:
-            try:
-                cand = float(mnext.group(1).replace('.', '').replace(',', '.'))
-            except ValueError:
-                cand = -1.0
-            if 400 <= cand <= 700:
-                return full.replace(val, mnext.group(1))
+
+        # search forward (next 200 chars)
+        fwd = text_with_bindings[match.end(): match.end() + 200]
+        mf  = re.search(r"(-?\d[\d.,]*)\s*(?:[µμ]m|um)\b", fwd)
+        if mf and plausible_um(mf.group(1)):
+            return full.replace(val, mf.group(1))
+
+        # search backward (prev 200 chars)
+        start = match.start()
+        bgn   = max(0, start - 200)
+        bwd   = text_with_bindings[bgn:start]
+        mb_iter = list(re.finditer(r"(-?\d[\d.,]*)\s*(?:[µμ]m|um)\b", bwd))
+        if mb_iter:
+            mb = mb_iter[-1]
+            if plausible_um(mb.group(1)):
+                return full.replace(val, mb.group(1))
+
         return full
 
     return re.sub(r"(?mi)\bCCT\s*:\s*([-\d.,]+)\s*(?:[µμ]m|um)\b", replace, text_with_bindings)
@@ -302,16 +329,15 @@ LABEL_STOP = re.compile(r"(?:\r?\n|(?=(?:AL|ACD|CCT|LT|WTW|K1|K2|K|AK|ΔK)\s*:))
 
 PATTERNS = {
     "axial_length": re.compile(rf"(?mi)\bAL\s*:\s*({MM})"),
-    "acd": re.compile(rf"(?mi)\bACD\s*:\s*({MM})"),
-    "cct": re.compile(rf"(?mi)\bCCT\s*:\s*({UM})"),
-    "lt": re.compile(rf"(?mi)\bLT\s*:\s*({MM})"),
-    "wtw": re.compile(rf"(?mi)\bWTW\s*:\s*({MM})"),
-    "k1": re.compile(rf"(?mi)\bK1\s*:\s*({DVAL})"),
-    "k2": re.compile(rf"(?mi)\bK2\s*:\s*({DVAL})"),
+    "acd":          re.compile(rf"(?mi)\bACD\s*:\s*({MM})"),
+    "cct":          re.compile(rf"(?mi)\bCCT\s*:\s*({UM})"),
+    "lt":           re.compile(rf"(?mi)\bLT\s*:\s*({MM})"),
+    "wtw":          re.compile(rf"(?mi)\bWTW\s*:\s*({MM})"),
+    "k1":           re.compile(rf"(?mi)\bK1\s*:\s*({DVAL})"),
+    "k2":           re.compile(rf"(?mi)\bK2\s*:\s*({DVAL})"),
     # ΔK / AK / K (but NOT K1/K2)
-    "ak": re.compile(rf"(?mi)\b(?:Δ\s*K|AK|K(?!\s*1|\s*2))\s*:\s*({DVAL})"),
+    "ak":           re.compile(rf"(?mi)\b(?:Δ\s*K|AK|K(?!\s*1|\s*2))\s*:\s*({DVAL})"),
 }
-
 
 def harvest_axis(field_tail: str) -> str:
     mstop = LABEL_STOP.search(field_tail)
@@ -325,45 +351,41 @@ def harvest_axis(field_tail: str) -> str:
     m = re.search(r"(\d{1,3})\s*(?:°|º|o)\b", seg)
     return f" @ {m.group(1)}°" if m else ""
 
-
 def parse_eye_block(txt: str) -> dict:
-    out = {"axial_length": "", "acd": "", "k1": "", "k2": "", "ak": "", "wtw": "", "cct": "", "lt": ""}
+    out = {"axial_length":"", "acd":"", "k1":"", "k2":"", "ak":"", "wtw":"", "cct":"", "lt":""}
     if not txt or not txt.strip():
         return out
     for key, pat in PATTERNS.items():
         for m in pat.finditer(txt):
             raw = re.sub(r"\s+", " ", m.group(1)).strip()
             if key in ("k1", "k2", "ak"):
-                raw = re.sub(r"@\s*.*$", "", raw)  # drop trailing axis blob
-                tail = txt[m.end(1) : m.end(1) + 200]
+                raw = re.sub(r"@\s*.*$", "", raw)
+                tail = txt[m.end(1): m.end(1) + 200]
                 raw = (raw + harvest_axis(tail)).strip()
             if not out[key]:
                 out[key] = raw
     return out
 
-
 def has_measurements(d: dict) -> bool:
     return any(d.values())
 
 
+# =========================
 # Rescue harvester (tolerant)
+# =========================
 RESCUE = {
     "axial_length": re.compile(r"(?mi)\bAL\s*[:=]?\s*(-?\d[\d.,]*)\s*mm\b"),
-    "acd": re.compile(r"(?mi)\bACD\s*[:=]?\s*(-?\d[\d.,]*)\s*mm\b"),
-    "lt": re.compile(r"(?mi)\bLT\s*[:=]?\s*(-?\d[\d.,]*)\s*mm\b"),
-    "wtw": re.compile(r"(?mi)\bWTW\s*[:=]?\s*(-?\d[\d.,]*)\s*mm\b"),
-    "cct": re.compile(
-        r"(?mi)\bCCT\s*[:=]?\s*(?:(-?\d[\d.,]*)\s*(?:[µμ]m|um)|(?:[µμ]m|um)\s*\n\s*(-?\d[\d.,]*))"
-    ),
-    "k1": re.compile(r"(?mi)\bK1\s*[:=]?\s*(-?\d[\d.,]*)\s*D(?:.*?@\s*(\d{1,3}))?"),
-    "k2": re.compile(r"(?mi)\bK2\s*[:=]?\s*(-?\d[\d.,]*)\s*D(?:.*?@\s*(\d{1,3}))?"),
-    "ak": re.compile(r"(?mi)\b(?:Δ\s*K|AK|K(?!\s*1|\s*2))\s*[:=]?\s*(-?\d[\d.,]*)\s*D(?:.*?@\s*(\d{1,3}))?"),
+    "acd":          re.compile(r"(?mi)\bACD\s*[:=]?\s*(-?\d[\d.,]*)\s*mm\b"),
+    "lt":           re.compile(r"(?mi)\bLT\s*[:=]?\s*(-?\d[\d.,]*)\s*mm\b"),
+    "wtw":          re.compile(r"(?mi)\bWTW\s*[:=]?\s*(-?\d[\d.,]*)\s*mm\b"),
+    "cct":          re.compile(r"(?mi)\bCCT\s*[:=]?\s*(?:(-?\d[\d.,]*)\s*(?:[µμ]m|um)|(?:[µμ]m|um)\s*\n\s*(-?\d[\d.,]*))"),
+    "k1":           re.compile(r"(?mi)\bK1\s*[:=]?\s*(-?\d[\d.,]*)\s*D(?:.*?@\s*(\d{1,3}))?"),
+    "k2":           re.compile(r"(?mi)\bK2\s*[:=]?\s*(-?\d[\d.,]*)\s*D(?:.*?@\s*(\d{1,3}))?"),
+    "ak":           re.compile(r"(?mi)\b(?:Δ\s*K|AK|K(?!\s*1|\s*2))\s*[:=]?\s*(-?\d[\d.,]*)\s*D(?:.*?@\s*(\d{1,3}))?")
 }
-
 
 def rescue_harvest(raw_text: str) -> dict:
     out = {}
-
     def setv(k, v):
         if v and k not in out:
             out[k] = v.strip()
@@ -376,8 +398,7 @@ def rescue_harvest(raw_text: str) -> dict:
     m = RESCUE["cct"].search(raw_text)
     if m:
         num = m.group(1) or m.group(2)
-        if num:
-            setv("cct", f"{num} µm")
+        if num: setv("cct", f"{num} µm")
 
     for k in ("k1", "k2", "ak"):
         m = RESCUE[k].search(raw_text)
@@ -385,14 +406,15 @@ def rescue_harvest(raw_text: str) -> dict:
             diop = m.group(1)
             axis = m.group(2)
             val = f"{diop} D"
-            if axis:
-                val += f" @ {axis}°"
+            if axis: val += f" @ {axis}°"
             setv(k, val)
 
     return out
 
 
+# =========================
 # Reconcile
+# =========================
 def reconcile(base: dict, binder: dict | None, rescue: dict | None) -> dict:
     res = dict(base)
     if binder:
@@ -406,7 +428,112 @@ def reconcile(base: dict, binder: dict | None, rescue: dict | None) -> dict:
     return res
 
 
-# Detect device
+# =========================
+# Plausibility re-score (final safety net)
+# =========================
+PLAUSIBLE = {
+    "axial_length": lambda x: 17.0 <= x <= 32.0,
+    "acd":          lambda x: 1.5  <= x <= 6.0,
+    "lt":           lambda x: 2.0  <= x <= 7.0,
+    "wtw":          lambda x: 9.0  <= x <= 15.0,
+    "cct_um":       lambda x: 350  <= x <= 800,
+    "k_diopters":   lambda x: 30.0 <= x <= 55.0,
+    "cyl_diopters": lambda x: 0.0  <= x <= 10.0,
+    "axis_deg":     lambda x: 0    <= x <= 180,
+}
+NOISE_LABELS = re.compile(r"(?mi)\b(?:CVD|SD|WTW|P|TK1|TK2|TSE|B-Scan|Fixação)\b")
+
+def _num(s: str) -> Optional[float]:
+    try:
+        s2 = s
+        for token in [" ", "µ", "μ", "um", "mm", "D", "°"]:
+            s2 = s2.replace(token, "")
+        s2 = s2.replace(".", "").replace(",", ".")
+        return float(s2)
+    except:
+        return None
+
+def _score_candidate(label: str, value_str: str, ctx: str, unit_kind: str) -> float:
+    # unit match
+    vlow = value_str.lower()
+    unit_ok = (unit_kind=="mm" and "mm" in vlow) or \
+              (unit_kind=="um" and ("µm" in vlow or "μm" in vlow or "um" in vlow)) or \
+              (unit_kind=="D"  and "d" in vlow)
+    if not unit_ok: return -1.0
+
+    # plausibility
+    v = _num(value_str)
+    plaus = 0.0
+    if v is not None:
+        if label == "CCT":
+            plaus = 1.0 if PLAUSIBLE["cct_um"](v) else -0.5
+        elif label in ("AL", "ACD", "LT", "WTW"):
+            key = {"AL":"axial_length", "ACD":"acd", "LT":"lt", "WTW":"wtw"}[label]
+            plaus = 1.0 if PLAUSIBLE[key](v) else -0.5
+
+    # noise penalty
+    noise = -0.6 if NOISE_LABELS.search(ctx) else 0.0
+
+    # proximity bonus: shorter context snippet = closer
+    prox = max(0.0, 0.8 - 0.001*len(ctx))
+
+    return (1.5 if unit_ok else 0) + plaus + noise + prox
+
+def plausibility_rescore(eye_text: str, data: dict) -> dict:
+    """
+    For each scalar (AL/ACD/LT/WTW/CCT), if empty or implausible,
+    search ±220 chars around its label for the best plausible candidate.
+    """
+    out = dict(data)
+    for lab, key, unit in [("AL","axial_length","mm"), ("ACD","acd","mm"),
+                           ("LT","lt","mm"), ("WTW","wtw","mm"), ("CCT","cct","um")]:
+        cur = out.get(key, "") or ""
+        # Check current plausibility
+        cur_ok = True
+        if cur:
+            valn = _num(cur)
+            if valn is None:
+                cur_ok = False
+            else:
+                if unit == "um":
+                    cur_ok = PLAUSIBLE["cct_um"](valn)
+                else:
+                    cur_ok = PLAUSIBLE[{"AL":"axial_length","ACD":"acd","LT":"lt","WTW":"wtw"}[lab]](valn)
+
+        if cur and cur_ok:
+            continue  # keep good value
+
+        best = (None, -9e9)  # (string, score)
+        for m in re.finditer(rf"(?mi)\b{lab}\s*:", eye_text):
+            anchor = m.end()
+            win_beg, win_end = max(0, anchor-220), min(len(eye_text), anchor+220)
+            win = eye_text[win_beg:win_end]
+
+            # candidates in window: number+unit or unit then number
+            for cand in re.finditer(r"(-?\d[\d.,]*)\s*(mm|[µμ]m|um|D)\b", win, flags=re.IGNORECASE):
+                s = f"{cand.group(1)} {cand.group(2)}"
+                sc = _score_candidate(lab, s, win, "um" if unit=="um" else ("mm" if unit=="mm" else "D"))
+                if sc > best[1]: best = (s, sc)
+
+            for cand in re.finditer(r"(mm|[µμ]m|um|D)\s*\n\s*(-?\d[\d.,]*)\b", win, flags=re.IGNORECASE):
+                s = f"{cand.group(2)} {cand.group(1)}"
+                sc = _score_candidate(lab, s, win, "um" if unit=="um" else ("mm" if unit=="mm" else "D"))
+                if sc > best[1]: best = (s, sc)
+
+        if best[0]:
+            # Normalize unit for CCT spelling
+            if unit == "um":
+                s = re.sub(r"(?i)um\b", "µm", best[0])
+                out[key] = s
+            else:
+                out[key] = best[0]
+
+    return out
+
+
+# =========================
+# Detect device & ordering
+# =========================
 def detect_source_label(text: str) -> str:
     if re.search(r"IOL\s*Master\s*700", text, re.IGNORECASE):
         return "IOL Master 700"
@@ -415,11 +542,7 @@ def detect_source_label(text: str) -> str:
     first = next((ln.strip() for ln in text.splitlines() if ln.strip()), "Unknown")
     return first[:60]
 
-
-# Output ordering
 FIELD_ORDER = ["source", "axial_length", "acd", "k1", "k2", "ak", "wtw", "cct", "lt"]
-
-
 def enforce_field_order(eye_dict: dict) -> OrderedDict:
     return OrderedDict((k, eye_dict.get(k, "")) for k in FIELD_ORDER)
 
@@ -430,27 +553,18 @@ def enforce_field_order(eye_dict: dict) -> OrderedDict:
 def parse_iol(norm_text: str, pdf_bytes: Optional[bytes], source_label: str, want_debug: bool = False):
     def fresh():
         return OrderedDict(
-            [
-                ("source", source_label),
-                ("axial_length", ""),
-                ("acd", ""),
-                ("k1", ""),
-                ("k2", ""),
-                ("ak", ""),
-                ("wtw", ""),
-                ("cct", ""),
-                ("lt", ""),
-            ]
+            [("source", source_label), ("axial_length",""), ("acd",""), ("k1",""), ("k2",""),
+             ("ak",""), ("wtw",""), ("cct",""), ("lt","")]
         )
 
     result = {"OD": fresh(), "OS": fresh()}
-    debug = {"strategy": "", "left_len": 0, "right_len": 0, "left_preview": "", "right_preview": "", "mapping": ""}
+    debug = {"strategy":"", "left_len":0, "right_len":0, "left_preview":"", "right_preview":"", "mapping":""}
 
     left_txt = right_txt = None
     if pdf_bytes:
         try:
             cols = pdf_split_left_right(pdf_bytes)
-            left_txt, right_txt = cols.get("left", ""), cols.get("right", "")
+            left_txt, right_txt = cols.get("left",""), cols.get("right","")
             debug["strategy"] = "pdf_layout_split"
             debug["left_len"] = len(left_txt or "")
             debug["right_len"] = len(right_txt or "")
@@ -459,69 +573,63 @@ def parse_iol(norm_text: str, pdf_bytes: Optional[bytes], source_label: str, wan
 
     if left_txt is not None and right_txt is not None:
         # Normalize → strict bind → CCT sanity → localize
-        left_norm = localize_pt_to_en(smart_fix_cct_bound(bind_disjoint_scalars(normalize_for_ocr(left_txt))))
+        left_norm  = localize_pt_to_en(smart_fix_cct_bound(bind_disjoint_scalars(normalize_for_ocr(left_txt))))
         right_norm = localize_pt_to_en(smart_fix_cct_bound(bind_disjoint_scalars(normalize_for_ocr(right_txt))))
         if want_debug:
-            debug["left_preview"] = left_norm[:600]
+            debug["left_preview"]  = left_norm[:600]
             debug["right_preview"] = right_norm[:600]
 
         # Primary parse
-        left_data = parse_eye_block(left_norm)
+        left_data  = parse_eye_block(left_norm)
         right_data = parse_eye_block(right_norm)
 
         # Bound scalar dicts (from normalized text)
         def scalars_from_bound(nrm: str) -> dict:
             d = {}
-            for lab, key, unit in [
-                ("AL", "axial_length", "mm"),
-                ("ACD", "acd", "mm"),
-                ("LT", "lt", "mm"),
-                ("WTW", "wtw", "mm"),
-                ("CCT", "cct", "µm"),
-            ]:
+            for lab, key, unit in [("AL","axial_length","mm"), ("ACD","acd","mm"),
+                                   ("LT","lt","mm"), ("WTW","wtw","mm"), ("CCT","cct","µm")]:
                 m = re.search(rf"(?mi)\b{lab}\s*:\s*(-?\d[\d.,]*)\s*(?:mm|[µμ]m|um)\b", nrm)
                 if m:
                     d[key] = f"{m.group(1)} {('µm' if lab=='CCT' else 'mm')}"
             return d
 
-        left_bound = scalars_from_bound(left_norm)
+        left_bound  = scalars_from_bound(left_norm)
         right_bound = scalars_from_bound(right_norm)
 
         # Rescue (tolerant)
-        left_rescue = rescue_harvest(left_norm)
+        left_rescue  = rescue_harvest(left_norm)
         right_rescue = rescue_harvest(right_norm)
 
         # Reconcile
-        left_final = reconcile(left_data, left_bound, left_rescue)
+        left_final  = reconcile(left_data,  left_bound,  left_rescue)
         right_final = reconcile(right_data, right_bound, right_rescue)
+
+        # NEW: Plausibility re-score pass (fix empty/implausible without touching good)
+        left_final  = plausibility_rescore(left_norm,  left_final)
+        right_final = plausibility_rescore(right_norm, right_final)
 
         # Map OD/OS by clues
         def looks_od(s: str) -> bool:
             u = s.upper()
             return bool(re.search(r"\bOD\b|\bO\s*D\b|RIGHT\b", u))
-
         def looks_os(s: str) -> bool:
             u = s.upper()
             return bool(re.search(r"\bOS\b|\bO\s*S\b|\bOE\b|\bO\s*E\b|LEFT\b", u))
 
-        left_is_od, left_is_os = looks_od(left_txt), looks_os(left_txt)
+        left_is_od, left_is_os   = looks_od(left_txt),  looks_os(left_txt)
         right_is_od, right_is_os = looks_od(right_txt), looks_os(right_txt)
 
         if left_is_od and right_is_os:
-            mapping = {"OD": left_final, "OS": right_final}
-            debug["mapping"] = "OD<-left, OS<-right (labels)"
+            mapping = {"OD": left_final, "OS": right_final};  debug["mapping"] = "OD<-left, OS<-right (labels)"
         elif left_is_os and right_is_od:
-            mapping = {"OD": right_final, "OS": left_final}
-            debug["mapping"] = "OD<-right, OS<-left (labels)"
+            mapping = {"OD": right_final, "OS": left_final};  debug["mapping"] = "OD<-right, OS<-left (labels)"
         else:
-            mapping = {"OD": left_final, "OS": right_final}
-            debug["mapping"] = "OD<-left, OS<-right (default)"
+            mapping = {"OD": left_final, "OS": right_final};  debug["mapping"] = "OD<-left, OS<-right (default)"
 
         # Copy into result
-        for eye in ("OD", "OS"):
-            for k, v in mapping[eye].items():
-                if v:
-                    result[eye][k] = v
+        for eye in ("OD","OS"):
+            for k,v in mapping[eye].items():
+                if v: result[eye][k] = v
 
         # Last-chance global rescue if any eye is still empty
         if not has_measurements(mapping["OD"]):
@@ -536,7 +644,7 @@ def parse_iol(norm_text: str, pdf_bytes: Optional[bytes], source_label: str, wan
                 if not result["OS"].get(k):
                     result["OS"][k] = v
 
-        # Enforce order
+        # Enforce output order
         result["OD"] = enforce_field_order(result["OD"])
         result["OS"] = enforce_field_order(result["OS"])
 
@@ -545,13 +653,11 @@ def parse_iol(norm_text: str, pdf_bytes: Optional[bytes], source_label: str, wan
     # No layout info → treat as single block → OD
     single = localize_pt_to_en(smart_fix_cct_bound(bind_disjoint_scalars(normalize_for_ocr(norm_text))))
     parsed = parse_eye_block(single)
-    for k, v in parsed.items():
-        if v:
-            result["OD"][k] = v
+    for k,v in parsed.items():
+        if v: result["OD"][k] = v
 
     result["OD"] = enforce_field_order(result["OD"])
     result["OS"] = enforce_field_order(result["OS"])
-
     debug["strategy"] = "ocr_single_block_to_OD"
     return (result, debug) if want_debug else result
 
@@ -561,14 +667,11 @@ def parse_iol(norm_text: str, pdf_bytes: Optional[bytes], source_label: str, wan
 # =========================
 @app.route("/api/health")
 def health():
-    return jsonify(
-        {
-            "status": "running",
-            "version": "LakeCalc.ai parser v3.6 (strict binder + CCT sanity + rescue + reconcile + ordered)",
-            "ocr_enabled": bool(vision_client),
-        }
-    )
-
+    return jsonify({
+        "status": "running",
+        "version": "LakeCalc.ai parser v3.7 (strict binder + CCT sanity + rescue + reconcile + plausibility + ordered)",
+        "ocr_enabled": bool(vision_client)
+    })
 
 @app.route("/api/parse-file", methods=["POST"])
 def parse_file():
@@ -579,10 +682,10 @@ def parse_file():
         return jsonify({"error": "No selected file"}), 400
 
     include_raw = request.args.get("include_raw") == "1"
-    raw_only = request.args.get("raw_only") == "1"
-    force_pdf = request.args.get("force_pdf") == "1"
-    force_ocr = request.args.get("force_ocr") == "1"
-    debug_flag = request.args.get("debug") == "1"
+    raw_only    = request.args.get("raw_only") == "1"
+    force_pdf   = request.args.get("force_pdf") == "1"
+    force_ocr   = request.args.get("force_ocr") == "1"
+    debug_flag  = request.args.get("debug") == "1"
 
     force_mode = "pdf" if force_pdf else ("ocr" if force_ocr else None)
 
@@ -593,28 +696,22 @@ def parse_file():
 
         if raw_only:
             loc_preview = localize_pt_to_en(smart_fix_cct_bound(bind_disjoint_scalars(norm_text)))
-            return jsonify(
-                {
-                    "filename": fs.filename,
-                    "text_source": source_tag,
-                    "raw_text": loc_preview,
-                    "num_chars": len(loc_preview),
-                    "num_lines": loc_preview.count("\n") + 1,
-                }
-            )
+            return jsonify({
+                "filename": fs.filename,
+                "text_source": source_tag,
+                "raw_text": loc_preview,
+                "num_chars": len(loc_preview),
+                "num_lines": loc_preview.count("\n") + 1
+            })
 
-        parsed, dbg = (
-            parse_iol(norm_text, pdf_bytes, source_label, want_debug=debug_flag)
-            if debug_flag
-            else (parse_iol(norm_text, pdf_bytes, source_label), None)
-        )
+        parsed, dbg = parse_iol(norm_text, pdf_bytes, source_label, want_debug=debug_flag) if debug_flag else (parse_iol(norm_text, pdf_bytes, source_label), None)
 
         if include_raw or debug_flag:
             payload = {
                 "filename": fs.filename,
                 "text_source": source_tag,
                 "structured": parsed,
-                "raw_text_preview": localize_pt_to_en(smart_fix_cct_bound(bind_disjoint_scalars(norm_text)))[:1500],
+                "raw_text_preview": localize_pt_to_en(smart_fix_cct_bound(bind_disjoint_scalars(norm_text)))[:1500]
             }
             if dbg is not None:
                 payload["debug"] = dbg
@@ -626,11 +723,9 @@ def parse_file():
         print(f"Error in /api/parse-file: {e}")
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
 
-
 @app.route("/")
 def root():
     return render_template("index.html")
-
 
 @app.route("/<path:path>")
 def fallback(path):
@@ -638,7 +733,6 @@ def fallback(path):
         return render_template("index.html")
     except Exception:
         return jsonify({"ok": True, "route": path})
-
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
