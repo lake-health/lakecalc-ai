@@ -1,5 +1,7 @@
-# app.py — LakeCalc.ai parser v3.4
-import os, io, re, unicodedata
+# app.py — LakeCalc.ai parser v3.5
+# layout split + binder + rescue + reconcile + PT→EN + µ/μ + ΔK/AK/K + ordered + safe PDF extract
+
+import os, io, re
 from collections import OrderedDict
 from io import BytesIO
 
@@ -32,20 +34,54 @@ try:
     elif os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
         vision_client = vision.ImageAnnotatorClient()
     else:
-        print("INFO: Vision credentials not set. OCR fallback disabled for images.")
+        print("INFO: Vision credentials not set. OCR fallback disabled.")
 except Exception as e:
     print(f"Vision init error: {e}")
 
 # =========================
-# Text extraction (PDF-first, OCR fallback)
+# Safe PDF text extraction
 # =========================
-def try_pdf_text_extract(pdf_bytes: bytes) -> str:
+def extract_pdf_text_safe(file_bytes: bytes) -> str:
+    """Robust wrapper around pdfminer to avoid TypeError / bad streams."""
     try:
-        text = pdfminer_extract_text(BytesIO(pdf_bytes)) or ""
+        bio = BytesIO(file_bytes)
+        text = pdfminer_extract_text(bio) or ""
         return re.sub(r"[ \t]+\n", "\n", text).strip()
     except Exception as e:
-        print(f"pdfminer text error: {e}")
+        print(f"[WARN] pdfminer failed: {e}")
         return ""
+
+# =========================
+# Text extraction (PDF-first, OCR fallback)
+# =========================
+def get_text_from_upload(fs, force_mode: str | None = None):
+    """
+    Returns (text, source_tag, pdf_bytes_or_None).
+    source_tag: 'pdf_text'|'ocr_pdf'|'ocr_image'
+    """
+    name = (fs.filename or "").lower()
+    is_pdf = name.endswith(".pdf")
+    file_bytes = fs.read()
+
+    if is_pdf:
+        if force_mode == "pdf":
+            txt = extract_pdf_text_safe(file_bytes)
+            return txt, "pdf_text", file_bytes
+        if force_mode == "ocr":
+            return ocr_pdf_to_text(file_bytes), "ocr_pdf", file_bytes
+
+        txt = extract_pdf_text_safe(file_bytes)
+        if txt:
+            return txt, "pdf_text", file_bytes
+        # fallback to OCR if no text
+        return ocr_pdf_to_text(file_bytes), "ocr_pdf", file_bytes
+
+    # images
+    if force_mode == "ocr" or not force_mode:
+        return ocr_image_to_text(file_bytes), "ocr_image", None
+
+    # default
+    return "", "unknown", None
 
 def ocr_pdf_to_text(pdf_bytes: bytes) -> str:
     if not vision_client:
@@ -68,29 +104,6 @@ def ocr_image_to_text(image_bytes: bytes) -> str:
     if resp.error.message:
         raise RuntimeError(f"Vision API Error: {resp.error.message}")
     return (resp.text_annotations[0].description if resp.text_annotations else "").strip()
-
-def get_text_from_upload(fs, force_mode: str | None = None):
-    """
-    Returns (text, source_tag, pdf_bytes_or_None).
-    source_tag: 'pdf_text'|'ocr_pdf'|'ocr_image'
-    """
-    name = (fs.filename or "").lower()
-    is_pdf = name.endswith(".pdf")
-
-    if is_pdf:
-        pdf_bytes = fs.read()
-        if force_mode == "pdf":
-            return try_pdf_text_extract(pdf_bytes), "pdf_text", pdf_bytes
-        if force_mode == "ocr":
-            return ocr_pdf_to_text(pdf_bytes), "ocr_pdf", pdf_bytes
-        text = try_pdf_text_extract(pdf_bytes)
-        if text:
-            return text, "pdf_text", pdf_bytes
-        return ocr_pdf_to_text(pdf_bytes), "ocr_pdf", pdf_bytes
-
-    # images
-    image_bytes = fs.read()
-    return ocr_image_to_text(image_bytes), "ocr_image", None
 
 # =========================
 # Normalization (OCR/PDF quirks)
@@ -124,53 +137,40 @@ def normalize_for_ocr(text: str) -> str:
 
     return t
 
-# ---- NEW: bind numbers printed above labels (e.g., 23,73 / 554 / 2,89 / 4,90 ... then AL: / CCT: / ACD: / LT:)
+# ---- Binder: numbers/units above labels
 def bind_disjoint_scalars(text: str) -> str:
     """
-    Devices sometimes print units, then numbers, then labels (AL/CCT/ACD/LT).
-    This binder looks *backwards* a short distance from each bare label line and
-    attaches the closest value with the *expected* unit. Handles both:
-      - number + unit   (e.g., '23,73 mm')
-      - unit then line break then number (e.g., 'mm\\n23,73')
-    If no explicit unit match is found, falls back to a nearby bare number ONLY
-    if no intervening labels like CVD:/SD:/WTW:/P:/TK* appear in between.
+    Some exports print units, then numbers, then labels (AL/CCT/ACD/LT/WTW).
+    Look back a short window from each bare label and attach the closest value
+    with the expected unit. Avoid grabbing CVD/SD/etc.
     """
 
     def patch_label(t: str, label: str, unit_kind: str) -> str:
-        # unit regex by kind
-        if unit_kind == "mm":
-            unit_pat = r"mm"
-        elif unit_kind == "um":
-            unit_pat = r"(?:[µμ]m|um)"   # µm or μm or um
-        else:
-            unit_pat = r"(?:mm|[µμ]m|um)"
-
-        # Bare label line (no value on the same line)
+        unit_pat = r"mm" if unit_kind == "mm" else r"(?:[µμ]m|um)"
         lab_re = re.compile(rf"(?mi)^({label})\s*:\s*$")
 
         def _repl(m):
             nonlocal t
             idx = m.start()
-            # Keep window SHORT to avoid grabbing CVD: 12,00 mm etc.
-            win = t[max(0, idx-80): idx]
+            win = t[max(0, idx-80): idx]  # SHORT window to avoid CVD/SD
 
-            # Guard: if window contains another label, abort
+            # bail if other labels are present in the window
             if re.search(r"(?mi)\b(?:CVD|SD|WTW|P|TK1|TK2|TSE)\s*:", win):
                 return m.group(0)
 
-            # 1) number + expected unit (nearest in window)
+            # number + expected unit
             m1 = re.search(rf"(-?\d[\d.,]*)\s*{unit_pat}\b", win, flags=re.IGNORECASE)
             if m1:
                 val = f"{m1.group(1)} {'mm' if unit_kind=='mm' else 'µm'}"
                 return f"{m.group(1)}: {val}"
 
-            # 2) expected unit then linebreak then number
+            # expected unit then newline then number
             m2 = re.search(rf"{unit_pat}\s*\n\s*(-?\d[\d.,]*)\b", win, flags=re.IGNORECASE)
             if m2:
                 val = f"{m2.group(1)} {'mm' if unit_kind=='mm' else 'µm'}"
                 return f"{m.group(1)}: {val}"
 
-            # 3) bare number fallback (only if no foreign label and it's very close)
+            # bare number fallback, but only very close
             m3 = re.search(r"(-?\d[\d.,]+)\s*$", win)
             if m3 and len(win) - m3.start() <= 30:
                 val = f"{m3.group(1)} {'mm' if unit_kind=='mm' else 'µm'}"
@@ -180,22 +180,12 @@ def bind_disjoint_scalars(text: str) -> str:
 
         return lab_re.sub(_repl, t)
 
-    # Apply in the order they appear there
     t = text
     t = patch_label(t, "AL",  "mm")
     t = patch_label(t, "CCT", "um")
     t = patch_label(t, "ACD", "mm")
     t = patch_label(t, "LT",  "mm")
     t = patch_label(t, "WTW", "mm")
-    return t
-
-
-    # Apply for all scalar labels that sometimes show values above labels
-    t = patch_label("AL",  "mm")
-    t = patch_label("ACD", "mm")
-    t = patch_label("LT",  "mm")
-    t = patch_label("WTW", "mm")
-    t = patch_label("CCT", "µm")
     return t
 
 # =========================
@@ -237,7 +227,7 @@ def pdf_split_left_right(pdf_bytes: bytes) -> dict:
                     x0, y0, x1, y1 = el.bbox
                     x_center = (x0 + x1) / 2.0
                     txt = el.get_text()
-                    if not txt or not txt.strip(): 
+                    if not txt or not txt.strip():
                         continue
                     blobs.append((y1, txt, x_center < midx))
 
@@ -301,24 +291,72 @@ def parse_eye_block(txt: str) -> dict:
 def has_measurements(d: dict) -> bool:
     return any(d.values())
 
-# =========================
-# Source detection
-# =========================
+# Rescue harvester (tolerant)
+RESCUE = {
+    "axial_length": re.compile(r"(?mi)\bAL\s*[:=]?\s*(-?\d[\d.,]*)\s*mm\b"),
+    "acd":          re.compile(r"(?mi)\bACD\s*[:=]?\s*(-?\d[\d.,]*)\s*mm\b"),
+    "lt":           re.compile(r"(?mi)\bLT\s*[:=]?\s*(-?\d[\d.,]*)\s*mm\b"),
+    "wtw":          re.compile(r"(?mi)\bWTW\s*[:=]?\s*(-?\d[\d.,]*)\s*mm\b"),
+    "cct":          re.compile(r"(?mi)\bCCT\s*[:=]?\s*(?:(-?\d[\d.,]*)\s*(?:[µμ]m|um)|(?:[µμ]m|um)\s*\n\s*(-?\d[\d.,]*))"),
+    "k1":           re.compile(r"(?mi)\bK1\s*[:=]?\s*(-?\d[\d.,]*)\s*D(?:.*?@\s*(\d{1,3}))?"),
+    "k2":           re.compile(r"(?mi)\bK2\s*[:=]?\s*(-?\d[\d.,]*)\s*D(?:.*?@\s*(\d{1,3}))?"),
+    "ak":           re.compile(r"(?mi)\b(?:Δ\s*K|AK|K(?!\s*1|\s*2))\s*[:=]?\s*(-?\d[\d.,]*)\s*D(?:.*?@\s*(\d{1,3}))?")
+}
+
+def rescue_harvest(raw_text: str) -> dict:
+    out = {}
+    def setv(k, v):
+        if v and k not in out:
+            out[k] = v.strip()
+
+    for k in ("axial_length", "acd", "lt", "wtw"):
+        m = RESCUE[k].search(raw_text)
+        if m:
+            setv(k, f"{m.group(1)} mm")
+
+    m = RESCUE["cct"].search(raw_text)
+    if m:
+        num = m.group(1) or m.group(2)
+        if num: setv("cct", f"{num} µm")
+
+    for k in ("k1", "k2", "ak"):
+        m = RESCUE[k].search(raw_text)
+        if m:
+            diop = m.group(1)
+            axis = m.group(2)
+            val = f"{diop} D"
+            if axis: val += f" @ {axis}°"
+            setv(k, val)
+
+    return out
+
+# Reconcile
+def reconcile(base: dict, binder: dict | None, rescue: dict | None) -> dict:
+    res = dict(base)
+    if binder:
+        for k, v in binder.items():
+            if k in res and (not res[k]) and v:
+                res[k] = v
+    if rescue:
+        for k, v in rescue.items():
+            if k in res and (not res[k]) and v:
+                res[k] = v
+    return res
+
+# Detect device
 def detect_source_label(text: str) -> str:
     if re.search(r"IOL\s*Master\s*700", text, re.IGNORECASE): return "IOL Master 700"
     if re.search(r"OCULUS\s+PENTACAM", text, re.IGNORECASE):   return "Pentacam"
     first = next((ln.strip() for ln in text.splitlines() if ln.strip()), "Unknown")
     return first[:60]
 
-# =========================
 # Output ordering
-# =========================
 FIELD_ORDER = ["source", "axial_length", "acd", "k1", "k2", "ak", "wtw", "cct", "lt"]
 def enforce_field_order(eye_dict: dict) -> OrderedDict:
     return OrderedDict((k, eye_dict.get(k, "")) for k in FIELD_ORDER)
 
 # =========================
-# Core controller (with debug)
+# Controller
 # =========================
 def parse_iol(norm_text: str, pdf_bytes: bytes | None, source_label: str, want_debug: bool = False):
     def fresh():
@@ -342,16 +380,42 @@ def parse_iol(norm_text: str, pdf_bytes: bytes | None, source_label: str, want_d
             print(f"layout split failed: {e}")
 
     if left_txt is not None and right_txt is not None:
-        # Normalize → bind disjoint scalars → localize
+        # Normalize → bind → localize
         left_norm  = localize_pt_to_en(bind_disjoint_scalars(normalize_for_ocr(left_txt)))
         right_norm = localize_pt_to_en(bind_disjoint_scalars(normalize_for_ocr(right_txt)))
         if want_debug:
             debug["left_preview"]  = left_norm[:600]
             debug["right_preview"] = right_norm[:600]
 
+        # Primary parse
         left_data  = parse_eye_block(left_norm)
         right_data = parse_eye_block(right_norm)
 
+        # Bound scalar dicts (from normalized text)
+        def scalars_from_bound(nrm: str) -> dict:
+            d = {}
+            for lab, key, unit in [("AL", "axial_length", "mm"),
+                                   ("ACD", "acd", "mm"),
+                                   ("LT", "lt", "mm"),
+                                   ("WTW", "wtw", "mm"),
+                                   ("CCT", "cct", "µm")]:
+                m = re.search(rf"(?mi)\b{lab}\s*:\s*(-?\d[\d.,]*)\s*(?:mm|[µμ]m|um)\b", nrm)
+                if m:
+                    d[key] = f"{m.group(1)} {('µm' if lab=='CCT' else 'mm')}"
+            return d
+
+        left_bound  = scalars_from_bound(left_norm)
+        right_bound = scalars_from_bound(right_norm)
+
+        # Rescue (tolerant)
+        left_rescue  = rescue_harvest(left_norm)
+        right_rescue = rescue_harvest(right_norm)
+
+        # Reconcile
+        left_final  = reconcile(left_data,  left_bound,  left_rescue)
+        right_final = reconcile(right_data, right_bound, right_rescue)
+
+        # Map OD/OS by clues
         def looks_od(s: str) -> bool:
             u = s.upper(); return bool(re.search(r"\bOD\b|\bO\s*D\b|RIGHT\b", u))
         def looks_os(s: str) -> bool:
@@ -361,34 +425,42 @@ def parse_iol(norm_text: str, pdf_bytes: bytes | None, source_label: str, want_d
         right_is_od, right_is_os = looks_od(right_txt), looks_os(right_txt)
 
         if left_is_od and right_is_os:
-            mapping = {"OD": left_data, "OS": right_data}; debug["mapping"] = "OD<-left, OS<-right (labels)"
+            mapping = {"OD": left_final, "OS": right_final};  debug["mapping"] = "OD<-left, OS<-right (labels)"
         elif left_is_os and right_is_od:
-            mapping = {"OD": right_data, "OS": left_data}; debug["mapping"] = "OD<-right, OS<-left (labels)"
+            mapping = {"OD": right_final, "OS": left_final};  debug["mapping"] = "OD<-right, OS<-left (labels)"
         else:
-            mapping = {"OD": left_data, "OS": right_data};  debug["mapping"] = "OD<-left, OS<-right (default)"
+            mapping = {"OD": left_final, "OS": right_final};  debug["mapping"] = "OD<-left, OS<-right (default)"
 
-        # Only one side has data → assign to OD
-        if not has_measurements(mapping["OD"]) and has_measurements(mapping["OS"]):
-            mapping = {"OD": mapping["OS"], "OS": {"axial_length":"", "acd":"", "k1":"", "k2":"", "ak":"", "wtw":"", "cct":"", "lt":""}}
-            debug["mapping"] += " | fallback: only one side had data → assigned to OD"
-
+        # Copy into result
         for eye in ("OD","OS"):
             for k,v in mapping[eye].items():
                 if v: result[eye][k] = v
 
-        # Enforce output order
+        # Last-chance global rescue if any eye is still empty
+        if not has_measurements(mapping["OD"]):
+            od_rescue = rescue_harvest(left_norm + "\n" + right_norm)
+            for k, v in od_rescue.items():
+                if not result["OD"].get(k):
+                    result["OD"][k] = v
+
+        if not has_measurements(mapping["OS"]):
+            os_rescue = rescue_harvest(right_norm + "\n" + left_norm)
+            for k, v in os_rescue.items():
+                if not result["OS"].get(k):
+                    result["OS"][k] = v
+
+        # Enforce order
         result["OD"] = enforce_field_order(result["OD"])
         result["OS"] = enforce_field_order(result["OS"])
 
         return (result, debug) if want_debug else result
 
-    # OCR image or no layout info → single block → OD
+    # No layout info → treat as single block → OD
     single = localize_pt_to_en(bind_disjoint_scalars(normalize_for_ocr(norm_text)))
     parsed = parse_eye_block(single)
     for k,v in parsed.items():
         if v: result["OD"][k] = v
 
-    # Enforce output order
     result["OD"] = enforce_field_order(result["OD"])
     result["OS"] = enforce_field_order(result["OS"])
 
@@ -402,7 +474,7 @@ def parse_iol(norm_text: str, pdf_bytes: bytes | None, source_label: str, want_d
 def health():
     return jsonify({
         "status": "running",
-        "version": "LakeCalc.ai parser v3.4 (layout split + binder for AL/ACD/LT/WTW/CCT + PT→EN + µ/μ + ΔK/AK/K + ordered)",
+        "version": "LakeCalc.ai parser v3.5 (safe PDF + layout split + binder + rescue + reconcile + ordered)",
         "ocr_enabled": bool(vision_client)
     })
 
@@ -454,7 +526,7 @@ def parse_file():
 
     except Exception as e:
         print(f"Error in /api/parse-file: {e}")
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
 
 @app.route("/")
 def root():
