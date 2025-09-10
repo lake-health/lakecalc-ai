@@ -483,25 +483,27 @@ def plausibility_rescore(eye_text: str, data: dict) -> dict:
     """
     For each scalar (AL/ACD/LT/WTW/CCT), if empty or implausible,
     search ±220 chars around its label for the best plausible candidate.
+    If CCT label is missing, fall back to scanning for a plausible 3-digit µm
+    near any scalar label (AL/ACD/LT/WTW) and pick the nearest.
     """
     out = dict(data)
+
+    def current_ok(key: str, unit: str) -> bool:
+        cur = (out.get(key) or "").strip()
+        if not cur:
+            return False
+        valn = _num(cur)
+        if valn is None:
+            return False
+        if unit == "um":
+            return PLAUSIBLE["cct_um"](valn)
+        return PLAUSIBLE[{"axial_length":"axial_length","acd":"acd","lt":"lt","wtw":"wtw"}[key]](valn)
+
+    # --- main pass: label-anchored window search ---
     for lab, key, unit in [("AL","axial_length","mm"), ("ACD","acd","mm"),
                            ("LT","lt","mm"), ("WTW","wtw","mm"), ("CCT","cct","um")]:
-        cur = out.get(key, "") or ""
-        # Check current plausibility
-        cur_ok = True
-        if cur:
-            valn = _num(cur)
-            if valn is None:
-                cur_ok = False
-            else:
-                if unit == "um":
-                    cur_ok = PLAUSIBLE["cct_um"](valn)
-                else:
-                    cur_ok = PLAUSIBLE[{"AL":"axial_length","ACD":"acd","LT":"lt","WTW":"wtw"}[lab]](valn)
-
-        if cur and cur_ok:
-            continue  # keep good value
+        if current_ok(key, unit):
+            continue
 
         best = (None, -9e9)  # (string, score)
         for m in re.finditer(rf"(?mi)\b{lab}\s*:", eye_text):
@@ -509,27 +511,48 @@ def plausibility_rescore(eye_text: str, data: dict) -> dict:
             win_beg, win_end = max(0, anchor-220), min(len(eye_text), anchor+220)
             win = eye_text[win_beg:win_end]
 
-            # candidates in window: number+unit or unit then number
+            # candidates: number+unit
             for cand in re.finditer(r"(-?\d[\d.,]*)\s*(mm|[µμ]m|um|D)\b", win, flags=re.IGNORECASE):
                 s = f"{cand.group(1)} {cand.group(2)}"
                 sc = _score_candidate(lab, s, win, "um" if unit=="um" else ("mm" if unit=="mm" else "D"))
                 if sc > best[1]: best = (s, sc)
 
+            # candidates: unit then number on next line
             for cand in re.finditer(r"(mm|[µμ]m|um|D)\s*\n\s*(-?\d[\d.,]*)\b", win, flags=re.IGNORECASE):
                 s = f"{cand.group(2)} {cand.group(1)}"
                 sc = _score_candidate(lab, s, win, "um" if unit=="um" else ("mm" if unit=="mm" else "D"))
                 if sc > best[1]: best = (s, sc)
 
         if best[0]:
-            # Normalize unit for CCT spelling
-            if unit == "um":
-                s = re.sub(r"(?i)um\b", "µm", best[0])
-                out[key] = s
-            else:
-                out[key] = best[0]
+            out[key] = re.sub(r"(?i)\bum\b", "µm", best[0]) if unit == "um" else best[0]
+
+    # --- CCT fallback: if still empty or implausible, borrow nearest plausible µm ---
+    if not current_ok("cct", "um"):
+        # Get anchor positions from any scalar label present
+        anchors = []
+        for lab in ("AL", "ACD", "LT", "WTW"):
+            for m in re.finditer(rf"(?mi)\b{lab}\s*:", eye_text):
+                anchors.append(m.end())
+        if not anchors:
+            anchors = [len(eye_text)//2]  # neutral anchor if none found
+
+        # Collect all plausible µm numbers in the eye text
+        candidates = []
+        for m in re.finditer(r"(-?\d[\d.,]{2,})\s*(?:[µμ]m|um)\b", eye_text):
+            val = m.group(1)
+            v = _num(val)
+            if v is None or not PLAUSIBLE["cct_um"](v):
+                continue
+            pos = m.start()
+            # distance to nearest anchor
+            dist = min(abs(pos - a) for a in anchors)
+            candidates.append((dist, f"{val} µm"))
+
+        if candidates:
+            candidates.sort(key=lambda x: x[0])  # nearest wins
+            out["cct"] = candidates[0][1]
 
     return out
-
 
 # =========================
 # Detect device & ordering
