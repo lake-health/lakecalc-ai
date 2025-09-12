@@ -1,378 +1,368 @@
+# app.py
+# LakeCalc.ai — IOL Parser
+# Version: 5.1.1 (Universal Parser + LLM fallback, with env diagnostics)
+
 import io
 import os
-import json
 import re
-from collections import OrderedDict
+import json
+import logging
+from dataclasses import dataclass, asdict
+from typing import Dict, Tuple, Optional
 
-from flask import Flask, jsonify, request, render_template, send_file
+from flask import Flask, request, jsonify, render_template, send_from_directory, Response
 
-# -------- Optional LLM fallback (OpenAI) --------
-ENABLE_LLM = os.environ.get("ENABLE_LLM", "0").strip() in {"1", "true", "yes", "on"}
-LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini").strip()
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
-openai_client = None
-if ENABLE_LLM and OPENAI_API_KEY:
-    try:
-        from openai import OpenAI
-        openai_client = OpenAI(api_key=OPENAI_API_KEY)
-    except Exception as e:
-        # If OpenAI isn't available, just run without LLM
-        openai_client = None
-        ENABLE_LLM = False
-
-# -------- PDF text extraction --------
+# --- PDF/text helpers (pure-Python; no system deps) ---
 import pdfplumber
 
-APP_VERSION = "5.1 (Universal Parser + LLM fallback)"
+# --- Optional: OpenAI (loaded lazily; app works without it) ---
+_OPENAI_IMPORTED = False
+try:
+    # New-style OpenAI client
+    from openai import OpenAI
+    _OPENAI_IMPORTED = True
+except Exception:
+    _OPENAI_IMPORTED = False
 
 
-app = Flask(__name__, static_folder='static', template_folder='templates')
+APP_VERSION = "5.1.1 (Universal Parser + LLM fallback + env diagnostics)"
+
+app = Flask(__name__, template_folder="templates", static_folder="static")
+
+# ------------------------------------------------------------------------------
+# Logging & ENV diagnostics
+# ------------------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("lakecalc")
+
+MASK = "*******"
 
 
-def normalize(text: str) -> str:
-    """Normalize weird glyphs/diacritics that commonly show up in these exports."""
-    if not text:
+def _mask(s: Optional[str]) -> str:
+    if not s:
         return ""
-    # Greek mu variants, degree symbols, odd hyphens, commas vs dots
-    rep = {
-        "µ": "µ", "μ": "µ", "u": "µ",  # we prefer the micro sign "µ"
-        "º": "°", "˚": "°", "o": "°",
-        "–": "-", "—": "-",
+    if len(s) <= 8:
+        return MASK
+    return s[:2] + "****" + s[-2:]
+
+
+def _bool_from_env(name: str, default: bool = False) -> bool:
+    v = os.getenv(name, "")
+    if not v:
+        return default
+    return v.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_snapshot() -> Dict:
+    return {
+        "ENABLE_LLM": os.getenv("ENABLE_LLM", ""),
+        "LLM_MODEL": os.getenv("LLM_MODEL", ""),
+        "OPENAI_API_KEY_present": bool(os.getenv("OPENAI_API_KEY")),
+        "GOOGLE_APPLICATION_CREDENTIALS_present": bool(os.getenv("GOOGLE_APPLICATION_CREDENTIALS")),
+        "GOOGLE_CLOUD_CREDENTIALS_JSON_present": bool(os.getenv("GOOGLE_CLOUD_CREDENTIALS_JSON")),
+        "PYTHONANYWHERE": os.getenv("PYTHONANYWHERE", ""),  # just to show a random extra
+        "PATH_sample": os.getenv("PATH", "")[:64] + "…",
     }
-    for k, v in rep.items():
-        text = text.replace(k, v)
-    # Collapse multiple spaces/newlines
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text
 
 
-def extract_pdf_halves(pdf_bytes: bytes):
-    """
-    Return (full_text, left_text, right_text, debug)
-    We split each page at the mid x between margins, collect words by x center.
-    """
-    full_text_parts = []
-    left_parts = []
-    right_parts = []
-    debug = {"strategy": "pdf_layout_split + coord_harvest"}
+def _log_env_on_startup():
+    snap = _env_snapshot()
+    pretty = json.dumps(snap, indent=2)
+    log.info("Environment snapshot (keys, masked where appropriate):\n%s", pretty)
 
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        x_mids = []
+
+_log_env_on_startup()
+
+ENABLE_LLM = _bool_from_env("ENABLE_LLM", False)
+LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
+OPENAI_API_KEY_PRESENT = bool(os.getenv("OPENAI_API_KEY"))
+
+if ENABLE_LLM:
+    if not OPENAI_API_KEY_PRESENT:
+        log.warning("ENABLE_LLM=1 but OPENAI_API_KEY is missing — LLM will be disabled at runtime.")
+    elif not _OPENAI_IMPORTED:
+        log.warning("OpenAI client not importable — install `openai` package. LLM will be disabled.")
+    else:
+        log.info("LLM integration enabled with model=%s", LLM_MODEL)
+else:
+    log.info("LLM integration disabled (set ENABLE_LLM=1 to enable).")
+
+
+# ------------------------------------------------------------------------------
+# Simple domain model
+# ------------------------------------------------------------------------------
+EYE_FIELDS_ORDER = [
+    "source",
+    "axial_length",
+    "acd",
+    "cct",
+    "lt",
+    "k1",
+    "k2",
+    "ak",
+    "wtw",
+]
+
+
+@dataclass
+class EyeData:
+    source: str = "IOL Master 700"
+    axial_length: str = ""
+    acd: str = ""
+    cct: str = ""
+    lt: str = ""
+    k1: str = ""
+    k2: str = ""
+    ak: str = ""
+    wtw: str = ""
+
+
+def _clean_text(s: str) -> str:
+    # normalize frequent OCR substitutions (µ/° issues etc.)
+    # NOTE: keep gentle to avoid breaking real numbers
+    s = s.replace("µ", "u")            # keep units readable but distinct
+    s = s.replace("°", "°")            # leave as-is; pdfminer usually preserves "°"
+    s = re.sub(r"[ \t]+", " ", s)
+    return s
+
+
+def extract_pdf_text(file_bytes: bytes) -> str:
+    """Extract text from PDF using pdfplumber (layout-preserving-ish)."""
+    out = []
+    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
         for page in pdf.pages:
-            # page.extract_words returns words with x0, x1 — we use the center
-            words = page.extract_words(use_text_flow=True, keep_blank_chars=False)
-            mid = page.width / 2.0
-            x_mids.append(mid)
-
-            left_words = []
-            right_words = []
-
-            for w in words:
-                x_center = (w["x0"] + w["x1"]) / 2.0
-                if x_center <= mid:
-                    left_words.append(w["text"])
-                else:
-                    right_words.append(w["text"])
-
-            # Build line-ish strings (simple join is usually sufficient on these exports)
-            left_parts.append(" ".join(left_words))
-            right_parts.append(" ".join(right_words))
-
-            # Full text (page-wise text)
-            full_text_parts.append(page.extract_text() or "")
-
-        debug["x_mid"] = sum(x_mids) / max(1, len(x_mids))
-
-    full_text = normalize("\n\n".join(full_text_parts))
-    left_text = normalize("\n\n".join(left_parts))
-    right_text = normalize("\n\n".join(right_parts))
-
-    debug["left_len"] = len(left_text)
-    debug["right_len"] = len(right_text)
-    debug["left_preview"] = left_text[:900]
-    debug["right_preview"] = right_text[:900]
-    return full_text, left_text, right_text, debug
+            # text() already follows reading order; extract_words for coord harvesting if needed
+            out.append(page.extract_text() or "")
+    return "\n".join(out)
 
 
-# ---------------- Parsing ----------------
-
-MM = r"-?\d{1,2}(?:[\.,]\d{1,2})?\s*mm"
-UM = r"\d{2,4}\s*(?:µm|um)"
-DIOP = r"-?\d{1,2}(?:[\.,]\d{1,2})?\s*D"
-AXIS_INLINE = r"@\s*(\d{1,3})\s*°"
-AXIS_NEXTLINE = r"(?:^|\n)\s*(\d{1,3})\s*°"
-
-def _first(pattern, text, flags=0):
-    m = re.search(pattern, text, flags)
-    return m.group(0) if m else ""
-
-def _first_group(pattern, text, flags=0):
-    m = re.search(pattern, text, flags)
-    return m.group(1) if m else ""
-
-def _axis_after(pos, text):
-    """Find axis number either inline '@ 100°' or on the next few tokens/line breaks."""
-    tail = text[pos: pos + 80]
-    m = re.search(AXIS_INLINE, tail)
-    if m:
-        return m.group(1)
-    m = re.search(AXIS_NEXTLINE, tail)
-    if m:
-        return m.group(1)
-    return ""
-
-
-def parse_eye_block(text: str):
+def split_left_right(text: str) -> Tuple[str, str]:
     """
-    Parse a single eye block (left column or right column).
-    Return an OrderedDict with fields in the order requested.
+    Naive left/right split: if the page is two columns, the left block tends to contain OD lines.
+    If not, we still return (text, text) so both parsers can try.
     """
-    out = OrderedDict()
-    out["source"] = "IOL Master 700"  # default/assumed
-    out["axial_length"] = ""
-    out["acd"] = ""
-    out["k1"] = ""
-    out["k2"] = ""
-    out["ak"] = ""
-    out["wtw"] = ""
-    out["cct"] = ""
-    out["lt"] = ""
+    # Cheap heuristic: if explicit OS labels exist later, prefer classic mapping
+    # Otherwise return full text for both so we don't miss anything.
+    if "OS" in text or "esquerda" in text.lower():
+        return text, text
+    return text, text
 
-    t = text
 
-    # Straight pulls
-    out["axial_length"] = _first(rf"AL\s*:\s*({MM})", t, re.I) or _first(rf"\b({MM})\b(?=.*\bAL\b)", t, re.I)
-    out["acd"]          = _first(rf"ACD\s*:\s*({MM})", t, re.I) or _first(rf"\b({MM})\b(?=.*\bACD\b)", t, re.I)
-    out["lt"]           = _first(rf"LT\s*:\s*({MM})", t, re.I)  or _first(rf"\b({MM})\b(?=.*\bLT\b)", t, re.I)
-    out["wtw"]          = _first(rf"WTW\s*:\s*({MM})", t, re.I)
-
-    # CCT (µm) – accept either Greek µ or 'um'
-    out["cct"]          = _first(rf"CCT\s*:\s*({UM})", t, re.I)
-    if not out["cct"]:
-        # Sometimes "CCT:" is near, value is on next token
-        m = re.search(r"CCT\s*:\s*", t, re.I)
+def find_value(patterns, hay) -> Optional[str]:
+    for pat in patterns:
+        m = re.search(pat, hay, flags=re.IGNORECASE | re.MULTILINE)
         if m:
-            after = t[m.end(): m.end() + 40]
-            m2 = re.search(rf"\b{UM}\b", after, re.I)
-            if m2:
-                out["cct"] = m2.group(0)
-
-    # K1 / K2 / AK including axis possibly in the next line(s)
-    for label, key in (("K1", "k1"), ("K2", "k2")):
-        m = re.search(rf"{label}\s*:\s*({DIOP})", t, re.I)
-        if m:
-            base = m.group(1)
-            axis = _axis_after(m.end(1), t)
-            out[key] = f"{base} @{axis}°" if axis else base
-
-    # ΔK or AK (cylinder)
-    m = re.search(rf"(?:ΔK|AK)\s*:\s*({DIOP})", t, re.I)
-    if m:
-        base = m.group(1)
-        axis = _axis_after(m.end(1), t)
-        out["ak"] = f"{base} @{axis}°" if axis else base
-
-    # SD row just after K lines (optionally append)
-    # We attach SD only if present immediately after the diopter lines
-    def attach_sd(label, key):
-        if out[key]:
-            # Look around the label region
-            mm = re.search(rf"{label}\s*:\s*{DIOP}.*?(?:SD\s*:\s*([0-9][\.,]?\d*)\s*D)", t, re.I | re.S)
-            if mm:
-                sd = mm.group(1).replace(",", ".")
-                out[key] = f"{out[key]} (SD {sd} D)"
-
-    attach_sd("K1", "k1")
-    attach_sd("K2", "k2")
-    attach_sd("(?:ΔK|AK)", "ak")
-
-    # Tidy formats (prefer comma for decimals as in sample)
-    def fix_commas(val):
-        if not val:
-            return val
-        val = re.sub(r"(\d)\.(\d)", r"\1,\2", val)
-        return re.sub(r"\s+", " ", val).strip()
-
-    for k in list(out.keys()):
-        out[k] = fix_commas(out[k])
-
-    return out
+            g = next((g for g in m.groups() if g), None)
+            return g.strip() if g else m.group(0).strip()
+    return None
 
 
-def merge_with_llm(eye_text: str, current: OrderedDict, llm_stats: dict):
-    """If any field is missing, ask the LLM to fill ONLY the missing ones from eye_text."""
-    if not (ENABLE_LLM and openai_client):
-        return current
+def parse_eye_block(block: str, prefer_units: bool = True) -> EyeData:
+    t = _clean_text(block)
 
-    missing = [k for k, v in current.items() if k != "source" and not v]
-    if not missing:
-        return current
+    # Patterns
+    num_mm = r"([\d]+[.,]\d+)\s*mm"
+    num_um = r"([\d]+[.,]\d+)\s*(?:um|µm|u m)"
+    diopter = r"([\d]+[.,]\d+)\s*D"
+    axis = r"@?\s*([0-9]{1,3})\s*°"
+    k_pair = r"([\d]+[.,]\d+)\s*D(?:\s*@\s*([0-9]{1,3})\s*°)?"
 
-    system = (
-        "You extract ophthalmology measurements from a raw IOLMaster-like report. "
-        "Return a strict JSON object with ONLY the keys you can confidently fill among: "
-        "['axial_length','acd','k1','k2','ak','wtw','cct','lt'].\n"
-        "- Values should include units exactly as shown in the text (mm, µm, D) and axis with ' @ ###°' if present.\n"
-        "- Do not guess; if a field isn't present, omit it from the JSON."
-    )
-    user = f"TEXT (one eye column):\n```\n{eye_text}\n```\nExtract the fields."
+    eye = EyeData()
+
+    # Source (device) — keep default but allow override if visible
+    src = find_value([r"(IOL ?Master ?700)"], t)
+    if src:
+        eye.source = src
+
+    # AL, ACD, CCT, LT
+    eye.axial_length = find_value([rf"(?:AL|Axial(?: Length)?)[^\S\r\n]*[: ]\s*{num_mm}",
+                                   rf"{num_mm}\s*(?:AL|Axial Length)"], t) or ""
+
+    eye.acd = find_value([rf"(?:ACD)[^\S\r\n]*[: ]\s*{num_mm}",
+                          rf"{num_mm}\s*ACD"], t) or ""
+
+    # cct: prefer µm but accept mm if present
+    cct_um = find_value([rf"(?:CCT)[^\S\r\n]*[: ]\s*{num_um}",
+                         rf"{num_um}\s*CCT"], t)
+    cct_mm = find_value([rf"(?:CCT)[^\S\r\n]*[: ]\s*{num_mm}",
+                         rf"{num_mm}\s*CCT"], t)
+    eye.cct = cct_um or cct_mm or ""
+
+    eye.lt = find_value([rf"(?:LT)[^\S\r\n]*[: ]\s*{num_mm}",
+                         rf"{num_mm}\s*LT"], t) or ""
+
+    # Keratometry (K1/K2) and cylinder (AK)
+    k1 = re.search(rf"(?:K1)[^\S\r\n]*[: ]\s*{k_pair}", t, flags=re.IGNORECASE)
+    if k1:
+        d = k1.group(1)
+        ax = k1.group(2)
+        eye.k1 = f"{d} D" + (f" @ {ax}°" if ax else "")
+
+    k2 = re.search(rf"(?:K2)[^\S\r\n]*[: ]\s*{k_pair}", t, flags=re.IGNORECASE)
+    if k2:
+        d = k2.group(1)
+        ax = k2.group(2)
+        eye.k2 = f"{d} D" + (f" @ {ax}°" if ax else "")
+
+    # SE / AK (cylinder)
+    ak = re.search(rf"(?:SE|AK|\(cid:706\)K)[^\S\r\n]*[: ]\s*(-?{diopter})(?:\s*@\s*{axis})?", t,
+                   flags=re.IGNORECASE)
+    if ak:
+        # ak.group(1) contains value with unit D due to nested capture: "-2,79 D"
+        val = ak.group(1).replace(" ", "")
+        ax = ak.group(2)
+        eye.ak = f"{val}" + (f" @ {ax}°" if ax else "")
+
+    # WTW
+    eye.wtw = find_value([rf"(?:WTW|Branco a branco)[^\S\r\n]*[: ]\s*{num_mm}",
+                          rf"{num_mm}\s*(?:WTW|Branco a branco)"], t) or ""
+
+    return eye
+
+
+def needs_llm(od: EyeData, os_: EyeData) -> bool:
+    # If any critical field is missing (especially CCT), we can escalate to LLM (if allowed)
+    def incomplete(e: EyeData) -> bool:
+        return not (e.axial_length and e.acd and e.lt and e.k1 and e.k2 and e.ak and e.wtw and e.cct)
+
+    return incomplete(od) or incomplete(os_)
+
+
+def llm_structurize(raw_text: str) -> Optional[Dict]:
+    """Ask the LLM to structure the text. Returns dict or None."""
+    if not (ENABLE_LLM and OPENAI_API_KEY_PRESENT and _OPENAI_IMPORTED):
+        return None
 
     try:
-        resp = openai_client.chat.completions.create(
-            model=LLM_MODEL,
-            temperature=0,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            response_format={"type": "json_object"},
+        client = OpenAI()
+        system = (
+            "You are a medical report parser. Extract a JSON with two objects 'OD' and 'OS'. "
+            "Each must include, in this order: source (device), axial_length (mm), acd (mm), "
+            "cct (µm or mm), lt (mm), k1 (with diopters and axis), k2 (with diopters and axis), "
+            "ak (cylinder with diopters and axis), wtw. Keep original units and decimals. "
+            "Do not invent values."
         )
-        content = resp.choices[0].message.content
-        data = json.loads(content)
-
-        # Merge only the missing keys
-        for k in missing:
-            if k in data and data[k]:
-                current[k] = data[k]
-
-        # minimal accounting info (optional)
-        llm_stats["llm_calls"] = llm_stats.get("llm_calls", 0) + 1
-    except Exception:
-        # If anything goes wrong, we just keep the original
-        pass
-
-    return current
-
-
-def structure_output(left_text: str, right_text: str, debug: dict, include_llm=True):
-    # Heuristic mapping: left column is OD, right column is OS (matches your sample)
-    debug["mapping"] = "OD<-left, OS<-right (default)"
-
-    result = OrderedDict()
-    result["OD"] = parse_eye_block(left_text)
-    result["OS"] = parse_eye_block(right_text)
-
-    # LLM fallback for missing fields
-    llm_stats = {}
-    if include_llm:
-        result["OD"] = merge_with_llm(left_text, result["OD"], llm_stats)
-        result["OS"] = merge_with_llm(right_text, result["OS"], llm_stats)
-    if llm_stats:
-        debug.update(llm_stats)
-
-    return result
+        user = f"Text:\n{raw_text[:45000]}\n\nReturn ONLY the JSON."
+        resp = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[{"role": "system", "content": system},
+                      {"role": "user", "content": user}],
+            temperature=0
+        )
+        content = resp.choices[0].message.content.strip()
+        # Try to locate JSON
+        j = re.search(r"\{.*\}", content, flags=re.S)
+        if not j:
+            return None
+        data = json.loads(j.group(0))
+        return data
+    except Exception as e:
+        log.warning("LLM structurize failed: %s", e)
+        return None
 
 
-# ---------------- Routes ----------------
-
+# ------------------------------------------------------------------------------
+# Flask routes
+# ------------------------------------------------------------------------------
 @app.route("/")
 def index():
-    # Simple UI shipped inline so you can keep working without extra files
-    return """
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>LakeCalc.ai — IOL Parser</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Inter, Arial; padding: 28px; max-width: 1100px; margin: 0 auto; }
-    .box { border: 2px dashed #bbb; padding: 16px; border-radius: 10px; margin: 10px 0 20px; color: #666; }
-    pre { background:#0b0b0b; color:#f1f1f1; padding:18px; border-radius:10px; overflow:auto; }
-    button { padding:10px 16px; border-radius:8px; border:0; background:#1c64f2; color:white; font-weight:600; }
-    label { margin-right:14px; }
-    .row { margin: 10px 0 18px; }
-  </style>
-</head>
-<body>
-  <h1>LakeCalc.ai — IOL Parser</h1>
-
-  <div class="row">
-    <input id="file" type="file" accept=".pdf,.png,.jpg,.jpeg"/>
-    <button id="go">Upload & Parse</button>
-  </div>
-
-  <div class="row">
-    <label><input type="checkbox" id="include_raw"> Include raw text preview</label>
-    <label><input type="checkbox" id="debug"> Debug</label>
-  </div>
-
-  <div class="box">Drag & drop a PDF/image here</div>
-
-  <div class="row">Health: <a href="/api/health" target="_blank">/api/health</a></div>
-  <h3>Response</h3>
-  <pre id="out">{}</pre>
-
-<script>
-const box = document.querySelector('.box');
-box.addEventListener('dragover', e => { e.preventDefault(); box.style.borderColor='#1c64f2'; });
-box.addEventListener('dragleave', e => { e.preventDefault(); box.style.borderColor='#bbb'; });
-box.addEventListener('drop', async e => {
-  e.preventDefault(); box.style.borderColor='#bbb';
-  const f = e.dataTransfer.files[0]; if (!f) return;
-  await send(f);
-});
-document.getElementById('go').onclick = async () => {
-  const f = document.getElementById('file').files[0]; if (!f) return;
-  await send(f);
-}
-async function send(file) {
-  const form = new FormData();
-  form.append('file', file);
-  form.append('include_raw', document.getElementById('include_raw').checked ? '1' : '0');
-  form.append('debug', document.getElementById('debug').checked ? '1' : '0');
-  const res = await fetch('/api/parse-file', { method:'POST', body:form });
-  const data = await res.json();
-  document.getElementById('out').textContent = JSON.stringify(data, null, 2);
-}
-</script>
-</body>
-</html>
-    """
+    # Simple HTML served from templates/index.html if you have it; otherwise a tiny page
+    try:
+        return render_template("index.html")
+    except Exception:
+        return Response(
+            """<!doctype html><meta charset="utf-8">
+            <title>LakeCalc.ai — IOL Parser</title>
+            <h1>LakeCalc.ai — IOL Parser</h1>
+            <p>Health: <a href="/api/health">/api/health</a></p>
+            """,
+            mimetype="text/html",
+        )
 
 
 @app.route("/api/health")
 def health():
+    # Return what the app actually sees right now, not expectations
+    snap = _env_snapshot()
     return jsonify({
+        "llm_enabled": bool(ENABLE_LLM and OPENAI_API_KEY_PRESENT and _OPENAI_IMPORTED),
+        "llm_model": LLM_MODEL if ENABLE_LLM else None,
         "status": "running",
         "version": APP_VERSION,
-        "llm_enabled": ENABLE_LLM and bool(openai_client),
-        "llm_model": LLM_MODEL if (ENABLE_LLM and openai_client) else None
+        "env": snap,  # helpful while we’re debugging Railway
     })
 
 
-@app.route("/api/parse-file", methods=["POST"])
-def parse_file():
+@app.route("/api/parse", methods=["POST"])
+def parse_endpoint():
+    include_raw = request.args.get("include_raw") == "1"
+    force_pdf_text = request.args.get("force_pdf_text") == "1"  # kept for UI compatibility
+    debug = request.args.get("debug") == "1"
+
     if "file" not in request.files:
-        return jsonify({"error": "No file part"}), 400
+        return jsonify({"error": "No file uploaded (field 'file')"}), 400
+
     f = request.files["file"]
-    if not f.filename:
-        return jsonify({"error": "No selected file"}), 400
+    data = f.read()
 
-    include_raw = request.form.get("include_raw") in {"1", "true", "yes", "on"}
-    debug_flag = request.form.get("debug") in {"1", "true", "yes", "on"}
+    # 1) Text extraction (PDF)
+    raw_text = extract_pdf_text(data)
+    left, right = split_left_right(raw_text)
 
-    try:
-        b = f.read()
-        full_text, left_text, right_text, dbg = extract_pdf_halves(b)
+    # 2) Heuristic parse
+    od = parse_eye_block(left)
+    os_ = parse_eye_block(right)
 
-        structured = structure_output(left_text, right_text, dbg, include_llm=True)
+    # 3) If incomplete and LLM is allowed, try LLM
+    llm_used = False
+    if ENABLE_LLM and OPENAI_API_KEY_PRESENT and _OPENAI_IMPORTED and needs_llm(od, os_):
+        structured = llm_structurize(raw_text)
+        if structured and "OD" in structured and "OS" in structured:
+            # Merge: fill only missing fields from LLM result
+            def merge(dst: EyeData, src: Dict):
+                for k in EYE_FIELDS_ORDER:
+                    v = getattr(dst, k)
+                    if not v and src.get(k):
+                        setattr(dst, k, src[k])
 
-        payload = OrderedDict()
-        if debug_flag:
-            payload["debug"] = dbg
-        payload["filename"] = f.filename
-        if include_raw:
-            payload["raw_text_preview"] = (full_text or "")[:1200]
-        payload["structured"] = structured
-        payload["text_source"] = "pdf_text"
+            merge(od, structured.get("OD", {}))
+            merge(os_, structured.get("OS", {}))
+            llm_used = True
 
-        return jsonify(payload)
-    except Exception as e:
-        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+    result = {
+        "OD": {k: getattr(od, k) for k in EYE_FIELDS_ORDER},
+        "OS": {k: getattr(os_, k) for k in EYE_FIELDS_ORDER},
+    }
+
+    # Optional debug payload so we can see exactly what the app saw
+    dbg = None
+    if debug:
+        dbg = {
+            "strategy": "pdf_layout_split + heuristics" + (" + LLM" if llm_used else ""),
+            "xtra": {
+                "notes": "See /api/health for env. LLM used only when ENABLE_LLM=1, key present, and fields were missing."
+            }
+        }
+
+    payload = {
+        "filename": f.filename,
+        "structured": result,
+        "text_source": "pdf_text",
+    }
+    if include_raw:
+        payload["raw_text_preview"] = raw_text[:2000]
+    if dbg:
+        payload["debug"] = dbg
+
+    return jsonify(payload)
+
+
+# Static passthrough (if needed)
+@app.route("/static/<path:fn>")
+def static_files(fn):
+    return send_from_directory(app.static_folder or "static", fn)
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port)
+    # Local debug
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)
