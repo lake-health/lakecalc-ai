@@ -1,30 +1,21 @@
-# Base image with Python 3.11 (stable and supported by pdfminer, Flask, etc.)
+# Small, reliable image
 FROM python:3.11-slim
 
-# Install system deps required for pdf2image (uses poppler-utils)
-RUN apt-get update && apt-get install -y \
-    poppler-utils \
-    tesseract-ocr \
-    libglib2.0-0 \
-    libsm6 \
-    libxrender1 \
-    libxext6 \
-    && rm -rf /var/lib/apt/lists/*
-
-# Create workdir
 WORKDIR /app
 
-# Copy requirements first (layer caching)
-COPY requirements.txt .
+# System deps for Pillow (pdfplumber) are minimal; add locales/ghostscript if later needed
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
 # Install Python deps
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy app code
-COPY . .
+# App
+COPY app.py .
 
-# Expose port (Railway uses PORT env var)
-EXPOSE 8080
+# Railway sets $PORT; default 5000
+EXPOSE 5000
 
-# Run with gunicorn for production
-CMD ["gunicorn", "-b", "0.0.0.0:8080", "app:app"]
+CMD sh -c 'PORT=${PORT:-5000}; gunicorn app:app -b 0.0.0.0:$PORT --timeout 120'
