@@ -3,7 +3,7 @@
 # Deterministic pipeline: safe PDF text → normalize → strict binder (+CCT special)
 # → CCT sanity → layout split → coordinate harvest → tolerant rescue → reconcile
 # → plausibility re-score → OD/OS mapping → (optional) LLM enrich → ordered
-
+print("DEBUG OPENAI_API_KEY:", repr(os.environ.get("OPENAI_API_KEY")))
 import os, io, re, json
 from collections import OrderedDict
 from io import BytesIO
