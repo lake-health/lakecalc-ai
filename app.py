@@ -164,6 +164,18 @@ def get_text_from_upload(fs, force_mode: Optional[str] = None) -> Tuple[str, str
 # In parse_iol(), after plausibility_rescore:
 #   if OS["cct"] is still empty, call llm_extract_cct(right_norm, "OS").
 
+# =========================
+# Detect device & ordering
+# =========================
+def detect_source_label(text: str) -> str:
+    # Recognize common devices in the raw text
+    if re.search(r"IOL\s*Master\s*700", text, re.IGNORECASE):
+        return "IOL Master 700"
+    if re.search(r"OCULUS\s*PENTACAM", text, re.IGNORECASE):
+        return "Pentacam"
+    # Fallback: first non-empty line as a label-ish source
+    first = next((ln.strip() for ln in text.splitlines() if ln.strip()), "Unknown")
+    return first[:60]
 
 # =========================
 # Routes
