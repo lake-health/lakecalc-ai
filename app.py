@@ -19,7 +19,7 @@ from google.cloud import vision
 from pdf2image import convert_from_bytes
 
 # LLM fallback
-from openai import OpenAI
+import OpenAI
 
 
 app = Flask(__name__, static_folder='static', template_folder='templates')
