@@ -3,7 +3,7 @@
 # Deterministic pipeline: safe PDF text → normalize → strict binder (+CCT special)
 # → CCT sanity → layout split → coordinate harvest → tolerant rescue → reconcile
 # → plausibility re-score → OD/OS mapping → (optional) LLM enrich → ordered
-print("DEBUG OPENAI_API_KEY:", repr(os.environ.get("OPENAI_API_KEY")))
+
 import os, io, re, json
 from collections import OrderedDict
 from io import BytesIO
@@ -819,13 +819,24 @@ def parse_iol(norm_text: str, pdf_bytes: Optional[bytes], source_label: str, wan
 # =========================
 @app.route("/api/health")
 def health():
+    openai_key = os.environ.get("OPENAI_API_KEY")
+    enable_llm = os.environ.get("ENABLE_LLM", "").lower() in ("1", "true", "yes")
+    llm_model  = os.environ.get("LLM_MODEL")
+
     return jsonify({
         "status": "running",
         "version": "LakeCalc.ai parser v3.9 (coord harvest + strict binder + sanity + rescue + plausibility + LLM optional + ordered)",
         "ocr_enabled": bool(vision_client),
-        "llm_enabled": bool(OPENAI_ENABLED)
+        "llm_enabled": bool(openai_key and enable_llm),
+        "llm_model": llm_model,
+        # DEBUG visibility — safe: only length of key, not the key itself
+        "env_debug": {
+            "OPENAI_API_KEY_present": bool(openai_key),
+            "OPENAI_API_KEY_len": len(openai_key) if openai_key else 0,
+            "ENABLE_LLM": os.environ.get("ENABLE_LLM"),
+            "LLM_MODEL": llm_model,
+        }
     })
-
 @app.route("/api/parse-file", methods=["POST"])
 def parse_file():
     if "file" not in request.files:
