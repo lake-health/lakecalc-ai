@@ -1,180 +1,145 @@
 import os
-import re
-import json
+import io
 from flask import Flask, request, jsonify
 from werkzeug.utils import secure_filename
-from pdfminer.high_level import extract_text
-import pytesseract
-from PIL import Image
-import fitz  # PyMuPDF
+
+# Optional CORS (ok to remove if you don't need it)
+try:
+    from flask_cors import CORS
+    CORS_ENABLED = True
+except Exception:
+    CORS_ENABLED = False
+
+# Optional: pdf text extraction via pdfminer.six
+try:
+    from pdfminer.high_level import extract_text
+    PDFMINER_AVAILABLE = True
+except Exception:
+    PDFMINER_AVAILABLE = False
 
 app = Flask(__name__)
+if CORS_ENABLED:
+    CORS(app)
 
-def extract_text_from_pdf(path: str) -> str:
-    try:
-        return extract_text(path)
-    except Exception:
-        return ""
+# ---- Config helpers ---------------------------------------------------------
 
-def extract_text_from_image(path: str) -> str:
-    try:
-        img = Image.open(path)
-        return pytesseract.image_to_string(img, lang="eng+por")
-    except Exception:
-        return ""
+def env_bool(name: str, default: bool = False) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return str(val).strip().lower() in {"1", "true", "yes", "on"}
 
-def split_left_right(text: str) -> tuple[str,str]:
-    mid = len(text)//2
-    return text[:mid], text[mid:]
+def env_str(name: str, default: str = "") -> str:
+    val = os.getenv(name)
+    return default if val is None else str(val).strip()
 
-def parse_eye_block(text: str) -> dict:
-    out = {}
-    def grab(pattern, key):
-        m = re.search(pattern, text, flags=re.I)
-        if m:
-            out[key] = m.group(1).strip()
-    grab(r"AL[: ]+([0-9.,]+ ?mm)", "axial_length")
-    grab(r"CCT[: ]+([0-9.,]+ ?µm)", "cct")
-    grab(r"ACD[: ]+([0-9.,]+ ?mm)", "acd")
-    grab(r"LT[: ]+([0-9.,]+ ?mm)", "lt")
-    grab(r"K1[: ]+([0-9.,]+ ?D.*)", "k1")
-    grab(r"K2[: ]+([0-9.,]+ ?D.*)", "k2")
-    grab(r"K[: ]+([-0-9.,]+ ?D.*)", "ak")
-    grab(r"WTW[: ]+([0-9.,]+ ?mm)", "wtw")
-    m = re.search(r"IOL ?Master ?700", text, flags=re.I)
-    if m:
-        out["source"] = "IOL Master 700"
-    return out
+ENABLE_LLM = env_bool("ENABLE_LLM", False)
+OPENAI_API_KEY = env_str("OPENAI_API_KEY")
+OPENAI_BASE_URL = env_str("OPENAI_BASE_URL")  # optional
+OPENAI_MODEL = env_str("OPENAI_MODEL", "gpt-4o-mini")  # default, can be anything
+ENABLE_DEBUG = env_bool("ENABLE_DEBUG", True)
 
-def base_structured(left: str, right: str) -> dict:
-    return {
-        "OD": parse_eye_block(left),
-        "OS": parse_eye_block(right)
-    }
+# ---- Health endpoint (no hand-built JSON!) ----------------------------------
 
-def _strip_code_fences(s: str) -> str:
-    s = s.strip()
-    m = re.match(r"^```(?:json)?\s*(.*?)\s*```$", s, flags=re.S)
-    return m.group(1) if m else s
-
-def _tolerant_json_loads(s: str):
-    s = _strip_code_fences(s).strip()
-    s = s.replace("“", '"').replace("”", '"').replace("’", "'")
-    s = s.replace("\xa0", " ").replace("\u200b", "")
-    if s.count("{") > s.count("}"):
-        s = s + "}"
-    if s.count("[") > s.count("]"):
-        s = s + "]"
-    s = re.sub(r",\s*([}\]])", r"\1", s)
-    return json.loads(s)
-
-def _build_llm_prompt(raw_left: str, raw_right: str) -> str:
-    return (
-        "You are extracting eye biometric values from an ophthalmology report.\n"
-        "Return a SINGLE JSON object ONLY, no commentary. Keys and order:\n"
-        '{\n'
-        '  "OD": { "source","axial_length","acd","cct","lt","k1","k2","ak","wtw" },\n'
-        '  "OS": { "source","axial_length","acd","cct","lt","k1","k2","ak","wtw" }\n'
-        '}\n"
-        "- Units: keep units appearing in text.\n"
-        "- If a value is clearly present, fill it. If absent, use an empty string.\n"
-        "- 'source' is the device name like 'IOL Master 700'.\n"
-        "- Typical ranges: cct 400–700 µm; axial length 20–30 mm.\n\n"
-        f"LEFT BLOCK (OD tentative):\n{raw_left[:8000]}\n\n"
-        f"RIGHT BLOCK (OS tentative):\n{raw_right[:8000]}\n"
-    )
-
-def call_llm_structured(raw_left: str, raw_right: str, debug: bool=False):
-    dbg = {}
-    if not os.getenv("ENABLE_LLM"):
-        return {}, dbg
-    try:
-        from openai import OpenAI
-        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        model = os.getenv("LLM_MODEL", "gpt-4o-mini")
-        prompt = _build_llm_prompt(raw_left, raw_right)
-        resp = client.chat.completions.create(
-            model=model,
-            temperature=0,
-            messages=[{"role":"user","content":prompt}]
-        )
-        text = resp.choices[0].message.content or ""
-        dbg["llm_raw"] = text[:2000]
-        data = _tolerant_json_loads(text)
-        return data, dbg
-    except Exception as e:
-        dbg["llm_error"] = repr(e)
-        return {}, dbg
-
-@app.get("/api/health")
+@app.route("/api/health", methods=["GET"])
 def api_health():
-    env_report = {
-        "ENABLE_LLM": os.getenv("ENABLE_LLM", ""),
-        "GOOGLE_APPLICATION_CREDENTIALS_present": bool(os.getenv("GOOGLE_APPLICATION_CREDENTIALS")),
-        "GOOGLE_CLOUD_CREDENTIALS_JSON_present": bool(os.getenv("GOOGLE_CLOUD_CREDENTIALS_JSON")),
-        "LLM_MODEL": os.getenv("LLM_MODEL", ""),
-        "OPENAI_API_KEY_present": bool(os.getenv("OPENAI_API_KEY")),
-        "PATH_sample": ":".join(os.getenv("PATH", "").split(":")[:3]),
-        "PYTHONANYWHERE": os.getenv("PYTHONANYWHERE", ""),
-    }
     return jsonify({
-        "env": env_report,
-        "llm_enabled": os.getenv("ENABLE_LLM", "").strip() in ("1", "true", "TRUE"),
-        "llm_model": os.getenv("LLM_MODEL"),
-        "status": "running",
-        "version": "5.1.1 (Universal Parser + LLM fallback + env diagnostics)"
+        "ok": True,
+        "service": "pdf-parser",
+        "llm": {
+            "enabled": ENABLE_LLM,
+            "model": OPENAI_MODEL if OPENAI_MODEL else None,
+            "base_url": OPENAI_BASE_URL if OPENAI_BASE_URL else None,
+            "api_key_present": bool(OPENAI_API_KEY),
+        },
+        "pdfminer_available": PDFMINER_AVAILABLE,
+        "debug": ENABLE_DEBUG,
+        "env": {
+            # Useful when debugging env propagation; redact actual secrets
+            "ENABLE_LLM": os.getenv("ENABLE_LLM"),
+            "OPENAI_MODEL": os.getenv("OPENAI_MODEL"),
+            "OPENAI_BASE_URL": os.getenv("OPENAI_BASE_URL"),
+            "OPENAI_API_KEY_set": "yes" if OPENAI_API_KEY else "no",
+        }
     })
-    
+
+# ---- Simple index -----------------------------------------------------------
+
+@app.route("/", methods=["GET"])
+def index():
+    return "PDF parser is up. POST a file to /api/parse", 200
+
+# ---- PDF parse endpoint -----------------------------------------------------
+
 @app.route("/api/parse", methods=["POST"])
-def parse():
-    debug = request.args.get("debug") == "1"
+def api_parse():
+    """
+    Accepts multipart/form-data with a 'file' field.
+    Returns a JSON payload with raw text preview and some debug info.
+    (This is intentionally simple and safe; your advanced parsing can be
+    reconnected here once the service is stable.)
+    """
     if "file" not in request.files:
-        return jsonify({"error":"No file"}),400
+        return jsonify({"ok": False, "error": "No file part"}), 400
+
     f = request.files["file"]
+    if not f or f.filename == "":
+        return jsonify({"ok": False, "error": "No selected file"}), 400
+
     filename = secure_filename(f.filename)
-    path = os.path.join("/tmp", filename)
-    f.save(path)
+    data = f.read()  # bytes
 
     text = ""
-    if filename.lower().endswith(".pdf"):
-        text = extract_text_from_pdf(path)
-        if not text:
-            doc = fitz.open(path)
-            for page in doc:
-                pix = page.get_pixmap()
-                img_path = path+".png"
-                pix.save(img_path)
-                text += extract_text_from_image(img_path)
-    else:
-        text = extract_text_from_image(path)
+    error = None
 
-    left,right = split_left_right(text)
-    struct = base_structured(left,right)
-    llm_struct,llm_dbg = call_llm_structured(left,right,debug=debug)
+    # Try pdfminer if available; otherwise just store bytes length
+    try:
+        if PDFMINER_AVAILABLE:
+            # Use in-memory bytes
+            text = extract_text(io.BytesIO(data)) or ""
+        else:
+            error = "pdfminer.six not installed; returning metadata only"
+    except Exception as e:
+        error = f"pdf extraction error: {type(e).__name__}: {e}"
 
-    def merge_eye(base,llm):
-        out = base.copy()
-        for k in ["source","axial_length","acd","cct","lt","k1","k2","ak","wtw"]:
-            if not out.get(k) and llm.get(k):
-                out[k] = llm[k]
-        return out
-
-    if llm_struct:
-        struct["OD"] = merge_eye(struct.get("OD",{}), llm_struct.get("OD",{}))
-        struct["OS"] = merge_eye(struct.get("OS",{}), llm_struct.get("OS",{}))
-
-    debug_blob = {}
-    if debug:
-        debug_blob = {
-            "left_preview": left[:400],
-            "right_preview": right[:400],
-            "llm": llm_dbg
+    # Build a conservative, stable response
+    raw_preview = (text[:1200] + "...") if text and len(text) > 1200 else text
+    resp = {
+        "ok": True,
+        "filename": filename,
+        "bytes": len(data),
+        "text_chars": len(text),
+        "raw_text_preview": raw_preview,
+        "structured": {
+            # Leave placeholders; reconnect your real parser later
+            "OD": {},
+            "OS": {}
+        },
+        "debug": {
+            "pdfminer_available": PDFMINER_AVAILABLE,
+            "note": "Minimal parser path; no LLM invoked here.",
+            "error": error
         }
+    }
+    return jsonify(resp), 200
 
-    return jsonify({
-        "structured": struct,
-        "debug": debug_blob
-    })
+# ---- (Optional) LLM endpoint stub ------------------------------------------
+# You can call this from your parser when you're ready.
+# It won't run unless ENABLE_LLM is true and an API key is present.
+
+@app.route("/api/llm-summarize", methods=["POST"])
+def api_llm_summarize():
+    if not ENABLE_LLM or not OPENAI_API_KEY:
+        return jsonify({"ok": False, "error": "LLM disabled or API key missing"}), 400
+
+    # Minimal echo — wire up your actual OpenAI call here later
+    payload = request.get_json(silent=True) or {}
+    prompt = payload.get("prompt", "")
+    # Return a stub now to avoid pulling extra dependencies in this fix:
+    return jsonify({"ok": True, "model": OPENAI_MODEL, "summary": f"(stub) {prompt[:200]}"}), 200
+
+# ---- Main -------------------------------------------------------------------
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+    # For local testing; Railway uses Gunicorn via Dockerfile/Procfile
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
