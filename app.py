@@ -106,9 +106,9 @@ def call_llm_structured(raw_left: str, raw_right: str, debug: bool=False):
         dbg["llm_error"] = repr(e)
         return {}, dbg
 
-@app.route("/api/health", methods=["GET"])
-def health():
-    env = {
+@app.get("/api/health")
+def api_health():
+    env_report = {
         "ENABLE_LLM": os.getenv("ENABLE_LLM", ""),
         "GOOGLE_APPLICATION_CREDENTIALS_present": bool(os.getenv("GOOGLE_APPLICATION_CREDENTIALS")),
         "GOOGLE_CLOUD_CREDENTIALS_JSON_present": bool(os.getenv("GOOGLE_CLOUD_CREDENTIALS_JSON")),
@@ -118,8 +118,8 @@ def health():
         "PYTHONANYWHERE": os.getenv("PYTHONANYWHERE", ""),
     }
     return jsonify({
-        "env": env,
-        "llm_enabled": os.getenv("ENABLE_LLM", "").strip() in {"1", "true", "True"},
+        "env": env_report,
+        "llm_enabled": os.getenv("ENABLE_LLM", "").strip() in ("1", "true", "TRUE"),
         "llm_model": os.getenv("LLM_MODEL"),
         "status": "running",
         "version": "5.1.1 (Universal Parser + LLM fallback + env diagnostics)"
