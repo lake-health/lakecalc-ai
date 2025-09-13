@@ -19,7 +19,7 @@ from google.cloud import vision
 from pdf2image import convert_from_bytes
 
 # LLM fallback
-import OpenAI
+import openai
 
 
 app = Flask(__name__, static_folder='static', template_folder='templates')
@@ -54,7 +54,7 @@ try:
     if os.environ.get("ENABLE_LLM") in ("1", "true", "True"):
         api_key = os.environ.get("OPENAI_API_KEY")
         if api_key:
-            llm_client = OpenAI(api_key=api_key)
+            llm_client = openai.OpenAI(api_key=api_key)
             llm_model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
             llm_enabled = True
             print(f"INFO: LLM enabled with model {llm_model}")
