@@ -43,29 +43,25 @@ try:
 except Exception as e:
     print(f"Vision init error: {e}")
 
-
 # =========================
 # OpenAI LLM (fallback)
 # =========================
-llm_client: Optional[OpenAI] = None
+llm_client = None
 llm_model = None
 llm_enabled = False
 try:
     if os.environ.get("ENABLE_LLM") in ("1", "true", "True"):
         api_key = os.environ.get("OPENAI_API_KEY")
         if api_key:
-            llm_client = openai.OpenAI(api_key=api_key)
+            openai.api_key = api_key
+            llm_client = openai
             llm_model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
             llm_enabled = True
-            print(f"INFO: LLM enabled with model {llm_model}")
+            print(f"[INFO] LLM enabled with model {llm_model}")
         else:
-            print("WARN: OPENAI_API_KEY not set, LLM disabled.")
-    else:
-        print("INFO: ENABLE_LLM not set → LLM disabled.")
+            print("WARN: OPENAI_API_KEY not set")
 except Exception as e:
     print(f"LLM init error: {e}")
-    llm_client = None
-    llm_enabled = False
 
 
 def llm_extract_cct(text: str, side: str) -> Optional[str]:
