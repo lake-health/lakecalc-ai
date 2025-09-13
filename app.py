@@ -106,22 +106,25 @@ def call_llm_structured(raw_left: str, raw_right: str, debug: bool=False):
         dbg["llm_error"] = repr(e)
         return {}, dbg
 
-@app.route("/api/health")
+@app.route("/api/health", methods=["GET"])
 def health():
-    env_diag = {
-        "ENABLE_LLM": os.getenv("ENABLE_LLM",""),
+    env = {
+        "ENABLE_LLM": os.getenv("ENABLE_LLM", ""),
+        "GOOGLE_APPLICATION_CREDENTIALS_present": bool(os.getenv("GOOGLE_APPLICATION_CREDENTIALS")),
         "GOOGLE_CLOUD_CREDENTIALS_JSON_present": bool(os.getenv("GOOGLE_CLOUD_CREDENTIALS_JSON")),
-        "LLM_MODEL": os.getenv("LLM_MODEL",""),
-        "OPENAI_API_KEY_present": bool(os.getenv("OPENAI_API_KEY"))
+        "LLM_MODEL": os.getenv("LLM_MODEL", ""),
+        "OPENAI_API_KEY_present": bool(os.getenv("OPENAI_API_KEY")),
+        "PATH_sample": ":".join(os.getenv("PATH", "").split(":")[:3]),
+        "PYTHONANYWHERE": os.getenv("PYTHONANYWHERE", ""),
     }
     return jsonify({
-        "env": env_diag,
-        "llm_enabled": bool(os.getenv("ENABLE_LLM")),
+        "env": env,
+        "llm_enabled": os.getenv("ENABLE_LLM", "").strip() in {"1", "true", "True"},
         "llm_model": os.getenv("LLM_MODEL"),
         "status": "running",
-        "version": "5.1.2 (LLM tolerant JSON)"
+        "version": "5.1.1 (Universal Parser + LLM fallback + env diagnostics)"
     })
-
+    
 @app.route("/api/parse", methods=["POST"])
 def parse():
     debug = request.args.get("debug") == "1"
