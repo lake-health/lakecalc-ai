@@ -1,368 +1,177 @@
-# app.py
-# LakeCalc.ai — IOL Parser
-# Version: 5.1.1 (Universal Parser + LLM fallback, with env diagnostics)
-
-import io
 import os
 import re
 import json
-import logging
-from dataclasses import dataclass, asdict
-from typing import Dict, Tuple, Optional
+from flask import Flask, request, jsonify
+from werkzeug.utils import secure_filename
+from pdfminer.high_level import extract_text
+import pytesseract
+from PIL import Image
+import fitz  # PyMuPDF
 
-from flask import Flask, request, jsonify, render_template, send_from_directory, Response
+app = Flask(__name__)
 
-# --- PDF/text helpers (pure-Python; no system deps) ---
-import pdfplumber
-
-# --- Optional: OpenAI (loaded lazily; app works without it) ---
-_OPENAI_IMPORTED = False
-try:
-    # New-style OpenAI client
-    from openai import OpenAI
-    _OPENAI_IMPORTED = True
-except Exception:
-    _OPENAI_IMPORTED = False
-
-
-APP_VERSION = "5.1.1 (Universal Parser + LLM fallback + env diagnostics)"
-
-app = Flask(__name__, template_folder="templates", static_folder="static")
-
-# ------------------------------------------------------------------------------
-# Logging & ENV diagnostics
-# ------------------------------------------------------------------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("lakecalc")
-
-MASK = "*******"
-
-
-def _mask(s: Optional[str]) -> str:
-    if not s:
+def extract_text_from_pdf(path: str) -> str:
+    try:
+        return extract_text(path)
+    except Exception:
         return ""
-    if len(s) <= 8:
-        return MASK
-    return s[:2] + "****" + s[-2:]
 
+def extract_text_from_image(path: str) -> str:
+    try:
+        img = Image.open(path)
+        return pytesseract.image_to_string(img, lang="eng+por")
+    except Exception:
+        return ""
 
-def _bool_from_env(name: str, default: bool = False) -> bool:
-    v = os.getenv(name, "")
-    if not v:
-        return default
-    return v.strip().lower() in {"1", "true", "yes", "on"}
+def split_left_right(text: str) -> tuple[str,str]:
+    mid = len(text)//2
+    return text[:mid], text[mid:]
 
+def parse_eye_block(text: str) -> dict:
+    out = {}
+    def grab(pattern, key):
+        m = re.search(pattern, text, flags=re.I)
+        if m:
+            out[key] = m.group(1).strip()
+    grab(r"AL[: ]+([0-9.,]+ ?mm)", "axial_length")
+    grab(r"CCT[: ]+([0-9.,]+ ?µm)", "cct")
+    grab(r"ACD[: ]+([0-9.,]+ ?mm)", "acd")
+    grab(r"LT[: ]+([0-9.,]+ ?mm)", "lt")
+    grab(r"K1[: ]+([0-9.,]+ ?D.*)", "k1")
+    grab(r"K2[: ]+([0-9.,]+ ?D.*)", "k2")
+    grab(r"K[: ]+([-0-9.,]+ ?D.*)", "ak")
+    grab(r"WTW[: ]+([0-9.,]+ ?mm)", "wtw")
+    m = re.search(r"IOL ?Master ?700", text, flags=re.I)
+    if m:
+        out["source"] = "IOL Master 700"
+    return out
 
-def _env_snapshot() -> Dict:
+def base_structured(left: str, right: str) -> dict:
     return {
-        "ENABLE_LLM": os.getenv("ENABLE_LLM", ""),
-        "LLM_MODEL": os.getenv("LLM_MODEL", ""),
-        "OPENAI_API_KEY_present": bool(os.getenv("OPENAI_API_KEY")),
-        "GOOGLE_APPLICATION_CREDENTIALS_present": bool(os.getenv("GOOGLE_APPLICATION_CREDENTIALS")),
-        "GOOGLE_CLOUD_CREDENTIALS_JSON_present": bool(os.getenv("GOOGLE_CLOUD_CREDENTIALS_JSON")),
-        "PYTHONANYWHERE": os.getenv("PYTHONANYWHERE", ""),  # just to show a random extra
-        "PATH_sample": os.getenv("PATH", "")[:64] + "…",
+        "OD": parse_eye_block(left),
+        "OS": parse_eye_block(right)
     }
 
+def _strip_code_fences(s: str) -> str:
+    s = s.strip()
+    m = re.match(r"^```(?:json)?\s*(.*?)\s*```$", s, flags=re.S)
+    return m.group(1) if m else s
 
-def _log_env_on_startup():
-    snap = _env_snapshot()
-    pretty = json.dumps(snap, indent=2)
-    log.info("Environment snapshot (keys, masked where appropriate):\n%s", pretty)
+def _tolerant_json_loads(s: str):
+    s = _strip_code_fences(s).strip()
+    s = s.replace("“", '"').replace("”", '"').replace("’", "'")
+    s = s.replace("\xa0", " ").replace("\u200b", "")
+    if s.count("{") > s.count("}"):
+        s = s + "}"
+    if s.count("[") > s.count("]"):
+        s = s + "]"
+    s = re.sub(r",\s*([}\]])", r"\1", s)
+    return json.loads(s)
 
+def _build_llm_prompt(raw_left: str, raw_right: str) -> str:
+    return (
+        "You are extracting eye biometric values from an ophthalmology report.\n"
+        "Return a SINGLE JSON object ONLY, no commentary. Keys and order:\n"
+        '{\n'
+        '  "OD": { "source","axial_length","acd","cct","lt","k1","k2","ak","wtw" },\n'
+        '  "OS": { "source","axial_length","acd","cct","lt","k1","k2","ak","wtw" }\n'
+        '}\n"
+        "- Units: keep units appearing in text.\n"
+        "- If a value is clearly present, fill it. If absent, use an empty string.\n"
+        "- 'source' is the device name like 'IOL Master 700'.\n"
+        "- Typical ranges: cct 400–700 µm; axial length 20–30 mm.\n\n"
+        f"LEFT BLOCK (OD tentative):\n{raw_left[:8000]}\n\n"
+        f"RIGHT BLOCK (OS tentative):\n{raw_right[:8000]}\n"
+    )
 
-_log_env_on_startup()
-
-ENABLE_LLM = _bool_from_env("ENABLE_LLM", False)
-LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
-OPENAI_API_KEY_PRESENT = bool(os.getenv("OPENAI_API_KEY"))
-
-if ENABLE_LLM:
-    if not OPENAI_API_KEY_PRESENT:
-        log.warning("ENABLE_LLM=1 but OPENAI_API_KEY is missing — LLM will be disabled at runtime.")
-    elif not _OPENAI_IMPORTED:
-        log.warning("OpenAI client not importable — install `openai` package. LLM will be disabled.")
-    else:
-        log.info("LLM integration enabled with model=%s", LLM_MODEL)
-else:
-    log.info("LLM integration disabled (set ENABLE_LLM=1 to enable).")
-
-
-# ------------------------------------------------------------------------------
-# Simple domain model
-# ------------------------------------------------------------------------------
-EYE_FIELDS_ORDER = [
-    "source",
-    "axial_length",
-    "acd",
-    "cct",
-    "lt",
-    "k1",
-    "k2",
-    "ak",
-    "wtw",
-]
-
-
-@dataclass
-class EyeData:
-    source: str = "IOL Master 700"
-    axial_length: str = ""
-    acd: str = ""
-    cct: str = ""
-    lt: str = ""
-    k1: str = ""
-    k2: str = ""
-    ak: str = ""
-    wtw: str = ""
-
-
-def _clean_text(s: str) -> str:
-    # normalize frequent OCR substitutions (µ/° issues etc.)
-    # NOTE: keep gentle to avoid breaking real numbers
-    s = s.replace("µ", "u")            # keep units readable but distinct
-    s = s.replace("°", "°")            # leave as-is; pdfminer usually preserves "°"
-    s = re.sub(r"[ \t]+", " ", s)
-    return s
-
-
-def extract_pdf_text(file_bytes: bytes) -> str:
-    """Extract text from PDF using pdfplumber (layout-preserving-ish)."""
-    out = []
-    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-        for page in pdf.pages:
-            # text() already follows reading order; extract_words for coord harvesting if needed
-            out.append(page.extract_text() or "")
-    return "\n".join(out)
-
-
-def split_left_right(text: str) -> Tuple[str, str]:
-    """
-    Naive left/right split: if the page is two columns, the left block tends to contain OD lines.
-    If not, we still return (text, text) so both parsers can try.
-    """
-    # Cheap heuristic: if explicit OS labels exist later, prefer classic mapping
-    # Otherwise return full text for both so we don't miss anything.
-    if "OS" in text or "esquerda" in text.lower():
-        return text, text
-    return text, text
-
-
-def find_value(patterns, hay) -> Optional[str]:
-    for pat in patterns:
-        m = re.search(pat, hay, flags=re.IGNORECASE | re.MULTILINE)
-        if m:
-            g = next((g for g in m.groups() if g), None)
-            return g.strip() if g else m.group(0).strip()
-    return None
-
-
-def parse_eye_block(block: str, prefer_units: bool = True) -> EyeData:
-    t = _clean_text(block)
-
-    # Patterns
-    num_mm = r"([\d]+[.,]\d+)\s*mm"
-    num_um = r"([\d]+[.,]\d+)\s*(?:um|µm|u m)"
-    diopter = r"([\d]+[.,]\d+)\s*D"
-    axis = r"@?\s*([0-9]{1,3})\s*°"
-    k_pair = r"([\d]+[.,]\d+)\s*D(?:\s*@\s*([0-9]{1,3})\s*°)?"
-
-    eye = EyeData()
-
-    # Source (device) — keep default but allow override if visible
-    src = find_value([r"(IOL ?Master ?700)"], t)
-    if src:
-        eye.source = src
-
-    # AL, ACD, CCT, LT
-    eye.axial_length = find_value([rf"(?:AL|Axial(?: Length)?)[^\S\r\n]*[: ]\s*{num_mm}",
-                                   rf"{num_mm}\s*(?:AL|Axial Length)"], t) or ""
-
-    eye.acd = find_value([rf"(?:ACD)[^\S\r\n]*[: ]\s*{num_mm}",
-                          rf"{num_mm}\s*ACD"], t) or ""
-
-    # cct: prefer µm but accept mm if present
-    cct_um = find_value([rf"(?:CCT)[^\S\r\n]*[: ]\s*{num_um}",
-                         rf"{num_um}\s*CCT"], t)
-    cct_mm = find_value([rf"(?:CCT)[^\S\r\n]*[: ]\s*{num_mm}",
-                         rf"{num_mm}\s*CCT"], t)
-    eye.cct = cct_um or cct_mm or ""
-
-    eye.lt = find_value([rf"(?:LT)[^\S\r\n]*[: ]\s*{num_mm}",
-                         rf"{num_mm}\s*LT"], t) or ""
-
-    # Keratometry (K1/K2) and cylinder (AK)
-    k1 = re.search(rf"(?:K1)[^\S\r\n]*[: ]\s*{k_pair}", t, flags=re.IGNORECASE)
-    if k1:
-        d = k1.group(1)
-        ax = k1.group(2)
-        eye.k1 = f"{d} D" + (f" @ {ax}°" if ax else "")
-
-    k2 = re.search(rf"(?:K2)[^\S\r\n]*[: ]\s*{k_pair}", t, flags=re.IGNORECASE)
-    if k2:
-        d = k2.group(1)
-        ax = k2.group(2)
-        eye.k2 = f"{d} D" + (f" @ {ax}°" if ax else "")
-
-    # SE / AK (cylinder)
-    ak = re.search(rf"(?:SE|AK|\(cid:706\)K)[^\S\r\n]*[: ]\s*(-?{diopter})(?:\s*@\s*{axis})?", t,
-                   flags=re.IGNORECASE)
-    if ak:
-        # ak.group(1) contains value with unit D due to nested capture: "-2,79 D"
-        val = ak.group(1).replace(" ", "")
-        ax = ak.group(2)
-        eye.ak = f"{val}" + (f" @ {ax}°" if ax else "")
-
-    # WTW
-    eye.wtw = find_value([rf"(?:WTW|Branco a branco)[^\S\r\n]*[: ]\s*{num_mm}",
-                          rf"{num_mm}\s*(?:WTW|Branco a branco)"], t) or ""
-
-    return eye
-
-
-def needs_llm(od: EyeData, os_: EyeData) -> bool:
-    # If any critical field is missing (especially CCT), we can escalate to LLM (if allowed)
-    def incomplete(e: EyeData) -> bool:
-        return not (e.axial_length and e.acd and e.lt and e.k1 and e.k2 and e.ak and e.wtw and e.cct)
-
-    return incomplete(od) or incomplete(os_)
-
-
-def llm_structurize(raw_text: str) -> Optional[Dict]:
-    """Ask the LLM to structure the text. Returns dict or None."""
-    if not (ENABLE_LLM and OPENAI_API_KEY_PRESENT and _OPENAI_IMPORTED):
-        return None
-
+def call_llm_structured(raw_left: str, raw_right: str, debug: bool=False):
+    dbg = {}
+    if not os.getenv("ENABLE_LLM"):
+        return {}, dbg
     try:
-        client = OpenAI()
-        system = (
-            "You are a medical report parser. Extract a JSON with two objects 'OD' and 'OS'. "
-            "Each must include, in this order: source (device), axial_length (mm), acd (mm), "
-            "cct (µm or mm), lt (mm), k1 (with diopters and axis), k2 (with diopters and axis), "
-            "ak (cylinder with diopters and axis), wtw. Keep original units and decimals. "
-            "Do not invent values."
-        )
-        user = f"Text:\n{raw_text[:45000]}\n\nReturn ONLY the JSON."
+        from openai import OpenAI
+        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        model = os.getenv("LLM_MODEL", "gpt-4o-mini")
+        prompt = _build_llm_prompt(raw_left, raw_right)
         resp = client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[{"role": "system", "content": system},
-                      {"role": "user", "content": user}],
-            temperature=0
+            model=model,
+            temperature=0,
+            messages=[{"role":"user","content":prompt}]
         )
-        content = resp.choices[0].message.content.strip()
-        # Try to locate JSON
-        j = re.search(r"\{.*\}", content, flags=re.S)
-        if not j:
-            return None
-        data = json.loads(j.group(0))
-        return data
+        text = resp.choices[0].message.content or ""
+        dbg["llm_raw"] = text[:2000]
+        data = _tolerant_json_loads(text)
+        return data, dbg
     except Exception as e:
-        log.warning("LLM structurize failed: %s", e)
-        return None
-
-
-# ------------------------------------------------------------------------------
-# Flask routes
-# ------------------------------------------------------------------------------
-@app.route("/")
-def index():
-    # Simple HTML served from templates/index.html if you have it; otherwise a tiny page
-    try:
-        return render_template("index.html")
-    except Exception:
-        return Response(
-            """<!doctype html><meta charset="utf-8">
-            <title>LakeCalc.ai — IOL Parser</title>
-            <h1>LakeCalc.ai — IOL Parser</h1>
-            <p>Health: <a href="/api/health">/api/health</a></p>
-            """,
-            mimetype="text/html",
-        )
-
+        dbg["llm_error"] = repr(e)
+        return {}, dbg
 
 @app.route("/api/health")
 def health():
-    # Return what the app actually sees right now, not expectations
-    snap = _env_snapshot()
+    env_diag = {
+        "ENABLE_LLM": os.getenv("ENABLE_LLM",""),
+        "GOOGLE_CLOUD_CREDENTIALS_JSON_present": bool(os.getenv("GOOGLE_CLOUD_CREDENTIALS_JSON")),
+        "LLM_MODEL": os.getenv("LLM_MODEL",""),
+        "OPENAI_API_KEY_present": bool(os.getenv("OPENAI_API_KEY"))
+    }
     return jsonify({
-        "llm_enabled": bool(ENABLE_LLM and OPENAI_API_KEY_PRESENT and _OPENAI_IMPORTED),
-        "llm_model": LLM_MODEL if ENABLE_LLM else None,
+        "env": env_diag,
+        "llm_enabled": bool(os.getenv("ENABLE_LLM")),
+        "llm_model": os.getenv("LLM_MODEL"),
         "status": "running",
-        "version": APP_VERSION,
-        "env": snap,  # helpful while we’re debugging Railway
+        "version": "5.1.2 (LLM tolerant JSON)"
     })
 
-
 @app.route("/api/parse", methods=["POST"])
-def parse_endpoint():
-    include_raw = request.args.get("include_raw") == "1"
-    force_pdf_text = request.args.get("force_pdf_text") == "1"  # kept for UI compatibility
+def parse():
     debug = request.args.get("debug") == "1"
-
     if "file" not in request.files:
-        return jsonify({"error": "No file uploaded (field 'file')"}), 400
-
+        return jsonify({"error":"No file"}),400
     f = request.files["file"]
-    data = f.read()
+    filename = secure_filename(f.filename)
+    path = os.path.join("/tmp", filename)
+    f.save(path)
 
-    # 1) Text extraction (PDF)
-    raw_text = extract_pdf_text(data)
-    left, right = split_left_right(raw_text)
+    text = ""
+    if filename.lower().endswith(".pdf"):
+        text = extract_text_from_pdf(path)
+        if not text:
+            doc = fitz.open(path)
+            for page in doc:
+                pix = page.get_pixmap()
+                img_path = path+".png"
+                pix.save(img_path)
+                text += extract_text_from_image(img_path)
+    else:
+        text = extract_text_from_image(path)
 
-    # 2) Heuristic parse
-    od = parse_eye_block(left)
-    os_ = parse_eye_block(right)
+    left,right = split_left_right(text)
+    struct = base_structured(left,right)
+    llm_struct,llm_dbg = call_llm_structured(left,right,debug=debug)
 
-    # 3) If incomplete and LLM is allowed, try LLM
-    llm_used = False
-    if ENABLE_LLM and OPENAI_API_KEY_PRESENT and _OPENAI_IMPORTED and needs_llm(od, os_):
-        structured = llm_structurize(raw_text)
-        if structured and "OD" in structured and "OS" in structured:
-            # Merge: fill only missing fields from LLM result
-            def merge(dst: EyeData, src: Dict):
-                for k in EYE_FIELDS_ORDER:
-                    v = getattr(dst, k)
-                    if not v and src.get(k):
-                        setattr(dst, k, src[k])
+    def merge_eye(base,llm):
+        out = base.copy()
+        for k in ["source","axial_length","acd","cct","lt","k1","k2","ak","wtw"]:
+            if not out.get(k) and llm.get(k):
+                out[k] = llm[k]
+        return out
 
-            merge(od, structured.get("OD", {}))
-            merge(os_, structured.get("OS", {}))
-            llm_used = True
+    if llm_struct:
+        struct["OD"] = merge_eye(struct.get("OD",{}), llm_struct.get("OD",{}))
+        struct["OS"] = merge_eye(struct.get("OS",{}), llm_struct.get("OS",{}))
 
-    result = {
-        "OD": {k: getattr(od, k) for k in EYE_FIELDS_ORDER},
-        "OS": {k: getattr(os_, k) for k in EYE_FIELDS_ORDER},
-    }
-
-    # Optional debug payload so we can see exactly what the app saw
-    dbg = None
+    debug_blob = {}
     if debug:
-        dbg = {
-            "strategy": "pdf_layout_split + heuristics" + (" + LLM" if llm_used else ""),
-            "xtra": {
-                "notes": "See /api/health for env. LLM used only when ENABLE_LLM=1, key present, and fields were missing."
-            }
+        debug_blob = {
+            "left_preview": left[:400],
+            "right_preview": right[:400],
+            "llm": llm_dbg
         }
 
-    payload = {
-        "filename": f.filename,
-        "structured": result,
-        "text_source": "pdf_text",
-    }
-    if include_raw:
-        payload["raw_text_preview"] = raw_text[:2000]
-    if dbg:
-        payload["debug"] = dbg
-
-    return jsonify(payload)
-
-
-# Static passthrough (if needed)
-@app.route("/static/<path:fn>")
-def static_files(fn):
-    return send_from_directory(app.static_folder or "static", fn)
-
+    return jsonify({
+        "structured": struct,
+        "debug": debug_blob
+    })
 
 if __name__ == "__main__":
-    # Local debug
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)
+    app.run(host="0.0.0.0", port=8080)
