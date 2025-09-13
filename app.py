@@ -848,7 +848,7 @@ def parse_file():
         source_label = detect_source_label(norm_text)
 
         if raw_only:
-            loc_preview = localize_pt_to_en(smart_fix_cct_bound(bind_disjoint_scalars(norm_text))))
+            loc_preview = localize_pt_to_en(smart_fix_cct_bound(bind_disjoint_scalars(norm_text)))
             return jsonify({
                 "filename": fs.filename,
                 "text_source": source_tag,
