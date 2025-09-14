@@ -2,6 +2,7 @@
 # v3.8/v3.9 core + coordinate-based harvest + strict binder + CCT sanity + rescue + plausibility
 # + LLM fallback (CCT only, OD/OS independently, strict JSON, 400–700µm, never copy between eyes)
 # + ordered fields + minimal front-end (templates/index.html)
+# + MULTI-PAGE PDF SUPPORT for IOL Master 700 reports
 #
 # Minimal surface changes to existing strategy. LLM used ONLY if CCT still missing.
 
@@ -243,13 +244,15 @@ def localize_pt_to_en(text: str) -> str:
 
 
 # =========================
-# PDF layout split (text)
+# Enhanced PDF processing for multi-page IOL Master 700 reports
 # =========================
 def pdf_split_left_right(pdf_bytes: bytes) -> dict:
     left_chunks, right_chunks = [], []
+    all_pages_text = []  # Store all pages for LLM context
     laparams = LAParams(all_texts=True)
+    
     try:
-        for page_layout in extract_pages(BytesIO(pdf_bytes), laparams=laparams):
+        for page_num, page_layout in enumerate(extract_pages(BytesIO(pdf_bytes), laparams=laparams)):
             page_width = getattr(page_layout, "width", None)
             if page_width is None:
                 xs = []
@@ -260,6 +263,7 @@ def pdf_split_left_right(pdf_bytes: bytes) -> dict:
             midx = page_width / 2.0
 
             blobs = []
+            page_text_elements = []
             for el in page_layout:
                 if isinstance(el, (LTTextBox, LTTextBoxHorizontal, LTTextLine, LTTextLineHorizontal)):
                     x0, y0, x1, y1 = el.bbox
@@ -268,20 +272,47 @@ def pdf_split_left_right(pdf_bytes: bytes) -> dict:
                     if not txt or not txt.strip():
                         continue
                     blobs.append((y1, txt, x_center < midx))
+                    page_text_elements.append(txt)
 
-            blobs.sort(key=lambda t: -t[0])
-            left_txt = "".join([b[1] for b in blobs if b[2]])
-            right_txt = "".join([b[1] for b in blobs if not b[2]])
-            left_chunks.append(left_txt)
-            right_chunks.append(right_txt)
+            # Store all text from this page
+            page_text = "".join(page_text_elements)
+            all_pages_text.append(f"=== PAGE {page_num + 1} ===\n{page_text}")
+
+            # Traditional column splitting for first page
+            if page_num == 0:
+                blobs.sort(key=lambda t: -t[0])
+                left_txt = "".join([b[1] for b in blobs if b[2]])
+                right_txt = "".join([b[1] for b in blobs if not b[2]])
+                left_chunks.append(left_txt)
+                right_chunks.append(right_txt)
+            else:
+                # For additional pages, determine if it's OD or OS based on content
+                page_upper = page_text.upper()
+                if "OS" in page_upper or "ESQUERDA" in page_upper or "LEFT" in page_upper:
+                    # This page contains OS (left eye) data
+                    right_chunks.append(page_text)
+                elif "OD" in page_upper or "DIREITA" in page_upper or "RIGHT" in page_upper:
+                    # This page contains OD (right eye) data
+                    left_chunks.append(page_text)
+                else:
+                    # Unclear, add to both (will be filtered later)
+                    left_chunks.append(page_text)
+                    right_chunks.append(page_text)
+
     except Exception as e:
         print(f"pdf layout split error: {e}")
 
-    return {"left": "\n".join(left_chunks).strip(), "right": "\n".join(right_chunks).strip()}
+    result = {
+        "left": "\n".join(left_chunks).strip(), 
+        "right": "\n".join(right_chunks).strip(),
+        "all_pages": "\n\n".join(all_pages_text)  # Complete text for LLM
+    }
+    
+    return result
 
 
 # =========================
-# Coordinate-based harvester (per column)
+# Coordinate-based harvester (per column) - Enhanced for multi-page
 # =========================
 _num_token = r"-?\d[\d.,]*"
 MM = r"-?\d[\d.,]*\s*mm"
@@ -317,9 +348,24 @@ def coordinate_harvest(pdf_bytes: bytes) -> Dict[str, Dict[str, str]]:
                     except Exception:
                         continue
 
-            # Split per column
-            left_lines  = [ln for ln in lines if (ln[0]+ln[2])/2.0 <  midx]
-            right_lines = [ln for ln in lines if (ln[0]+ln[2])/2.0 >= midx]
+            # Determine if this page is OD or OS based on content
+            page_text = " ".join([line[4] for line in lines]).upper()
+            is_od_page = "OD" in page_text or "DIREITA" in page_text or "RIGHT" in page_text
+            is_os_page = "OS" in page_text or "ESQUERDA" in page_text or "LEFT" in page_text
+
+            # Split per column or assign to eye based on page content
+            if is_od_page and not is_os_page:
+                # This is an OD-only page, harvest for left (OD)
+                left_lines = lines
+                right_lines = []
+            elif is_os_page and not is_od_page:
+                # This is an OS-only page, harvest for right (OS)
+                left_lines = []
+                right_lines = lines
+            else:
+                # Mixed or unclear, use traditional column splitting
+                left_lines  = [ln for ln in lines if (ln[0]+ln[2])/2.0 <  midx]
+                right_lines = [ln for ln in lines if (ln[0]+ln[2])/2.0 >= midx]
 
             # Sort top→bottom in each column
             left_lines.sort(key=lambda r: -r[3])
@@ -765,15 +811,18 @@ def parse_iol(norm_text: str, pdf_bytes: Optional[bytes], source_label: str, wan
     debug = {"strategy":"", "left_len":0, "right_len":0, "left_preview":"", "right_preview":"", "mapping":""}
 
     left_txt = right_txt = None
+    all_pages_text = None
     coord_vals = {"left": {}, "right": {}}
     if pdf_bytes:
         try:
             cols = pdf_split_left_right(pdf_bytes)
             left_txt, right_txt = cols.get("left",""), cols.get("right","")
+            all_pages_text = cols.get("all_pages", "")  # Complete text for LLM
             coord_vals = coordinate_harvest(pdf_bytes)
-            debug["strategy"] = "pdf_layout_split + coord_harvest"
+            debug["strategy"] = "pdf_layout_split + coord_harvest + multi_page"
             debug["left_len"] = len(left_txt or "")
             debug["right_len"] = len(right_txt or "")
+            debug["all_pages_len"] = len(all_pages_text or "")
         except Exception as e:
             print(f"layout/coord split failed: {e}")
 
@@ -853,19 +902,28 @@ def parse_iol(norm_text: str, pdf_bytes: Optional[bytes], source_label: str, wan
             "condition_check": enabled and (not result["OD"].get("cct") or not result["OS"].get("cct")),
             "llm_called": False,
             "llm_response": None,
-            "llm_error": None
+            "llm_error": None,
+            "context_source": "all_pages" if all_pages_text else "columns"
         }
         
         if enabled and (not result["OD"].get("cct") or not result["OS"].get("cct")):
             llm_debug["llm_called"] = True
             print(f"[DEBUG] Calling LLM for missing CCT - OD: '{result['OD'].get('cct')}', OS: '{result['OS'].get('cct')}'")
-            # Build context with both normalized columns; the model will detect OD/OS/LEFT/RIGHT cues.
-            ctx = (
-                "=== LEFT COLUMN (may contain LEFT/OS or RIGHT/OD cues) ===\n"
-                + (left_norm or "") + "\n\n"
-                "=== RIGHT COLUMN (may contain LEFT/OS or RIGHT/OD cues) ===\n"
-                + (right_norm or "") + "\n"
-            )
+            
+            # Use complete multi-page text for LLM context if available
+            if all_pages_text:
+                ctx = all_pages_text
+                print(f"[DEBUG] Using all pages text for LLM context ({len(ctx)} chars)")
+            else:
+                # Fallback to column-based context
+                ctx = (
+                    "=== LEFT COLUMN (may contain LEFT/OS or RIGHT/OD cues) ===\n"
+                    + (left_norm or "") + "\n\n"
+                    "=== RIGHT COLUMN (may contain LEFT/OS or RIGHT/OD cues) ===\n"
+                    + (right_norm or "") + "\n"
+                )
+                print(f"[DEBUG] Using column-based context for LLM ({len(ctx)} chars)")
+            
             try:
                 llm_out = llm_extract_cct(ctx, model or "gpt-4o-mini")
                 llm_debug["llm_response"] = llm_out
@@ -912,7 +970,8 @@ def parse_iol(norm_text: str, pdf_bytes: Optional[bytes], source_label: str, wan
         "condition_check": enabled and not result["OD"].get("cct"),
         "llm_called": False,
         "llm_response": None,
-        "llm_error": None
+        "llm_error": None,
+        "context_source": "single_block"
     }
     
     if enabled and not result["OD"].get("cct"):
@@ -951,7 +1010,7 @@ def health():
     }
     return jsonify({
         "status": "running",
-        "version": "LakeCalc.ai parser v3.11 (coord harvest + strict binder + sanity + rescue + plausibility + LLM optional + ordered)",
+        "version": "LakeCalc.ai parser v3.12 (multi-page PDF support + coord harvest + strict binder + sanity + rescue + plausibility + LLM optional + ordered)",
         "ocr_enabled": bool(vision_client),
         "llm_enabled": bool(llm_on),
         "llm_model": model if llm_on else None,
