@@ -842,7 +842,22 @@ def parse_iol(norm_text: str, pdf_bytes: Optional[bytes], source_label: str, wan
         qp_llm = request.args.get("llm")
         if qp_llm == "0":
             enabled = False
+        
+        # Enhanced debug info for LLM condition
+        llm_debug = {
+            "enabled": enabled,
+            "od_cct_value": result["OD"].get("cct"),
+            "os_cct_value": result["OS"].get("cct"),
+            "od_cct_empty": not result["OD"].get("cct"),
+            "os_cct_empty": not result["OS"].get("cct"),
+            "condition_check": enabled and (not result["OD"].get("cct") or not result["OS"].get("cct")),
+            "llm_called": False,
+            "llm_response": None,
+            "llm_error": None
+        }
+        
         if enabled and (not result["OD"].get("cct") or not result["OS"].get("cct")):
+            llm_debug["llm_called"] = True
             print(f"[DEBUG] Calling LLM for missing CCT - OD: '{result['OD'].get('cct')}', OS: '{result['OS'].get('cct')}'")
             # Build context with both normalized columns; the model will detect OD/OS/LEFT/RIGHT cues.
             ctx = (
@@ -851,15 +866,24 @@ def parse_iol(norm_text: str, pdf_bytes: Optional[bytes], source_label: str, wan
                 "=== RIGHT COLUMN (may contain LEFT/OS or RIGHT/OD cues) ===\n"
                 + (right_norm or "") + "\n"
             )
-            llm_out = llm_extract_cct(ctx, model or "gpt-4o-mini")
-            print(f"[DEBUG] LLM returned: {llm_out}")
-            # Only fill if still missing and value present from LLM
-            if not result["OD"].get("cct") and llm_out.get("OD"):
-                result["OD"]["cct"] = llm_out["OD"]
-                print(f"[DEBUG] Set OD CCT from LLM: {llm_out['OD']}")
-            if not result["OS"].get("cct") and llm_out.get("OS"):
-                result["OS"]["cct"] = llm_out["OS"]
-                print(f"[DEBUG] Set OS CCT from LLM: {llm_out['OS']}")
+            try:
+                llm_out = llm_extract_cct(ctx, model or "gpt-4o-mini")
+                llm_debug["llm_response"] = llm_out
+                print(f"[DEBUG] LLM returned: {llm_out}")
+                # Only fill if still missing and value present from LLM
+                if not result["OD"].get("cct") and llm_out.get("OD"):
+                    result["OD"]["cct"] = llm_out["OD"]
+                    print(f"[DEBUG] Set OD CCT from LLM: {llm_out['OD']}")
+                if not result["OS"].get("cct") and llm_out.get("OS"):
+                    result["OS"]["cct"] = llm_out["OS"]
+                    print(f"[DEBUG] Set OS CCT from LLM: {llm_out['OS']}")
+            except Exception as e:
+                llm_debug["llm_error"] = str(e)
+                print(f"[DEBUG] LLM call failed: {e}")
+
+        # Add LLM debug info to debug output
+        if want_debug:
+            debug["llm_debug"] = llm_debug
 
         # Enforce output order
         result["OD"] = enforce_field_order(result["OD"])
@@ -878,18 +902,37 @@ def parse_iol(norm_text: str, pdf_bytes: Optional[bytes], source_label: str, wan
     qp_llm = request.args.get("llm")
     if qp_llm == "0":
         enabled = False
+    
+    # Enhanced debug info for single block case
+    llm_debug = {
+        "enabled": enabled,
+        "od_cct_value": result["OD"].get("cct"),
+        "os_cct_value": result["OS"].get("cct"),
+        "od_cct_empty": not result["OD"].get("cct"),
+        "condition_check": enabled and not result["OD"].get("cct"),
+        "llm_called": False,
+        "llm_response": None,
+        "llm_error": None
+    }
+    
     if enabled and not result["OD"].get("cct"):
+        llm_debug["llm_called"] = True
         print(f"[DEBUG] Calling LLM for missing OD CCT - OD: '{result['OD'].get('cct')}'")
-        llm_out = llm_extract_cct(single, model or "gpt-4o-mini")
-        print(f"[DEBUG] LLM returned: {llm_out}")
-        if llm_out.get("OD"):
-            result["OD"]["cct"] = llm_out["OD"]
-            print(f"[DEBUG] Set OD CCT from LLM: {llm_out['OD']}")
+        try:
+            llm_out = llm_extract_cct(single, model or "gpt-4o-mini")
+            llm_debug["llm_response"] = llm_out
+            print(f"[DEBUG] LLM returned: {llm_out}")
+            if llm_out.get("OD"):
+                result["OD"]["cct"] = llm_out["OD"]
+                print(f"[DEBUG] Set OD CCT from LLM: {llm_out['OD']}")
+        except Exception as e:
+            llm_debug["llm_error"] = str(e)
+            print(f"[DEBUG] LLM call failed: {e}")
 
     result["OD"] = enforce_field_order(result["OD"])
     result["OS"] = enforce_field_order(result["OS"])
     if want_debug:
-        dbg = {"strategy":"ocr_single_block_to_OD", "left_len":0, "right_len":0, "left_preview":single[:600], "right_preview":"", "mapping":"OD<-single"}
+        dbg = {"strategy":"ocr_single_block_to_OD", "left_len":0, "right_len":0, "left_preview":single[:600], "right_preview":"", "mapping":"OD<-single", "llm_debug": llm_debug}
         return (result, dbg)
     return result
 
