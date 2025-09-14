@@ -2,6 +2,7 @@
 # v3.8/v3.9 core + coordinate-based harvest + strict binder + CCT sanity + rescue + plausibility
 # + LLM fallback (CCT only, OD/OS independently, strict JSON, 400–700µm, never copy between eyes)
 # + ordered fields + minimal front-end (templates/index.html)
+# + MULTI-PAGE PDF FIX for IOL Master 700 reports
 #
 # Minimal surface changes to existing strategy. LLM used ONLY if CCT still missing.
 
@@ -243,12 +244,13 @@ def localize_pt_to_en(text: str) -> str:
 
 
 # =========================
-# PDF layout split (text)
+# PDF layout split (text) - FIXED FOR MULTI-PAGE IOL MASTER 700
 # =========================
 def pdf_split_left_right(pdf_bytes: bytes) -> dict:
     left_chunks, right_chunks = [], []
     laparams = LAParams(all_texts=True)
     try:
+        page_num = 0
         for page_layout in extract_pages(BytesIO(pdf_bytes), laparams=laparams):
             page_width = getattr(page_layout, "width", None)
             if page_width is None:
@@ -270,10 +272,16 @@ def pdf_split_left_right(pdf_bytes: bytes) -> dict:
                     blobs.append((y1, txt, x_center < midx))
 
             blobs.sort(key=lambda t: -t[0])
-            left_txt = "".join([b[1] for b in blobs if b[2]])
-            right_txt = "".join([b[1] for b in blobs if not b[2]])
-            left_chunks.append(left_txt)
-            right_chunks.append(right_txt)
+            page_text = "".join([b[1] for b in blobs])
+            
+            # Multi-page IOL Master 700: Page 1=OD, Page 2=OS
+            if page_num == 0:  # First page (OD)
+                left_chunks.append(page_text)
+            elif page_num == 1:  # Second page (OS)  
+                right_chunks.append(page_text)
+            # Skip additional pages (IOL calculations)
+            
+            page_num += 1
     except Exception as e:
         print(f"pdf layout split error: {e}")
 
@@ -419,85 +427,107 @@ def coordinate_harvest(pdf_bytes: bytes) -> Dict[str, Dict[str, str]]:
                     out_right[k] = v
 
     except Exception as e:
-        print(f"coordinate_harvest error: {e}")
+        print(f"coordinate harvest error: {e}")
 
     return {"left": out_left, "right": out_right}
 
 
 # =========================
-# Patterns & parsing helpers (text-based)
+# Eye block parser (regex)
 # =========================
-PATTERNS = {
-    "axial_length": re.compile(rf"(?mi)\bAL\s*:\s*({MM})"),
-    "acd":          re.compile(rf"(?mi)\bACD\s*:\s*({MM})"),
-    "cct":          re.compile(rf"(?mi)\bCCT\s*:\s*({UM})"),
-    "lt":           re.compile(rf"(?mi)\bLT\s*:\s*({MM})"),
-    "wtw":          re.compile(rf"(?mi)\bWTW\s*:\s*({MM})"),
-    "k1":           re.compile(rf"(?mi)\bK1\s*:\s*({DVAL})"),
-    "k2":           re.compile(rf"(?mi)\bK2\s*:\s*({DVAL})"),
-    "ak":           re.compile(rf"(?mi)\b(?:Δ\s*K|AK|K(?!\s*1|\s*2))\s*:\s*({DVAL})"),
-}
-
-def harvest_axis(field_tail: str) -> str:
-    mstop = LABEL_STOP.search(field_tail)
-    seg = field_tail[: mstop.start()] if mstop else field_tail
-    seg = seg[:120]
-    if "@" in seg:
-        after = seg.split("@", 1)[1]
-        digits = re.findall(r"\d", after)
-        axis = "".join(digits)[:3]
-        return f" @ {axis}°" if axis else ""
-    m = re.search(r"(\d{1,3})\s*(?:°|º|o)\b", seg)
-    return f" @ {m.group(1)}°" if m else ""
-
-def parse_eye_block(txt: str) -> dict:
+def parse_eye_block(text: str) -> dict:
     out = {"axial_length":"", "acd":"", "k1":"", "k2":"", "ak":"", "wtw":"", "cct":"", "lt":""}
-    if not txt or not txt.strip():
-        return out
-    for key, pat in PATTERNS.items():
-        for m in pat.finditer(txt):
-            raw = re.sub(r"\s+", " ", m.group(1)).strip()
-            if key in ("k1", "k2", "ak"):
-                raw = re.sub(r"@\s*.*$", "", raw)
-                tail = txt[m.end(1): m.end(1) + 200]
-                raw = (raw + harvest_axis(tail)).strip()
-            if not out[key]:
-                out[key] = raw
+
+    def setv(key: str, val: str):
+        if not out[key] and val:
+            out[key] = val
+
+    # Patterns
+    for m in re.finditer(rf"(?mi)\bAL\s*:\s*({MM})", text):
+        setv("axial_length", m.group(1))
+    for m in re.finditer(rf"(?mi)\bACD\s*:\s*({MM})", text):
+        setv("acd", m.group(1))
+    for m in re.finditer(rf"(?mi)\bLT\s*:\s*({MM})", text):
+        setv("lt", m.group(1))
+    for m in re.finditer(rf"(?mi)\bWTW\s*:\s*({MM})", text):
+        setv("wtw", m.group(1))
+    for m in re.finditer(rf"(?mi)\bCCT\s*:\s*({UM})", text):
+        setv("cct", m.group(1))
+
+    # K1, K2, AK with axis
+    for m in re.finditer(rf"(?mi)\bK1\s*:\s*({DVAL})", text):
+        val = m.group(1)
+        axis_m = re.search(r"@\s*(\d{1,3})\s*(?:°|º|o)\b", val)
+        if axis_m:
+            setv("k1", val)
+        else:
+            # Look for axis in nearby text
+            start, end = m.start(), m.end()
+            window = text[start:end+100]
+            axis_m = re.search(r"@\s*(\d{1,3})\s*(?:°|º|o)\b", window)
+            if axis_m:
+                setv("k1", f"{val} @ {axis_m.group(1)}°")
+            else:
+                setv("k1", val)
+
+    for m in re.finditer(rf"(?mi)\bK2\s*:\s*({DVAL})", text):
+        val = m.group(1)
+        axis_m = re.search(r"@\s*(\d{1,3})\s*(?:°|º|o)\b", val)
+        if axis_m:
+            setv("k2", val)
+        else:
+            start, end = m.start(), m.end()
+            window = text[start:end+100]
+            axis_m = re.search(r"@\s*(\d{1,3})\s*(?:°|º|o)\b", window)
+            if axis_m:
+                setv("k2", f"{val} @ {axis_m.group(1)}°")
+            else:
+                setv("k2", val)
+
+    for m in re.finditer(rf"(?mi)\b(?:AK|ΔK|K(?!\s*[12]))\s*:\s*({DVAL})", text):
+        val = m.group(1)
+        axis_m = re.search(r"@\s*(\d{1,3})\s*(?:°|º|o)\b", val)
+        if axis_m:
+            setv("ak", val)
+        else:
+            start, end = m.start(), m.end()
+            window = text[start:end+100]
+            axis_m = re.search(r"@\s*(\d{1,3})\s*(?:°|º|o)\b", window)
+            if axis_m:
+                setv("ak", f"{val} @ {axis_m.group(1)}°")
+            else:
+                setv("ak", val)
+
     return out
 
-def has_measurements(d: dict) -> bool:
-    return any(d.values())
-
 
 # =========================
-# Rescue harvester (tolerant)
+# Rescue harvest (loose patterns)
 # =========================
-RESCUE = {
-    "axial_length": re.compile(r"(?mi)\bAL\s*[:=]?\s*(-?\d[\d.,]*)\s*mm\b"),
-    "acd":          re.compile(r"(?mi)\bACD\s*[:=]?\s*(-?\d[\d.,]*)\s*mm\b"),
-    "lt":           re.compile(r"(?mi)\bLT\s*[:=]?\s*(-?\d[\d.,]*)\s*mm\b"),
-    "wtw":          re.compile(r"(?mi)\bWTW\s*[:=]?\s*(-?\d[\d.,]*)\s*mm\b"),
-    "cct":          re.compile(r"(?mi)\bCCT\s*[:=]?\s*(?:(-?\d[\d.,]*)\s*(?:[µμ]m|um)|(?:[µμ]m|um)\s*\n\s*(-?\d[\d.,]*))"),
-    "k1":           re.compile(r"(?mi)\bK1\s*[:=]?\s*(-?\d[\d.,]*)\s*D(?:.*?@\s*(\d{1,3}))?"),
-    "k2":           re.compile(r"(?mi)\bK2\s*[:=]?\s*(-?\d[\d.,]*)\s*D(?:.*?@\s*(\d{1,3}))?"),
-    "ak":           re.compile(r"(?mi)\b(?:Δ\s*K|AK|K(?!\s*1|\s*2))\s*[:=]?\s*(-?\d[\d.,]*)\s*D(?:.*?@\s*(\d{1,3}))?")
-}
-
 def rescue_harvest(raw_text: str) -> dict:
-    out = {}
-    def setv(k, v):
-        if v and k not in out:
-            out[k] = v.strip()
+    out = {"axial_length":"", "acd":"", "k1":"", "k2":"", "ak":"", "wtw":"", "cct":"", "lt":""}
 
-    for k in ("axial_length", "acd", "lt", "wtw"):
+    def setv(key: str, val: str):
+        if not out[key] and val:
+            out[key] = val
+
+    # Rescue patterns
+    RESCUE = {
+        "axial_length": re.compile(rf"(?mi)({_num_token})\s*mm.*?(?:axial|AL)", re.IGNORECASE),
+        "acd": re.compile(rf"(?mi)({_num_token})\s*mm.*?(?:ACD)", re.IGNORECASE),
+        "lt": re.compile(rf"(?mi)({_num_token})\s*mm.*?(?:LT)", re.IGNORECASE),
+        "wtw": re.compile(rf"(?mi)({_num_token})\s*mm.*?(?:WTW)", re.IGNORECASE),
+        "cct": re.compile(rf"(?mi)({_num_token})\s*(?:[µμ]m|um).*?(?:CCT)", re.IGNORECASE),
+        "k1": re.compile(rf"(?mi)({_num_token})\s*D.*?@\s*(\d{{1,3}})\s*(?:°|º|o).*?K1", re.IGNORECASE),
+        "k2": re.compile(rf"(?mi)({_num_token})\s*D.*?@\s*(\d{{1,3}})\s*(?:°|º|o).*?K2", re.IGNORECASE),
+        "ak": re.compile(rf"(?mi)({_num_token})\s*D.*?@\s*(\d{{1,3}})\s*(?:°|º|o).*?(?:AK|ΔK)", re.IGNORECASE),
+    }
+
+    for k in ("axial_length", "acd", "lt", "wtw", "cct"):
         m = RESCUE[k].search(raw_text)
         if m:
-            setv(k, f"{m.group(1)} mm")
-
-    m = RESCUE["cct"].search(raw_text)
-    if m:
-        num = m.group(1) or m.group(2)
-        if num: setv("cct", f"{num} µm")
+            unit = "µm" if k == "cct" else "mm"
+            setv(k, f"{m.group(1)} {unit}")
 
     for k in ("k1", "k2", "ak"):
         m = RESCUE[k].search(raw_text)
@@ -749,7 +779,7 @@ def parse_iol(norm_text: str, pdf_bytes: Optional[bytes], source_label: str, wan
             cols = pdf_split_left_right(pdf_bytes)
             left_txt, right_txt = cols.get("left",""), cols.get("right","")
             coord_vals = coordinate_harvest(pdf_bytes)
-            debug["strategy"] = "pdf_layout_split + coord_harvest"
+            debug["strategy"] = "pdf_layout_split + coord_harvest + multipage_fix"
             debug["left_len"] = len(left_txt or "")
             debug["right_len"] = len(right_txt or "")
         except Exception as e:
@@ -820,7 +850,23 @@ def parse_iol(norm_text: str, pdf_bytes: Optional[bytes], source_label: str, wan
         qp_llm = request.args.get("llm")
         if qp_llm == "0":
             enabled = False
+        
+        # Enhanced debug info for LLM condition
+        llm_debug = {
+            "enabled": enabled,
+            "od_cct_value": result["OD"].get("cct"),
+            "os_cct_value": result["OS"].get("cct"),
+            "od_cct_empty": not result["OD"].get("cct"),
+            "os_cct_empty": not result["OS"].get("cct"),
+            "condition_check": enabled and (not result["OD"].get("cct") or not result["OS"].get("cct")),
+            "llm_called": False,
+            "llm_response": None,
+            "llm_error": None
+        }
+        
         if enabled and (not result["OD"].get("cct") or not result["OS"].get("cct")):
+            llm_debug["llm_called"] = True
+            print(f"[DEBUG] Calling LLM for missing CCT - OD: '{result['OD'].get('cct')}', OS: '{result['OS'].get('cct')}'")
             # Build context with both normalized columns; the model will detect OD/OS/LEFT/RIGHT cues.
             ctx = (
                 "=== LEFT COLUMN (may contain LEFT/OS or RIGHT/OD cues) ===\n"
@@ -828,12 +874,24 @@ def parse_iol(norm_text: str, pdf_bytes: Optional[bytes], source_label: str, wan
                 "=== RIGHT COLUMN (may contain LEFT/OS or RIGHT/OD cues) ===\n"
                 + (right_norm or "") + "\n"
             )
-            llm_out = llm_extract_cct(ctx, model or "gpt-4o-mini")
-            # Only fill if still missing and value present from LLM
-            if not result["OD"].get("cct") and llm_out.get("OD"):
-                result["OD"]["cct"] = llm_out["OD"]
-            if not result["OS"].get("cct") and llm_out.get("OS"):
-                result["OS"]["cct"] = llm_out["OS"]
+            try:
+                llm_out = llm_extract_cct(ctx, model or "gpt-4o-mini")
+                llm_debug["llm_response"] = llm_out
+                print(f"[DEBUG] LLM returned: {llm_out}")
+                # Only fill if still missing and value present from LLM
+                if not result["OD"].get("cct") and llm_out.get("OD"):
+                    result["OD"]["cct"] = llm_out["OD"]
+                    print(f"[DEBUG] Set OD CCT from LLM: {llm_out['OD']}")
+                if not result["OS"].get("cct") and llm_out.get("OS"):
+                    result["OS"]["cct"] = llm_out["OS"]
+                    print(f"[DEBUG] Set OS CCT from LLM: {llm_out['OS']}")
+            except Exception as e:
+                llm_debug["llm_error"] = str(e)
+                print(f"[DEBUG] LLM call failed: {e}")
+
+        # Add LLM debug info to debug output
+        if want_debug:
+            debug["llm_debug"] = llm_debug
 
         # Enforce output order
         result["OD"] = enforce_field_order(result["OD"])
@@ -852,15 +910,37 @@ def parse_iol(norm_text: str, pdf_bytes: Optional[bytes], source_label: str, wan
     qp_llm = request.args.get("llm")
     if qp_llm == "0":
         enabled = False
+    
+    # Enhanced debug info for single block case
+    llm_debug = {
+        "enabled": enabled,
+        "od_cct_value": result["OD"].get("cct"),
+        "os_cct_value": result["OS"].get("cct"),
+        "od_cct_empty": not result["OD"].get("cct"),
+        "condition_check": enabled and not result["OD"].get("cct"),
+        "llm_called": False,
+        "llm_response": None,
+        "llm_error": None
+    }
+    
     if enabled and not result["OD"].get("cct"):
-        llm_out = llm_extract_cct(single, model or "gpt-4o-mini")
-        if llm_out.get("OD"):
-            result["OD"]["cct"] = llm_out["OD"]
+        llm_debug["llm_called"] = True
+        print(f"[DEBUG] Calling LLM for missing OD CCT - OD: '{result['OD'].get('cct')}'")
+        try:
+            llm_out = llm_extract_cct(single, model or "gpt-4o-mini")
+            llm_debug["llm_response"] = llm_out
+            print(f"[DEBUG] LLM returned: {llm_out}")
+            if llm_out.get("OD"):
+                result["OD"]["cct"] = llm_out["OD"]
+                print(f"[DEBUG] Set OD CCT from LLM: {llm_out['OD']}")
+        except Exception as e:
+            llm_debug["llm_error"] = str(e)
+            print(f"[DEBUG] LLM call failed: {e}")
 
     result["OD"] = enforce_field_order(result["OD"])
     result["OS"] = enforce_field_order(result["OS"])
     if want_debug:
-        dbg = {"strategy":"ocr_single_block_to_OD", "left_len":0, "right_len":0, "left_preview":single[:600], "right_preview":"", "mapping":"OD<-single"}
+        dbg = {"strategy":"ocr_single_block_to_OD", "left_len":0, "right_len":0, "left_preview":single[:600], "right_preview":"", "mapping":"OD<-single", "llm_debug": llm_debug}
         return (result, dbg)
     return result
 
@@ -879,7 +959,7 @@ def health():
     }
     return jsonify({
         "status": "running",
-        "version": "LakeCalc.ai parser v3.11 (coord harvest + strict binder + sanity + rescue + plausibility + LLM optional + ordered)",
+        "version": "LakeCalc.ai parser v3.11 (coord harvest + strict binder + sanity + rescue + plausibility + LLM optional + ordered + multipage fix)",
         "ocr_enabled": bool(vision_client),
         "llm_enabled": bool(llm_on),
         "llm_model": model if llm_on else None,
@@ -937,11 +1017,25 @@ def parse_file():
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
 
 @app.route("/")
-def root():
-    return render_template("index.html")
+def index():
+    try:
+        return render_template("index.html")
+    except Exception:
+        return """
+        <html>
+          <body style="font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;">
+            <h2>/api/parse-file tester</h2>
+            <form action="/api/parse-file" method="post" enctype="multipart/form-data">
+              <input type="file" name="file" />
+              <button type="submit">Upload & Parse</button>
+            </form>
+            <p>Health: <a href="/api/health">/api/health</a></p>
+          </body>
+        </html>
+        """
 
 @app.route("/<path:path>")
-def fallback(path):
+def serve_fallback(path):
     try:
         return render_template("index.html")
     except Exception:
@@ -949,4 +1043,5 @@ def fallback(path):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, debug=False)
+
