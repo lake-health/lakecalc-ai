@@ -1,10 +1,11 @@
-# app.py — LakeCalc.ai parser v3.11
+# app.py — LakeCalc.ai parser v3.12 - INTELLIGENT PDF ANALYZER (FIXED)
 # v3.8/v3.9 core + coordinate-based harvest + strict binder + CCT sanity + rescue + plausibility
 # + LLM fallback (CCT only, OD/OS independently, strict JSON, 400–700µm, never copy between eyes)
 # + ordered fields + minimal front-end (templates/index.html)
-# + MULTI-PAGE PDF FIX for IOL Master 700 reports
+# + INTELLIGENT PDF ANALYSIS: Auto-detect pages, layout, columns, early exit when complete
+# + FIXED: Eye marker detection using existing language support
 #
-# Minimal surface changes to existing strategy. LLM used ONLY if CCT still missing.
+# Smart PDF processing: Analyzes each page layout, detects content type, processes accordingly
 
 import os, io, re, json
 from collections import OrderedDict
@@ -228,7 +229,7 @@ def smart_fix_cct_bound(text_with_bindings: str) -> str:
 
 
 # =========================
-# PT→EN (clues only)
+# PT→EN (clues only) - EXISTING LANGUAGE SUPPORT
 # =========================
 def localize_pt_to_en(text: str) -> str:
     t = text
@@ -244,52 +245,193 @@ def localize_pt_to_en(text: str) -> str:
 
 
 # =========================
-# PDF layout split (text) - FIXED FOR MULTI-PAGE IOL MASTER 700
+# INTELLIGENT PDF ANALYZER - ENHANCED WITH LANGUAGE SUPPORT
 # =========================
-def pdf_split_left_right(pdf_bytes: bytes) -> dict:
-    left_chunks, right_chunks = [], []
+def analyze_pdf_structure(pdf_bytes: bytes) -> Dict:
+    """
+    Intelligent PDF analysis with proper eye marker detection using existing language support
+    """
     laparams = LAParams(all_texts=True)
+    pages_info = []
+    
     try:
-        page_num = 0
-        for page_layout in extract_pages(BytesIO(pdf_bytes), laparams=laparams):
-            page_width = getattr(page_layout, "width", None)
-            if page_width is None:
-                xs = []
-                for el in page_layout:
-                    if hasattr(el, "bbox"):
-                        xs += [el.bbox[0], el.bbox[2]]
-                page_width = max(xs) if xs else 1000.0
-            midx = page_width / 2.0
-
-            blobs = []
+        for page_num, page_layout in enumerate(extract_pages(BytesIO(pdf_bytes), laparams=laparams)):
+            page_width = getattr(page_layout, "width", 1000.0)
+            
+            # Collect all text elements with positions
+            elements = []
             for el in page_layout:
                 if isinstance(el, (LTTextBox, LTTextBoxHorizontal, LTTextLine, LTTextLineHorizontal)):
                     x0, y0, x1, y1 = el.bbox
-                    x_center = (x0 + x1) / 2.0
-                    txt = el.get_text()
-                    if not txt or not txt.strip():
-                        continue
-                    blobs.append((y1, txt, x_center < midx))
-
-            blobs.sort(key=lambda t: -t[0])
-            page_text = "".join([b[1] for b in blobs])
+                    txt = el.get_text().strip()
+                    if txt:
+                        elements.append((x0, y0, x1, y1, txt))
             
-            # Multi-page IOL Master 700: Page 1=OD, Page 2=OS
-            if page_num == 0:  # First page (OD)
-                left_chunks.append(page_text)
-            elif page_num == 1:  # Second page (OS)  
-                right_chunks.append(page_text)
-            # Skip additional pages (IOL calculations)
+            if not elements:
+                continue
+                
+            # Analyze column structure
+            x_positions = [el[0] for el in elements]  # Left edges
+            x_positions.sort()
             
-            page_num += 1
+            # Detect column breaks (significant gaps in x positions)
+            columns = []
+            current_col_start = x_positions[0]
+            
+            for i in range(1, len(x_positions)):
+                gap = x_positions[i] - x_positions[i-1]
+                if gap > page_width * 0.15:  # 15% of page width = column break
+                    columns.append(current_col_start)
+                    current_col_start = x_positions[i]
+            columns.append(current_col_start)
+            
+            num_columns = len(columns)
+            
+            # Extract full page text
+            page_text = "".join([el[4] for el in elements])
+            
+            # FIXED: Apply existing language normalization for better eye marker detection
+            normalized_text = localize_pt_to_en(page_text)
+            
+            # Detect content type
+            has_measurements = bool(re.search(r'\b(AL|CCT|ACD|LT|K1|K2)\s*:', page_text, re.IGNORECASE))
+            
+            # Enhanced eye marker detection using both raw and normalized text
+            has_od_marker = bool(
+                re.search(r'\b(OD|RIGHT)\b', normalized_text, re.IGNORECASE) or
+                re.search(r'\b(O{3,}D+|direita)\b', page_text, re.IGNORECASE)
+            )
+            has_os_marker = bool(
+                re.search(r'\b(OS|LEFT)\b', normalized_text, re.IGNORECASE) or
+                re.search(r'\b(O{3,}S+|esquerda)\b', page_text, re.IGNORECASE)
+            )
+            
+            has_calculations = bool(re.search(r'\b(IOL|Emetropia|Constante A)\b', page_text, re.IGNORECASE))
+            
+            # Determine page type with enhanced logic
+            if has_measurements and has_od_marker and not has_os_marker:
+                page_type = "OD_measurements"
+            elif has_measurements and has_os_marker and not has_od_marker:
+                page_type = "OS_measurements"
+            elif has_measurements and has_od_marker and has_os_marker:
+                page_type = "mixed_measurements"
+            elif has_calculations:
+                page_type = "calculations"
+            else:
+                page_type = "header_info"
+            
+            pages_info.append({
+                'page_num': page_num,
+                'num_columns': num_columns,
+                'page_type': page_type,
+                'text': page_text,
+                'normalized_text': normalized_text,
+                'elements': elements,
+                'has_measurements': has_measurements,
+                'has_od': has_od_marker,
+                'has_os': has_os_marker
+            })
+    
     except Exception as e:
-        print(f"pdf layout split error: {e}")
+        print(f"PDF structure analysis error: {e}")
+        return {'pages': [], 'strategy': 'fallback', 'total_pages': 0}
+    
+    # Determine optimal processing strategy
+    total_pages = len(pages_info)
+    measurement_pages = [p for p in pages_info if p['has_measurements']]
+    
+    if total_pages == 1:
+        if measurement_pages and measurement_pages[0]['has_od'] and measurement_pages[0]['has_os']:
+            strategy = "single_page_mixed"
+        else:
+            strategy = "single_page_single_eye"
+    elif len(measurement_pages) >= 2:
+        od_pages = [p for p in measurement_pages if p['has_od'] and not p['has_os']]
+        os_pages = [p for p in measurement_pages if p['has_os'] and not p['has_od']]
+        if od_pages and os_pages:
+            strategy = "multi_page_separate_eyes"
+        else:
+            strategy = "multi_page_mixed"
+    else:
+        strategy = "single_measurement_page"
+    
+    return {
+        'pages': pages_info,
+        'strategy': strategy,
+        'total_pages': total_pages,
+        'measurement_pages': len(measurement_pages)
+    }
 
-    return {"left": "\n".join(left_chunks).strip(), "right": "\n".join(right_chunks).strip()}
+
+def intelligent_pdf_split(pdf_bytes: bytes) -> Dict:
+    """
+    Smart PDF processing based on structure analysis with enhanced eye detection
+    """
+    analysis = analyze_pdf_structure(pdf_bytes)
+    strategy = analysis['strategy']
+    pages = analysis['pages']
+    
+    left_text = ""
+    right_text = ""
+    
+    if strategy == "single_page_mixed":
+        # Single page with both eyes - use column splitting
+        page = pages[0]
+        elements = page['elements']
+        page_width = max([el[2] for el in elements]) if elements else 1000.0
+        midx = page_width / 2.0
+        
+        left_elements = [el for el in elements if (el[0] + el[2]) / 2.0 < midx]
+        right_elements = [el for el in elements if (el[0] + el[2]) / 2.0 >= midx]
+        
+        left_text = "".join([el[4] for el in left_elements])
+        right_text = "".join([el[4] for el in right_elements])
+        
+    elif strategy == "multi_page_separate_eyes":
+        # Separate pages for each eye
+        od_pages = [p for p in pages if p['page_type'] == 'OD_measurements']
+        os_pages = [p for p in pages if p['page_type'] == 'OS_measurements']
+        
+        if od_pages:
+            left_text = od_pages[0]['text']  # OD goes to left
+        if os_pages:
+            right_text = os_pages[0]['text']  # OS goes to right
+        else:
+            # Fallback: If no clear OS page, check for pages with measurements but no clear OD marker
+            potential_os_pages = [p for p in pages if p['has_measurements'] and not p['has_od'] and p['page_num'] > 0]
+            if potential_os_pages:
+                right_text = potential_os_pages[0]['text']
+            
+    elif strategy == "single_measurement_page":
+        # Only one page with measurements - assign to OD
+        measurement_pages = [p for p in pages if p['has_measurements']]
+        if measurement_pages:
+            left_text = measurement_pages[0]['text']
+            
+    else:
+        # Fallback to original column splitting on first page
+        if pages:
+            page = pages[0]
+            elements = page['elements']
+            if elements:
+                page_width = max([el[2] for el in elements])
+                midx = page_width / 2.0
+                
+                left_elements = [el for el in elements if (el[0] + el[2]) / 2.0 < midx]
+                right_elements = [el for el in elements if (el[0] + el[2]) / 2.0 >= midx]
+                
+                left_text = "".join([el[4] for el in left_elements])
+                right_text = "".join([el[4] for el in right_elements])
+    
+    return {
+        "left": left_text.strip(),
+        "right": right_text.strip(),
+        "analysis": analysis
+    }
 
 
 # =========================
-# Coordinate-based harvester (per column)
+# Coordinate-based harvester (per column) - ENHANCED FOR INTELLIGENT PROCESSING
 # =========================
 _num_token = r"-?\d[\d.,]*"
 MM = r"-?\d[\d.,]*\s*mm"
@@ -300,136 +442,198 @@ LABEL_STOP = re.compile(r"(?:\r?\n|(?=(?:AL|ACD|CCT|LT|WTW|K1|K2|K|AK|ΔK)\s*:))
 def _clean(s: str) -> str:
     return re.sub(r"[ \t]+", " ", (s or "")).strip()
 
-def coordinate_harvest(pdf_bytes: bytes) -> Dict[str, Dict[str, str]]:
+def intelligent_coordinate_harvest(pdf_bytes: bytes) -> Dict[str, Dict[str, str]]:
+    """
+    Enhanced coordinate harvesting that adapts to PDF structure
+    """
     out_left = {"axial_length":"", "acd":"", "lt":"", "wtw":"", "cct":"", "k1":"", "k2":"", "ak":""}
     out_right = {"axial_length":"", "acd":"", "lt":"", "wtw":"", "cct":"", "k1":"", "k2":"", "ak":""}
 
-    laparams = LAParams(all_texts=True)
+    analysis = analyze_pdf_structure(pdf_bytes)
+    strategy = analysis['strategy']
+    pages = analysis['pages']
+    
     try:
-        for page_layout in extract_pages(BytesIO(pdf_bytes), laparams=laparams):
-            width = getattr(page_layout, "width", 1000.0)
-            midx = width / 2.0
+        if strategy == "multi_page_separate_eyes":
+            # Process each eye's page separately
+            od_pages = [p for p in pages if p['page_type'] == 'OD_measurements']
+            os_pages = [p for p in pages if p['page_type'] == 'OS_measurements']
+            
+            if od_pages:
+                out_left = harvest_page_elements(od_pages[0]['elements'])
+            if os_pages:
+                out_right = harvest_page_elements(os_pages[0]['elements'])
+            else:
+                # Fallback: Look for second page with measurements
+                potential_os_pages = [p for p in pages if p['has_measurements'] and p['page_num'] == 1]
+                if potential_os_pages:
+                    out_right = harvest_page_elements(potential_os_pages[0]['elements'])
+                
+        else:
+            # Use original column-based approach for other strategies
+            laparams = LAParams(all_texts=True)
+            for page_layout in extract_pages(BytesIO(pdf_bytes), laparams=laparams):
+                width = getattr(page_layout, "width", 1000.0)
+                midx = width / 2.0
 
-            # Collect lines with positions
-            lines: List[tuple] = []  # (x0, y0, x1, y1, text)
-            for el in page_layout:
-                if isinstance(el, (LTTextLine, LTTextLineHorizontal, LTTextBoxHorizontal, LTTextBox)):
-                    try:
-                        x0, y0, x1, y1 = el.bbox
-                        txt = el.get_text()
-                        if txt and txt.strip():
-                            for ln in txt.splitlines():
-                                s = _clean(ln)
-                                if s:
-                                    lines.append((x0, y0, x1, y1, s))
-                    except Exception:
-                        continue
+                # Collect lines with positions
+                lines: List[tuple] = []  # (x0, y0, x1, y1, text)
+                for el in page_layout:
+                    if isinstance(el, (LTTextLine, LTTextLineHorizontal, LTTextBoxHorizontal, LTTextBox)):
+                        try:
+                            x0, y0, x1, y1 = el.bbox
+                            txt = el.get_text()
+                            if txt and txt.strip():
+                                for ln in txt.splitlines():
+                                    s = _clean(ln)
+                                    if s:
+                                        lines.append((x0, y0, x1, y1, s))
+                        except Exception:
+                            continue
 
-            # Split per column
-            left_lines  = [ln for ln in lines if (ln[0]+ln[2])/2.0 <  midx]
-            right_lines = [ln for ln in lines if (ln[0]+ln[2])/2.0 >= midx]
+                # Split per column
+                left_lines  = [ln for ln in lines if (ln[0]+ln[2])/2.0 <  midx]
+                right_lines = [ln for ln in lines if (ln[0]+ln[2])/2.0 >= midx]
 
-            # Sort top→bottom in each column
-            left_lines.sort(key=lambda r: -r[3])
-            right_lines.sort(key=lambda r: -r[3])
+                # Sort top→bottom in each column
+                left_lines.sort(key=lambda r: -r[3])
+                right_lines.sort(key=lambda r: -r[3])
 
-            def harvest_column(col_lines: List[tuple]) -> Dict[str,str]:
-                found = {"axial_length":"", "acd":"", "lt":"", "wtw":"", "cct":"", "k1":"", "k2":"", "ak":""}
+                left_vals  = harvest_column_lines(left_lines)
+                right_vals = harvest_column_lines(right_lines)
 
-                label_map = {
-                    "AL":  "axial_length",
-                    "ACD": "acd",
-                    "LT":  "lt",
-                    "WTW": "wtw",
-                    "CCT": "cct",
-                    "K1":  "k1",
-                    "K2":  "k2",
-                    "AK":  "ak",
-                    "ΔK":  "ak",
-                    "K":   "ak",
-                }
-                label_rows = []
-                for x0,y0,x1,y1,txt in col_lines:
-                    t = txt.upper().rstrip(":")
-                    if t in ("AL","ACD","LT","WTW","CCT","K1","K2","AK","ΔK","K"):
-                        label_rows.append((x0,y0,x1,y1,txt))
-
-                def plaus_mm(v: float, key: str) -> bool:
-                    if key == "axial_length": return 17.0 <= v <= 32.0
-                    if key == "acd":          return 1.5  <= v <= 6.0
-                    if key == "lt":           return 2.0  <= v <= 7.0
-                    if key == "wtw":          return 9.0  <= v <= 15.0
-                    return True
-
-                def to_num(s: str) -> Optional[float]:
-                    try:
-                        s2 = s
-                        for token in [" ", "µ", "μ", "um", "mm", "D", "°"]:
-                            s2 = s2.replace(token, "")
-                        s2 = s2.replace(".", "").replace(",", ".")
-                        return float(s2)
-                    except:
-                        return None
-
-                for lx0,ly0,lx1,ly1,lbl in label_rows:
-                    L = lbl.upper().rstrip(":")
-                    key = label_map.get(L)
-                    if not key:
-                        continue
-                    if L == "K" and any(("K1" in r[4].upper()) or ("K2" in r[4].upper()) for r in col_lines):
-                        continue
-
-                    top = ly1 + 140.0
-                    bot = ly0 - 4.0
-                    cand = []
-
-                    for x0,y0,x1,y1,txt in col_lines:
-                        if y1 <= top and y0 >= bot:
-                            if not (x1 < lx0 - 5 or x0 > lx1 + 5):
-                                if key == "cct":
-                                    m = re.search(rf"({_num_token})\s*(?:[µμ]m|um)\b", txt, flags=re.IGNORECASE)
-                                    if m:
-                                        v = to_num(m.group(1))
-                                        if v is not None and 350 <= v <= 800:
-                                            dist = abs((ly0 + ly1)/2.0 - (y0 + y1)/2.0)
-                                            cand.append((dist, f"{m.group(1)} µm"))
-                                elif key in ("axial_length","acd","lt","wtw"):
-                                    m = re.search(rf"({_num_token})\s*mm\b", txt, flags=re.IGNORECASE)
-                                    if m:
-                                        v = to_num(m.group(1))
-                                        if v is not None and plaus_mm(v, key):
-                                            dist = abs((ly0 + ly1)/2.0 - (y0 + y1)/2.0)
-                                            cand.append((dist, f"{m.group(1)} mm"))
-                                elif key in ("k1","k2","ak"):
-                                    md = re.search(rf"({_num_token})\s*D\b", txt, flags=re.IGNORECASE)
-                                    if md:
-                                        axis = ""
-                                        ma = re.search(r"@\s*(\d{1,3})\s*(?:°|º|o)\b", txt)
-                                        if ma:
-                                            axis = f" @ {ma.group(1)}°"
-                                        dist = abs((ly0 + ly1)/2.0 - (y0 + y1)/2.0)
-                                        cand.append((dist, f"{md.group(1)} D{axis}"))
-
-                    if cand and not found[key]:
-                        cand.sort(key=lambda t: t[0])
-                        found[key] = cand[0][1]
-
-                return found
-
-            left_vals  = harvest_column(left_lines)
-            right_vals = harvest_column(right_lines)
-
-            for k,v in left_vals.items():
-                if v and not out_left[k]:
-                    out_left[k] = v
-            for k,v in right_vals.items():
-                if v and not out_right[k]:
-                    out_right[k] = v
+                for k,v in left_vals.items():
+                    if v and not out_left[k]:
+                        out_left[k] = v
+                for k,v in right_vals.items():
+                    if v and not out_right[k]:
+                        out_right[k] = v
+                        
+                # Early exit if we have complete data
+                if is_complete_data(out_left, out_right):
+                    break
 
     except Exception as e:
-        print(f"coordinate harvest error: {e}")
+        print(f"intelligent coordinate harvest error: {e}")
 
     return {"left": out_left, "right": out_right}
+
+
+def harvest_page_elements(elements: List[tuple]) -> Dict[str, str]:
+    """
+    Harvest measurements from page elements (for single-eye pages)
+    """
+    found = {"axial_length":"", "acd":"", "lt":"", "wtw":"", "cct":"", "k1":"", "k2":"", "ak":""}
+    
+    # Convert elements to lines format for existing harvester
+    lines = []
+    for x0, y0, x1, y1, txt in elements:
+        for ln in txt.splitlines():
+            s = _clean(ln)
+            if s:
+                lines.append((x0, y0, x1, y1, s))
+    
+    lines.sort(key=lambda r: -r[3])  # Sort top to bottom
+    return harvest_column_lines(lines)
+
+
+def harvest_column_lines(col_lines: List[tuple]) -> Dict[str,str]:
+    """
+    Extract measurements from column lines (existing logic)
+    """
+    found = {"axial_length":"", "acd":"", "lt":"", "wtw":"", "cct":"", "k1":"", "k2":"", "ak":""}
+
+    label_map = {
+        "AL":  "axial_length",
+        "ACD": "acd",
+        "LT":  "lt",
+        "WTW": "wtw",
+        "CCT": "cct",
+        "K1":  "k1",
+        "K2":  "k2",
+        "AK":  "ak",
+        "ΔK":  "ak",
+        "K":   "ak",
+    }
+    label_rows = []
+    for x0,y0,x1,y1,txt in col_lines:
+        t = txt.upper().rstrip(":")
+        if t in ("AL","ACD","LT","WTW","CCT","K1","K2","AK","ΔK","K"):
+            label_rows.append((x0,y0,x1,y1,txt))
+
+    def plaus_mm(v: float, key: str) -> bool:
+        if key == "axial_length": return 17.0 <= v <= 32.0
+        if key == "acd":          return 1.5  <= v <= 6.0
+        if key == "lt":           return 2.0  <= v <= 7.0
+        if key == "wtw":          return 9.0  <= v <= 15.0
+        return True
+
+    def to_num(s: str) -> Optional[float]:
+        try:
+            s2 = s
+            for token in [" ", "µ", "μ", "um", "mm", "D", "°"]:
+                s2 = s2.replace(token, "")
+            s2 = s2.replace(".", "").replace(",", ".")
+            return float(s2)
+        except:
+            return None
+
+    for lx0,ly0,lx1,ly1,lbl in label_rows:
+        L = lbl.upper().rstrip(":")
+        key = label_map.get(L)
+        if not key:
+            continue
+        if L == "K" and any(("K1" in r[4].upper()) or ("K2" in r[4].upper()) for r in col_lines):
+            continue
+
+        top = ly1 + 140.0
+        bot = ly0 - 4.0
+        cand = []
+
+        for x0,y0,x1,y1,txt in col_lines:
+            if y1 <= top and y0 >= bot:
+                if not (x1 < lx0 - 5 or x0 > lx1 + 5):
+                    if key == "cct":
+                        m = re.search(rf"({_num_token})\s*(?:[µμ]m|um)\b", txt, flags=re.IGNORECASE)
+                        if m:
+                            v = to_num(m.group(1))
+                            if v is not None and 350 <= v <= 800:
+                                dist = abs((ly0 + ly1)/2.0 - (y0 + y1)/2.0)
+                                cand.append((dist, f"{m.group(1)} µm"))
+                    elif key in ("axial_length","acd","lt","wtw"):
+                        m = re.search(rf"({_num_token})\s*mm\b", txt, flags=re.IGNORECASE)
+                        if m:
+                            v = to_num(m.group(1))
+                            if v is not None and plaus_mm(v, key):
+                                dist = abs((ly0 + ly1)/2.0 - (y0 + y1)/2.0)
+                                cand.append((dist, f"{m.group(1)} mm"))
+                    elif key in ("k1","k2","ak"):
+                        md = re.search(rf"({_num_token})\s*D\b", txt, flags=re.IGNORECASE)
+                        if md:
+                            axis = ""
+                            ma = re.search(r"@\s*(\d{1,3})\s*(?:°|º|o)\b", txt)
+                            if ma:
+                                axis = f" @ {ma.group(1)}°"
+                            dist = abs((ly0 + ly1)/2.0 - (y0 + y1)/2.0)
+                            cand.append((dist, f"{md.group(1)} D{axis}"))
+
+        if cand and not found[key]:
+            cand.sort(key=lambda t: t[0])
+            found[key] = cand[0][1]
+
+    return found
+
+
+def is_complete_data(od_data: Dict, os_data: Dict) -> bool:
+    """
+    Check if we have complete measurement data for both eyes
+    """
+    required_fields = ["axial_length", "cct", "k1", "k2"]
+    
+    od_complete = all(od_data.get(field) for field in required_fields)
+    os_complete = all(os_data.get(field) for field in required_fields)
+    
+    return od_complete and os_complete
 
 
 # =========================
@@ -760,7 +964,7 @@ def llm_extract_cct(context_text: str, model: str) -> Dict[str, Optional[str]]:
 
 
 # =========================
-# Controller
+# INTELLIGENT CONTROLLER - ENHANCED WITH SMART PDF PROCESSING AND LANGUAGE SUPPORT
 # =========================
 def parse_iol(norm_text: str, pdf_bytes: Optional[bytes], source_label: str, want_debug: bool = False):
     def fresh():
@@ -774,16 +978,28 @@ def parse_iol(norm_text: str, pdf_bytes: Optional[bytes], source_label: str, wan
 
     left_txt = right_txt = None
     coord_vals = {"left": {}, "right": {}}
+    pdf_analysis = None
+    
     if pdf_bytes:
         try:
-            cols = pdf_split_left_right(pdf_bytes)
+            # Use intelligent PDF processing with enhanced eye detection
+            cols = intelligent_pdf_split(pdf_bytes)
             left_txt, right_txt = cols.get("left",""), cols.get("right","")
-            coord_vals = coordinate_harvest(pdf_bytes)
-            debug["strategy"] = "pdf_layout_split + coord_harvest + multipage_fix"
+            pdf_analysis = cols.get("analysis", {})
+            
+            # Use intelligent coordinate harvesting
+            coord_vals = intelligent_coordinate_harvest(pdf_bytes)
+            
+            strategy_desc = f"intelligent_pdf_{pdf_analysis.get('strategy', 'unknown')}"
+            debug["strategy"] = strategy_desc
             debug["left_len"] = len(left_txt or "")
             debug["right_len"] = len(right_txt or "")
+            
+            if want_debug:
+                debug["pdf_analysis"] = pdf_analysis
+                
         except Exception as e:
-            print(f"layout/coord split failed: {e}")
+            print(f"intelligent PDF processing failed: {e}")
 
     if left_txt is not None and right_txt is not None:
         left_norm  = localize_pt_to_en(smart_fix_cct_bound(bind_disjoint_scalars(normalize_for_ocr(left_txt))))
@@ -825,20 +1041,28 @@ def parse_iol(norm_text: str, pdf_bytes: Optional[bytes], source_label: str, wan
 
         def looks_od(s: str) -> bool:
             u = s.upper()
-            return bool(re.search(r"\bOD\b|\bO\s*D\b|RIGHT\b", u))
+            return bool(re.search(r"\bOD\b|\bO\s*D\b|RIGHT\b|OOOODDDD|DIREITA", u))
         def looks_os(s: str) -> bool:
             u = s.upper()
-            return bool(re.search(r"\bOS\b|\bO\s*S\b|\bOE\b|\bO\s*E\b|LEFT\b", u))
+            return bool(re.search(r"\bOS\b|\bO\s*S\b|\bOE\b|\bO\s*E\b|LEFT\b|OOOOSSSS|ESQUERDA", u))
 
         left_is_od, left_is_os   = looks_od(left_txt),  looks_os(left_txt)
         right_is_od, right_is_os = looks_od(right_txt), looks_os(right_txt)
 
-        if left_is_od and right_is_os:
-            mapping = {"OD": left_final, "OS": right_final};  debug["mapping"] = "OD<-left, OS<-right (labels)"
+        # Smart eye assignment based on PDF analysis and content
+        if pdf_analysis and pdf_analysis.get('strategy') == 'multi_page_separate_eyes':
+            # For separate eye pages, left=OD, right=OS by design
+            mapping = {"OD": left_final, "OS": right_final}
+            debug["mapping"] = "OD<-left, OS<-right (intelligent multi-page)"
+        elif left_is_od and right_is_os:
+            mapping = {"OD": left_final, "OS": right_final}
+            debug["mapping"] = "OD<-left, OS<-right (labels)"
         elif left_is_os and right_is_od:
-            mapping = {"OD": right_final, "OS": left_final};  debug["mapping"] = "OD<-right, OS<-left (labels)"
+            mapping = {"OD": right_final, "OS": left_final}
+            debug["mapping"] = "OD<-right, OS<-left (labels)"
         else:
-            mapping = {"OD": left_final, "OS": right_final};  debug["mapping"] = "OD<-left, OS<-right (default)"
+            mapping = {"OD": left_final, "OS": right_final}
+            debug["mapping"] = "OD<-left, OS<-right (default)"
 
         for eye in ("OD","OS"):
             for k,v in mapping[eye].items():
@@ -959,7 +1183,7 @@ def health():
     }
     return jsonify({
         "status": "running",
-        "version": "LakeCalc.ai parser v3.11 (coord harvest + strict binder + sanity + rescue + plausibility + LLM optional + ordered + multipage fix)",
+        "version": "LakeCalc.ai parser v3.12 FIXED (intelligent PDF analyzer + enhanced eye detection + language support)",
         "ocr_enabled": bool(vision_client),
         "llm_enabled": bool(llm_on),
         "llm_model": model if llm_on else None,
