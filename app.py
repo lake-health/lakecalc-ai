@@ -419,85 +419,107 @@ def coordinate_harvest(pdf_bytes: bytes) -> Dict[str, Dict[str, str]]:
                     out_right[k] = v
 
     except Exception as e:
-        print(f"coordinate_harvest error: {e}")
+        print(f"coordinate harvest error: {e}")
 
     return {"left": out_left, "right": out_right}
 
 
 # =========================
-# Patterns & parsing helpers (text-based)
+# Eye block parser (regex)
 # =========================
-PATTERNS = {
-    "axial_length": re.compile(rf"(?mi)\bAL\s*:\s*({MM})"),
-    "acd":          re.compile(rf"(?mi)\bACD\s*:\s*({MM})"),
-    "cct":          re.compile(rf"(?mi)\bCCT\s*:\s*({UM})"),
-    "lt":           re.compile(rf"(?mi)\bLT\s*:\s*({MM})"),
-    "wtw":          re.compile(rf"(?mi)\bWTW\s*:\s*({MM})"),
-    "k1":           re.compile(rf"(?mi)\bK1\s*:\s*({DVAL})"),
-    "k2":           re.compile(rf"(?mi)\bK2\s*:\s*({DVAL})"),
-    "ak":           re.compile(rf"(?mi)\b(?:Δ\s*K|AK|K(?!\s*1|\s*2))\s*:\s*({DVAL})"),
-}
-
-def harvest_axis(field_tail: str) -> str:
-    mstop = LABEL_STOP.search(field_tail)
-    seg = field_tail[: mstop.start()] if mstop else field_tail
-    seg = seg[:120]
-    if "@" in seg:
-        after = seg.split("@", 1)[1]
-        digits = re.findall(r"\d", after)
-        axis = "".join(digits)[:3]
-        return f" @ {axis}°" if axis else ""
-    m = re.search(r"(\d{1,3})\s*(?:°|º|o)\b", seg)
-    return f" @ {m.group(1)}°" if m else ""
-
-def parse_eye_block(txt: str) -> dict:
+def parse_eye_block(text: str) -> dict:
     out = {"axial_length":"", "acd":"", "k1":"", "k2":"", "ak":"", "wtw":"", "cct":"", "lt":""}
-    if not txt or not txt.strip():
-        return out
-    for key, pat in PATTERNS.items():
-        for m in pat.finditer(txt):
-            raw = re.sub(r"\s+", " ", m.group(1)).strip()
-            if key in ("k1", "k2", "ak"):
-                raw = re.sub(r"@\s*.*$", "", raw)
-                tail = txt[m.end(1): m.end(1) + 200]
-                raw = (raw + harvest_axis(tail)).strip()
-            if not out[key]:
-                out[key] = raw
+
+    def setv(key: str, val: str):
+        if not out[key] and val:
+            out[key] = val
+
+    # Patterns
+    for m in re.finditer(rf"(?mi)\bAL\s*:\s*({MM})", text):
+        setv("axial_length", m.group(1))
+    for m in re.finditer(rf"(?mi)\bACD\s*:\s*({MM})", text):
+        setv("acd", m.group(1))
+    for m in re.finditer(rf"(?mi)\bLT\s*:\s*({MM})", text):
+        setv("lt", m.group(1))
+    for m in re.finditer(rf"(?mi)\bWTW\s*:\s*({MM})", text):
+        setv("wtw", m.group(1))
+    for m in re.finditer(rf"(?mi)\bCCT\s*:\s*({UM})", text):
+        setv("cct", m.group(1))
+
+    # K1, K2, AK with axis
+    for m in re.finditer(rf"(?mi)\bK1\s*:\s*({DVAL})", text):
+        val = m.group(1)
+        axis_m = re.search(r"@\s*(\d{1,3})\s*(?:°|º|o)\b", val)
+        if axis_m:
+            setv("k1", val)
+        else:
+            # Look for axis in nearby text
+            start, end = m.start(), m.end()
+            window = text[start:end+100]
+            axis_m = re.search(r"@\s*(\d{1,3})\s*(?:°|º|o)\b", window)
+            if axis_m:
+                setv("k1", f"{val} @ {axis_m.group(1)}°")
+            else:
+                setv("k1", val)
+
+    for m in re.finditer(rf"(?mi)\bK2\s*:\s*({DVAL})", text):
+        val = m.group(1)
+        axis_m = re.search(r"@\s*(\d{1,3})\s*(?:°|º|o)\b", val)
+        if axis_m:
+            setv("k2", val)
+        else:
+            start, end = m.start(), m.end()
+            window = text[start:end+100]
+            axis_m = re.search(r"@\s*(\d{1,3})\s*(?:°|º|o)\b", window)
+            if axis_m:
+                setv("k2", f"{val} @ {axis_m.group(1)}°")
+            else:
+                setv("k2", val)
+
+    for m in re.finditer(rf"(?mi)\b(?:AK|ΔK|K(?!\s*[12]))\s*:\s*({DVAL})", text):
+        val = m.group(1)
+        axis_m = re.search(r"@\s*(\d{1,3})\s*(?:°|º|o)\b", val)
+        if axis_m:
+            setv("ak", val)
+        else:
+            start, end = m.start(), m.end()
+            window = text[start:end+100]
+            axis_m = re.search(r"@\s*(\d{1,3})\s*(?:°|º|o)\b", window)
+            if axis_m:
+                setv("ak", f"{val} @ {axis_m.group(1)}°")
+            else:
+                setv("ak", val)
+
     return out
 
-def has_measurements(d: dict) -> bool:
-    return any(d.values())
-
 
 # =========================
-# Rescue harvester (tolerant)
+# Rescue harvest (loose patterns)
 # =========================
-RESCUE = {
-    "axial_length": re.compile(r"(?mi)\bAL\s*[:=]?\s*(-?\d[\d.,]*)\s*mm\b"),
-    "acd":          re.compile(r"(?mi)\bACD\s*[:=]?\s*(-?\d[\d.,]*)\s*mm\b"),
-    "lt":           re.compile(r"(?mi)\bLT\s*[:=]?\s*(-?\d[\d.,]*)\s*mm\b"),
-    "wtw":          re.compile(r"(?mi)\bWTW\s*[:=]?\s*(-?\d[\d.,]*)\s*mm\b"),
-    "cct":          re.compile(r"(?mi)\bCCT\s*[:=]?\s*(?:(-?\d[\d.,]*)\s*(?:[µμ]m|um)|(?:[µμ]m|um)\s*\n\s*(-?\d[\d.,]*))"),
-    "k1":           re.compile(r"(?mi)\bK1\s*[:=]?\s*(-?\d[\d.,]*)\s*D(?:.*?@\s*(\d{1,3}))?"),
-    "k2":           re.compile(r"(?mi)\bK2\s*[:=]?\s*(-?\d[\d.,]*)\s*D(?:.*?@\s*(\d{1,3}))?"),
-    "ak":           re.compile(r"(?mi)\b(?:Δ\s*K|AK|K(?!\s*1|\s*2))\s*[:=]?\s*(-?\d[\d.,]*)\s*D(?:.*?@\s*(\d{1,3}))?")
-}
-
 def rescue_harvest(raw_text: str) -> dict:
-    out = {}
-    def setv(k, v):
-        if v and k not in out:
-            out[k] = v.strip()
+    out = {"axial_length":"", "acd":"", "k1":"", "k2":"", "ak":"", "wtw":"", "cct":"", "lt":""}
 
-    for k in ("axial_length", "acd", "lt", "wtw"):
+    def setv(key: str, val: str):
+        if not out[key] and val:
+            out[key] = val
+
+    # Rescue patterns
+    RESCUE = {
+        "axial_length": re.compile(rf"(?mi)({_num_token})\s*mm.*?(?:axial|AL)", re.IGNORECASE),
+        "acd": re.compile(rf"(?mi)({_num_token})\s*mm.*?(?:ACD)", re.IGNORECASE),
+        "lt": re.compile(rf"(?mi)({_num_token})\s*mm.*?(?:LT)", re.IGNORECASE),
+        "wtw": re.compile(rf"(?mi)({_num_token})\s*mm.*?(?:WTW)", re.IGNORECASE),
+        "cct": re.compile(rf"(?mi)({_num_token})\s*(?:[µμ]m|um).*?(?:CCT)", re.IGNORECASE),
+        "k1": re.compile(rf"(?mi)({_num_token})\s*D.*?@\s*(\d{{1,3}})\s*(?:°|º|o).*?K1", re.IGNORECASE),
+        "k2": re.compile(rf"(?mi)({_num_token})\s*D.*?@\s*(\d{{1,3}})\s*(?:°|º|o).*?K2", re.IGNORECASE),
+        "ak": re.compile(rf"(?mi)({_num_token})\s*D.*?@\s*(\d{{1,3}})\s*(?:°|º|o).*?(?:AK|ΔK)", re.IGNORECASE),
+    }
+
+    for k in ("axial_length", "acd", "lt", "wtw", "cct"):
         m = RESCUE[k].search(raw_text)
         if m:
-            setv(k, f"{m.group(1)} mm")
-
-    m = RESCUE["cct"].search(raw_text)
-    if m:
-        num = m.group(1) or m.group(2)
-        if num: setv("cct", f"{num} µm")
+            unit = "µm" if k == "cct" else "mm"
+            setv(k, f"{m.group(1)} {unit}")
 
     for k in ("k1", "k2", "ak"):
         m = RESCUE[k].search(raw_text)
@@ -821,6 +843,7 @@ def parse_iol(norm_text: str, pdf_bytes: Optional[bytes], source_label: str, wan
         if qp_llm == "0":
             enabled = False
         if enabled and (not result["OD"].get("cct") or not result["OS"].get("cct")):
+            print(f"[DEBUG] Calling LLM for missing CCT - OD: '{result['OD'].get('cct')}', OS: '{result['OS'].get('cct')}'")
             # Build context with both normalized columns; the model will detect OD/OS/LEFT/RIGHT cues.
             ctx = (
                 "=== LEFT COLUMN (may contain LEFT/OS or RIGHT/OD cues) ===\n"
@@ -829,11 +852,14 @@ def parse_iol(norm_text: str, pdf_bytes: Optional[bytes], source_label: str, wan
                 + (right_norm or "") + "\n"
             )
             llm_out = llm_extract_cct(ctx, model or "gpt-4o-mini")
+            print(f"[DEBUG] LLM returned: {llm_out}")
             # Only fill if still missing and value present from LLM
             if not result["OD"].get("cct") and llm_out.get("OD"):
                 result["OD"]["cct"] = llm_out["OD"]
+                print(f"[DEBUG] Set OD CCT from LLM: {llm_out['OD']}")
             if not result["OS"].get("cct") and llm_out.get("OS"):
                 result["OS"]["cct"] = llm_out["OS"]
+                print(f"[DEBUG] Set OS CCT from LLM: {llm_out['OS']}")
 
         # Enforce output order
         result["OD"] = enforce_field_order(result["OD"])
@@ -853,9 +879,12 @@ def parse_iol(norm_text: str, pdf_bytes: Optional[bytes], source_label: str, wan
     if qp_llm == "0":
         enabled = False
     if enabled and not result["OD"].get("cct"):
+        print(f"[DEBUG] Calling LLM for missing OD CCT - OD: '{result['OD'].get('cct')}'")
         llm_out = llm_extract_cct(single, model or "gpt-4o-mini")
+        print(f"[DEBUG] LLM returned: {llm_out}")
         if llm_out.get("OD"):
             result["OD"]["cct"] = llm_out["OD"]
+            print(f"[DEBUG] Set OD CCT from LLM: {llm_out['OD']}")
 
     result["OD"] = enforce_field_order(result["OD"])
     result["OS"] = enforce_field_order(result["OS"])
@@ -937,11 +966,25 @@ def parse_file():
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
 
 @app.route("/")
-def root():
-    return render_template("index.html")
+def index():
+    try:
+        return render_template("index.html")
+    except Exception:
+        return """
+        <html>
+          <body style="font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;">
+            <h2>/api/parse-file tester</h2>
+            <form action="/api/parse-file" method="post" enctype="multipart/form-data">
+              <input type="file" name="file" />
+              <button type="submit">Upload & Parse</button>
+            </form>
+            <p>Health: <a href="/api/health">/api/health</a></p>
+          </body>
+        </html>
+        """
 
 @app.route("/<path:path>")
-def fallback(path):
+def serve_fallback(path):
     try:
         return render_template("index.html")
     except Exception:
@@ -949,4 +992,5 @@ def fallback(path):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, debug=False)
+
