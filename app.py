@@ -1,11 +1,14 @@
-# app.py — LakeCalc.ai parser v3.8
-# v3.7 + coordinate-based harvesting (per-column) to rescue missing CCT in OS
-# layout split + strict binder (+CCT special) + CCT sanity (fwd/back)
-# + rescue + reconcile + plausibility re-score + PT→EN (clues only)
-# + µ/μ + ΔK/AK/K + ordered + safe PDF extract + coord harvester
+# app.py — LakeCalc.ai parser v3.11
+# v3.10 + per-page column detection + front-page-first strategy
+# Keeps original flow: normalize → strict binder (CCT special) → sanity → parse → rescue → plausibility → order
+# Adds:
+#   - page counting
+#   - page-wise 1/2-column classifier
+#   - per-page text harvest (left/right)
+#   - early-stop when both eyes are sufficiently populated from first pages
 
-import os, io, re
-from collections import OrderedDict
+import os, io, re, math
+from collections import OrderedDict, defaultdict
 from io import BytesIO
 from typing import Optional, Tuple, List, Dict
 
@@ -14,16 +17,14 @@ from flask import Flask, request, jsonify, render_template
 # PDF text & geometry
 from pdfminer.high_level import extract_text as pdfminer_extract_text, extract_pages
 from pdfminer.layout import (
-    LTTextBox, LTTextBoxHorizontal, LTTextLine, LTTextLineHorizontal, LAParams, LTChar
+    LTTextBox, LTTextBoxHorizontal, LTTextLine, LTTextLineHorizontal, LAParams
 )
 
 # OCR fallback
 from google.cloud import vision
 from pdf2image import convert_from_bytes
 
-
 app = Flask(__name__, static_folder='static', template_folder='templates')
-
 
 # =========================
 # Google Vision (OCR)
@@ -44,6 +45,21 @@ try:
 except Exception as e:
     print(f"Vision init error: {e}")
 
+# =========================
+# Utils
+# =========================
+def _clean_spaces(s: str) -> str:
+    return re.sub(r"[ \t]+", " ", s or "").strip()
+
+def _num(s: str) -> Optional[float]:
+    try:
+        s2 = s
+        for token in [" ", "µ", "μ", "um", "mm", "D", "°"]:
+            s2 = s2.replace(token, "")
+        s2 = s2.replace(".", "").replace(",", ".")
+        return float(s2)
+    except:
+        return None
 
 # =========================
 # Safe PDF text extraction
@@ -57,9 +73,8 @@ def extract_pdf_text_safe(file_bytes: bytes) -> str:
         print(f"[WARN] pdfminer failed: {e}")
         return ""
 
-
 # =========================
-# Text extraction (PDF-first, OCR fallback)
+# OCR helpers
 # =========================
 def ocr_pdf_to_text(pdf_bytes: bytes) -> str:
     if not vision_client:
@@ -75,7 +90,6 @@ def ocr_pdf_to_text(pdf_bytes: bytes) -> str:
         pages_txt.append(resp.text_annotations[0].description if resp.text_annotations else "")
     return "\n\n--- Page ---\n\n".join(pages_txt).strip()
 
-
 def ocr_image_to_text(image_bytes: bytes) -> str:
     if not vision_client:
         raise RuntimeError("Vision client not initialized; cannot OCR image.")
@@ -84,7 +98,6 @@ def ocr_image_to_text(image_bytes: bytes) -> str:
     if resp.error.message:
         raise RuntimeError(f"Vision API Error: {resp.error.message}")
     return (resp.text_annotations[0].description if resp.text_annotations else "").strip()
-
 
 def get_text_from_upload(fs, force_mode: Optional[str] = None) -> Tuple[str, str, Optional[bytes]]:
     name = (fs.filename or "").lower()
@@ -107,7 +120,6 @@ def get_text_from_upload(fs, force_mode: Optional[str] = None) -> Tuple[str, str
         return ocr_image_to_text(file_bytes), "ocr_image", None
     return "", "unknown", None
 
-
 # =========================
 # Normalization (OCR/PDF quirks)
 # =========================
@@ -126,7 +138,6 @@ def normalize_for_ocr(text: str) -> str:
     t = re.sub(r"(?:[°ºo])\s*(?:\r?\n|\s)*?(\d{1,3})\b", r" \1°", t)
     t = re.sub(r"[ \t]+", " ", t)
     return t
-
 
 # =========================
 # Strict binder (CCT special)
@@ -184,7 +195,6 @@ def bind_disjoint_scalars(text: str) -> str:
     t = patch_label(t, "WTW", "mm")
     return t
 
-
 # =========================
 # CCT sanity (fwd/back)
 # =========================
@@ -217,7 +227,6 @@ def smart_fix_cct_bound(text_with_bindings: str) -> str:
 
     return re.sub(r"(?mi)\bCCT\s*:\s*([-\d.,]+)\s*(?:[µμ]m|um)\b", replace, text_with_bindings)
 
-
 # =========================
 # PT→EN (clues only)
 # =========================
@@ -233,47 +242,8 @@ def localize_pt_to_en(text: str) -> str:
         t = re.sub(pat, repl, t, flags=re.IGNORECASE)
     return t
 
-
 # =========================
-# PDF layout split (text)
-# =========================
-def pdf_split_left_right(pdf_bytes: bytes) -> dict:
-    left_chunks, right_chunks = [], []
-    laparams = LAParams(all_texts=True)
-    try:
-        for page_layout in extract_pages(BytesIO(pdf_bytes), laparams=laparams):
-            page_width = getattr(page_layout, "width", None)
-            if page_width is None:
-                xs = []
-                for el in page_layout:
-                    if hasattr(el, "bbox"):
-                        xs += [el.bbox[0], el.bbox[2]]
-                page_width = max(xs) if xs else 1000.0
-            midx = page_width / 2.0
-
-            blobs = []
-            for el in page_layout:
-                if isinstance(el, (LTTextBox, LTTextBoxHorizontal, LTTextLine, LTTextLineHorizontal)):
-                    x0, y0, x1, y1 = el.bbox
-                    x_center = (x0 + x1) / 2.0
-                    txt = el.get_text()
-                    if not txt or not txt.strip():
-                        continue
-                    blobs.append((y1, txt, x_center < midx))
-
-            blobs.sort(key=lambda t: -t[0])
-            left_txt = "".join([b[1] for b in blobs if b[2]])
-            right_txt = "".join([b[1] for b in blobs if not b[2]])
-            left_chunks.append(left_txt)
-            right_chunks.append(right_txt)
-    except Exception as e:
-        print(f"pdf layout split error: {e}")
-
-    return {"left": "\n".join(left_chunks).strip(), "right": "\n".join(right_chunks).strip()}
-
-
-# =========================
-# Coordinate-based harvester (per column)
+# Patterns & parsing helpers (text-based)
 # =========================
 _num_token = r"-?\d[\d.,]*"
 MM = r"-?\d[\d.,]*\s*mm"
@@ -281,163 +251,6 @@ UM = r"-?\d[\d.,]*\s*(?:[µμ]m|um)"
 DVAL = r"-?\d[\d.,]*\s*D"
 LABEL_STOP = re.compile(r"(?:\r?\n|(?=(?:AL|ACD|CCT|LT|WTW|K1|K2|K|AK|ΔK)\s*:))", re.IGNORECASE)
 
-def _clean(s: str) -> str:
-    return re.sub(r"[ \t]+", " ", (s or "")).strip()
-
-def coordinate_harvest(pdf_bytes: bytes) -> Dict[str, Dict[str, str]]:
-    """
-    Harvest scalars by PDF coordinates per column:
-      - Find label lines (AL/ACD/LT/WTW/CCT, K1/K2/AK)
-      - Search a vertical window *above* each label within same column for number+unit
-      - Use plausibility ranges for tie-breaks (esp. CCT 400–700 µm)
-    Returns: {"left": {...fields...}, "right": {...fields...}}
-    """
-    out_left = {"axial_length":"", "acd":"", "lt":"", "wtw":"", "cct":"", "k1":"", "k2":"", "ak":""}
-    out_right = {"axial_length":"", "acd":"", "lt":"", "wtw":"", "cct":"", "k1":"", "k2":"", "ak":""}
-
-    laparams = LAParams(all_texts=True)
-    try:
-        for page_layout in extract_pages(BytesIO(pdf_bytes), laparams=laparams):
-            width = getattr(page_layout, "width", 1000.0)
-            midx = width / 2.0
-
-            # Collect lines with positions
-            lines: List[tuple] = []  # (x0, y0, x1, y1, text)
-            for el in page_layout:
-                if isinstance(el, (LTTextLine, LTTextLineHorizontal, LTTextBoxHorizontal, LTTextBox)):
-                    try:
-                        x0, y0, x1, y1 = el.bbox
-                        txt = el.get_text()
-                        if txt and txt.strip():
-                            for ln in txt.splitlines():
-                                s = _clean(ln)
-                                if s:
-                                    lines.append((x0, y0, x1, y1, s))
-                    except Exception:
-                        continue
-
-            # Split per column
-            left_lines  = [ln for ln in lines if (ln[0]+ln[2])/2.0 <  midx]
-            right_lines = [ln for ln in lines if (ln[0]+ln[2])/2.0 >= midx]
-
-            # Sort top→bottom in each column
-            left_lines.sort(key=lambda r: -r[3])
-            right_lines.sort(key=lambda r: -r[3])
-
-            def harvest_column(col_lines: List[tuple]) -> Dict[str,str]:
-                found = {"axial_length":"", "acd":"", "lt":"", "wtw":"", "cct":"", "k1":"", "k2":"", "ak":""}
-
-                # Build quick search helpers
-                label_map = {
-                    "AL":  "axial_length",
-                    "ACD": "acd",
-                    "LT":  "lt",
-                    "WTW": "wtw",
-                    "CCT": "cct",
-                    "K1":  "k1",
-                    "K2":  "k2",
-                    "AK":  "ak",
-                    "ΔK":  "ak",
-                    "K":   "ak",  # later we will ignore K1/K2 for this
-                }
-                # Capture label rows (text exactly the label or "LABEL:")
-                label_rows = []
-                for x0,y0,x1,y1,txt in col_lines:
-                    t = txt.upper().rstrip(":")
-                    if t in ("AL","ACD","LT","WTW","CCT","K1","K2","AK","ΔK","K"):
-                        label_rows.append((x0,y0,x1,y1,txt))
-
-                # For each label row, look upward within ~120 pts for value+unit in the same column box
-                def plaus_mm(v: float, key: str) -> bool:
-                    if key == "axial_length": return 17.0 <= v <= 32.0
-                    if key == "acd":          return 1.5  <= v <= 6.0
-                    if key == "lt":           return 2.0  <= v <= 7.0
-                    if key == "wtw":          return 9.0  <= v <= 15.0
-                    return True
-
-                def to_num(s: str) -> Optional[float]:
-                    try:
-                        s2 = s
-                        for token in [" ", "µ", "μ", "um", "mm", "D", "°"]:
-                            s2 = s2.replace(token, "")
-                        s2 = s2.replace(".", "").replace(",", ".")
-                        return float(s2)
-                    except:
-                        return None
-
-                # index lines by y to search above efficiently
-                for lx0,ly0,lx1,ly1,lbl in label_rows:
-                    L = lbl.upper().rstrip(":")
-                    key = label_map.get(L)
-                    if not key: 
-                        continue
-
-                    # Skip K if it's actually K1 or K2; we handle AK as cylinder
-                    if L == "K" and any("K1" in r[4].upper() or "K2" in r[4].upper() for r in col_lines):
-                        continue
-
-                    # search window: from label baseline up by ~140 points
-                    top = ly1 + 140.0
-                    bot = ly0 - 4.0  # include same line slight overlap
-                    cand = []
-
-                    for x0,y0,x1,y1,txt in col_lines:
-                        if y1 <= top and y0 >= bot:
-                            # same column region horizontally (loose overlap with label box)
-                            if not (x1 < lx0 - 5 or x0 > lx1 + 5):
-                                # collect candidates by unit
-                                if key == "cct":
-                                    # µm only
-                                    m = re.search(rf"({_num_token})\s*(?:[µμ]m|um)\b", txt, flags=re.IGNORECASE)
-                                    if m:
-                                        v = to_num(m.group(1))
-                                        if v is not None and 350 <= v <= 800:
-                                            dist = abs((ly0 + ly1)/2.0 - (y0 + y1)/2.0)
-                                            cand.append((dist, f"{m.group(1)} µm"))
-                                elif key in ("axial_length","acd","lt","wtw"):
-                                    m = re.search(rf"({_num_token})\s*mm\b", txt, flags=re.IGNORECASE)
-                                    if m:
-                                        v = to_num(m.group(1))
-                                        if v is not None and plaus_mm(v, key):
-                                            dist = abs((ly0 + ly1)/2.0 - (y0 + y1)/2.0)
-                                            cand.append((dist, f"{m.group(1)} mm"))
-                                elif key in ("k1","k2","ak"):
-                                    # diopters possibly with axis nearby on same line
-                                    md = re.search(rf"({_num_token})\s*D\b", txt, flags=re.IGNORECASE)
-                                    if md:
-                                        axis = ""
-                                        ma = re.search(r"@\s*(\d{1,3})\s*(?:°|º|o)\b", txt)
-                                        if ma:
-                                            axis = f" @ {ma.group(1)}°"
-                                        dist = abs((ly0 + ly1)/2.0 - (y0 + y1)/2.0)
-                                        cand.append((dist, f"{md.group(1)} D{axis}"))
-
-                    if cand and not found[key]:
-                        cand.sort(key=lambda t: t[0])
-                        found[key] = cand[0][1]
-
-                return found
-
-            left_vals  = harvest_column(left_lines)
-            right_vals = harvest_column(right_lines)
-
-            # Merge with page results (if multiple pages, first non-empty wins)
-            for k,v in left_vals.items():
-                if v and not out_left[k]:
-                    out_left[k] = v
-            for k,v in right_vals.items():
-                if v and not out_right[k]:
-                    out_right[k] = v
-
-    except Exception as e:
-        print(f"coordinate_harvest error: {e}")
-
-    return {"left": out_left, "right": out_right}
-
-
-# =========================
-# Patterns & parsing helpers (text-based)
-# =========================
 PATTERNS = {
     "axial_length": re.compile(rf"(?mi)\bAL\s*:\s*({MM})"),
     "acd":          re.compile(rf"(?mi)\bACD\s*:\s*({MM})"),
@@ -476,12 +289,8 @@ def parse_eye_block(txt: str) -> dict:
                 out[key] = raw
     return out
 
-def has_measurements(d: dict) -> bool:
-    return any(d.values())
-
-
 # =========================
-# Rescue harvester (tolerant)
+# Rescue (tolerant)
 # =========================
 RESCUE = {
     "axial_length": re.compile(r"(?mi)\bAL\s*[:=]?\s*(-?\d[\d.,]*)\s*mm\b"),
@@ -521,7 +330,6 @@ def rescue_harvest(raw_text: str) -> dict:
 
     return out
 
-
 # =========================
 # Reconcile
 # =========================
@@ -537,7 +345,6 @@ def reconcile(base: dict, binder: dict | None, rescue: dict | None) -> dict:
                 res[k] = v
     return res
 
-
 # =========================
 # Plausibility re-score (final safety net)
 # =========================
@@ -547,21 +354,8 @@ PLAUSIBLE = {
     "lt":           lambda x: 2.0  <= x <= 7.0,
     "wtw":          lambda x: 9.0  <= x <= 15.0,
     "cct_um":       lambda x: 350  <= x <= 800,
-    "k_diopters":   lambda x: 30.0 <= x <= 55.0,
-    "cyl_diopters": lambda x: 0.0  <= x <= 10.0,
-    "axis_deg":     lambda x: 0    <= x <= 180,
 }
 NOISE_LABELS = re.compile(r"(?mi)\b(?:CVD|SD|WTW|P|TK1|TK2|TSE|B-Scan|Fixação)\b")
-
-def _num(s: str) -> Optional[float]:
-    try:
-        s2 = s
-        for token in [" ", "µ", "μ", "um", "mm", "D", "°"]:
-            s2 = s2.replace(token, "")
-        s2 = s2.replace(".", "").replace(",", ".")
-        return float(s2)
-    except:
-        return None
 
 def _score_candidate(label: str, value_str: str, ctx: str, unit_kind: str) -> float:
     vlow = value_str.lower()
@@ -634,7 +428,6 @@ def plausibility_rescore(eye_text: str, data: dict) -> dict:
 
     return out
 
-
 # =========================
 # Detect device & ordering
 # =========================
@@ -650,124 +443,260 @@ FIELD_ORDER = ["source", "axial_length", "acd", "k1", "k2", "ak", "wtw", "cct", 
 def enforce_field_order(eye_dict: dict) -> OrderedDict:
     return OrderedDict((k, eye_dict.get(k, "")) for k in FIELD_ORDER)
 
+# =========================
+# Per-page column detection & harvest
+# =========================
+def classify_columns_for_page(page_layout) -> str:
+    """
+    Heuristic: build a histogram of text line center-x; if we see two clusters
+    with a big gap between them (and both are populous), call it 'double' else 'single'.
+    """
+    centers = []
+    xs = []
+    for el in page_layout:
+        if isinstance(el, (LTTextLine, LTTextLineHorizontal, LTTextBox, LTTextBoxHorizontal)):
+            x0, y0, x1, y1 = el.bbox
+            centers.append((x0+x1)/2.0)
+            xs += [x0, x1]
+    if not centers:
+        return "single"
+    page_width = max(xs) if xs else 1000.0
+    # simple 2-bin split at midx
+    midx = page_width/2.0
+    left_count = sum(1 for c in centers if c < midx*0.98)
+    right_count = sum(1 for c in centers if c > midx*1.02)  # small dead zone
+    # also check gap density near mid
+    near_mid = sum(1 for c in centers if abs(c - midx) < 25)
+    if left_count > 8 and right_count > 8 and near_mid < 0.25*(left_count+right_count):
+        return "double"
+    return "single"
+
+def harvest_page_texts(pdf_bytes: bytes) -> Dict[int, Dict[str, str]]:
+    """
+    Return per-page dict:
+      page_map[p] = {"mode": "single"|"double", "left": "...", "right": "...", "full": "..."}
+    """
+    laparams = LAParams(all_texts=True)
+    out = {}
+    try:
+        for pnum, page_layout in enumerate(extract_pages(BytesIO(pdf_bytes), laparams=laparams), start=1):
+            mode = classify_columns_for_page(page_layout)
+            # gather lines with bbox
+            lines = []
+            xs = []
+            for el in page_layout:
+                if isinstance(el, (LTTextLine, LTTextLineHorizontal, LTTextBox, LTTextBoxHorizontal)):
+                    x0, y0, x1, y1 = el.bbox
+                    txt = el.get_text()
+                    if txt and txt.strip():
+                        for ln in txt.splitlines():
+                            s = _clean_spaces(ln)
+                            if s:
+                                lines.append((x0, y0, x1, y1, s))
+                    xs += [x0, x1]
+            page_width = max(xs) if xs else 1000.0
+            midx = page_width/2.0
+            # order by top→bottom
+            lines.sort(key=lambda r: -r[3])
+            if mode == "single":
+                full = "\n".join([t[4] for t in lines])
+                out[pnum] = {"mode":"single", "left":"", "right":"", "full":full}
+            else:
+                left_lines = [t for t in lines if (t[0]+t[2])/2.0 < midx]
+                right_lines = [t for t in lines if (t[0]+t[2])/2.0 >= midx]
+                left_txt = "\n".join([t[4] for t in left_lines])
+                right_txt = "\n".join([t[4] for t in right_lines])
+                out[pnum] = {"mode":"double", "left":left_txt, "right":right_txt, "full":""}
+    except Exception as e:
+        print(f"[WARN] harvest_page_texts: {e}")
+    return out
+
+# =========================
+# Front-page-first orchestration
+# =========================
+def enough_fields(d: dict) -> bool:
+    """Define what 'good enough' means to stop early (tune as needed)."""
+    have = 0
+    for k in ("axial_length","acd","k1","k2","wtw","cct","lt","ak"):
+        if d.get(k): have += 1
+    return have >= 5  # threshold
+
+def parse_eye_block_ordered(txt: str) -> dict:
+    parsed = parse_eye_block(txt)
+    return OrderedDict((k, parsed.get(k, "")) for k in ["axial_length","acd","k1","k2","ak","wtw","cct","lt"])
+
+def scalars_from_bound(nrm: str) -> dict:
+    d = {}
+    for lab, key in [("AL","axial_length"), ("ACD","acd"), ("LT","lt"), ("WTW","wtw"), ("CCT","cct")]:
+        m = re.search(rf"(?mi)\b{lab}\s*:\s*(-?\d[\d.,]*)\s*(?:mm|[µμ]m|um)\b", nrm)
+        if m:
+            unit = "µm" if lab == "CCT" else "mm"
+            d[key] = f"{m.group(1)} {unit}"
+    return d
+
+def process_eye_text(raw: str) -> dict:
+    nrm = localize_pt_to_en(smart_fix_cct_bound(bind_disjoint_scalars(normalize_for_ocr(raw))))
+    base   = parse_eye_block_ordered(nrm)
+    bound  = scalars_from_bound(nrm)
+    rescue = rescue_harvest(nrm)
+    merged = reconcile(base, bound, rescue)
+    final  = plausibility_rescore(nrm, merged)
+    return final
+
+def map_eyes_by_clues(left_txt: str, right_txt: str) -> Tuple[str, str]:
+    def looks_od(s: str) -> bool:
+        u = (s or "").upper()
+        return bool(re.search(r"\bOD\b|\bO\s*D\b|RIGHT\b", u))
+    def looks_os(s: str) -> bool:
+        u = (s or "").upper()
+        return bool(re.search(r"\bOS\b|\bO\s*S\b|\bOE\b|\bO\s*E\b|LEFT\b", u))
+    left_is_od, left_is_os   = looks_od(left_txt),  looks_os(left_txt)
+    right_is_od, right_is_os = looks_od(right_txt), looks_os(right_txt)
+    if left_is_od and right_is_os:
+        return "left->OD,right->OS"
+    if left_is_os and right_is_od:
+        return "left->OS,right->OD"
+    # default to left->OD, right->OS
+    return "left->OD,right->OS"
+
+def parse_across_pages(pdf_bytes: bytes, source_label: str, want_debug: bool=False):
+    page_map = harvest_page_texts(pdf_bytes)
+    pages = sorted(page_map.keys())
+    debug = {
+        "page_count": len(pages),
+        "page_modes": {p: page_map[p]["mode"] for p in pages},
+        "early_stop": False,
+        "strategy": "per-page harvest + front-page-first",
+        "mapping": "",
+    }
+
+    # Accumulators
+    OD = OrderedDict([("source", source_label), ("axial_length",""),("acd",""),("k1",""),("k2",""),("ak",""),("wtw",""),("cct",""),("lt","")])
+    OS = OrderedDict([("source", source_label), ("axial_length",""),("acd",""),("k1",""),("k2",""),("ak",""),("wtw",""),("cct",""),("lt","")])
+
+    # Phase 1: first two pages preferred
+    preferred = [p for p in pages if p <= 2]
+    if not preferred:
+        preferred = pages[:2]
+
+    def merge_if_empty(dst: OrderedDict, src: dict):
+        for k, v in src.items():
+            if k == "source": continue
+            if v and not dst.get(k):
+                dst[k] = v
+
+    # pass 1: preferred pages
+    for p in preferred:
+        pm = page_map[p]
+        if pm["mode"] == "single":
+            full = pm["full"]
+            # Heuristic: single column pages are often headers/summary; run once and try to detect OD/OS by clues
+            parsed_full = process_eye_text(full)
+            # We don't know side, so only merge safe fields that clearly look like global scalars? We'll be conservative:
+            # In practice these pages often have either OD or OS label inside; try mapping via clues chunking.
+            # Split by OD/OS markers roughly:
+            blocks = re.split(r"(?mi)\b(OD|OS|RIGHT|LEFT)\b", full)
+            if len(blocks) >= 3:
+                # Reconstruct simple pairs: [text_before, LABEL, block_after, LABEL, block_after, ...]
+                for i in range(1, len(blocks), 2):
+                    lab = blocks[i].upper()
+                    blk = blocks[i+1] if i+1 < len(blocks) else ""
+                    parsed_blk = process_eye_text(blk)
+                    if lab in ("OD","RIGHT"):
+                        merge_if_empty(OD, parsed_blk)
+                    elif lab in ("OS","LEFT"):
+                        merge_if_empty(OS, parsed_blk)
+            else:
+                # If we cannot split, do nothing on single page pass here.
+                pass
+        else:
+            left_txt, right_txt = pm["left"], pm["right"]
+            # Decide mapping
+            mapping = map_eyes_by_clues(left_txt, right_txt)
+            debug["mapping"] = mapping or debug["mapping"]
+            if mapping == "left->OS,right->OD":
+                left_dst, right_dst = OS, OD
+            else:  # default left->OD,right->OS
+                left_dst, right_dst = OD, OS
+            left_parsed  = process_eye_text(left_txt)
+            right_parsed = process_eye_text(right_txt)
+            merge_if_empty(left_dst,  left_parsed)
+            merge_if_empty(right_dst, right_parsed)
+
+        if enough_fields(OD) and enough_fields(OS):
+            debug["early_stop"] = True
+            break
+
+    # Phase 2: if still incomplete, scan remaining pages
+    if not (enough_fields(OD) and enough_fields(OS)):
+        for p in pages:
+            if p in preferred: 
+                continue
+            pm = page_map[p]
+            if pm["mode"] == "single":
+                full = pm["full"]
+                # Same conservative logic as above
+                blocks = re.split(r"(?mi)\b(OD|OS|RIGHT|LEFT)\b", full)
+                if len(blocks) >= 3:
+                    for i in range(1, len(blocks), 2):
+                        lab = blocks[i].upper()
+                        blk = blocks[i+1] if i+1 < len(blocks) else ""
+                        parsed_blk = process_eye_text(blk)
+                        if lab in ("OD","RIGHT"):
+                            merge_if_empty(OD, parsed_blk)
+                        elif lab in ("OS","LEFT"):
+                            merge_if_empty(OS, parsed_blk)
+            else:
+                left_txt, right_txt = pm["left"], pm["right"]
+                mapping = map_eyes_by_clues(left_txt, right_txt)
+                debug["mapping"] = mapping or debug["mapping"]
+                if mapping == "left->OS,right->OD":
+                    left_dst, right_dst = OS, OD
+                else:
+                    left_dst, right_dst = OD, OS
+                left_parsed  = process_eye_text(left_txt)
+                right_parsed = process_eye_text(right_txt)
+                merge_if_empty(left_dst,  left_parsed)
+                merge_if_empty(right_dst, right_parsed)
+
+            if enough_fields(OD) and enough_fields(OS):
+                debug["early_stop"] = True
+                break
+
+    return {
+        "OD": enforce_field_order(OD),
+        "OS": enforce_field_order(OS),
+    }, debug
 
 # =========================
 # Controller
 # =========================
 def parse_iol(norm_text: str, pdf_bytes: Optional[bytes], source_label: str, want_debug: bool = False):
+    # If we have the PDF bytes, prefer structured per-page pipeline
+    if pdf_bytes:
+        try:
+            structured, dbg = parse_across_pages(pdf_bytes, source_label, want_debug)
+            if want_debug:
+                return structured, dbg
+            return structured
+        except Exception as e:
+            print(f"[WARN] parse_across_pages failed: {e}")
+
+    # Fallback: single-block to OD (legacy)
     def fresh():
         return OrderedDict(
             [("source", source_label), ("axial_length",""), ("acd",""), ("k1",""), ("k2",""),
              ("ak",""), ("wtw",""), ("cct",""), ("lt","")]
         )
-
     result = {"OD": fresh(), "OS": fresh()}
-    debug = {"strategy":"", "left_len":0, "right_len":0, "left_preview":"", "right_preview":"", "mapping":""}
-
-    left_txt = right_txt = None
-    coord_vals = {"left": {}, "right": {}}
-    if pdf_bytes:
-        try:
-            cols = pdf_split_left_right(pdf_bytes)
-            left_txt, right_txt = cols.get("left",""), cols.get("right","")
-            # NEW: coordinate-based harvest (per column)
-            coord_vals = coordinate_harvest(pdf_bytes)
-            debug["strategy"] = "pdf_layout_split + coord_harvest"
-            debug["left_len"] = len(left_txt or "")
-            debug["right_len"] = len(right_txt or "")
-        except Exception as e:
-            print(f"layout/coord split failed: {e}")
-
-    if left_txt is not None and right_txt is not None:
-        # Normalize → strict bind → CCT sanity → localize
-        left_norm  = localize_pt_to_en(smart_fix_cct_bound(bind_disjoint_scalars(normalize_for_ocr(left_txt))))
-        right_norm = localize_pt_to_en(smart_fix_cct_bound(bind_disjoint_scalars(normalize_for_ocr(right_txt))))
-        if want_debug:
-            debug["left_preview"]  = left_norm[:600]
-            debug["right_preview"] = right_norm[:600]
-
-        # Primary text parse
-        left_data  = parse_eye_block(left_norm)
-        right_data = parse_eye_block(right_norm)
-
-        # Bound scalar dicts (from normalized text)
-        def scalars_from_bound(nrm: str) -> dict:
-            d = {}
-            for lab, key in [("AL","axial_length"), ("ACD","acd"), ("LT","lt"), ("WTW","wtw"), ("CCT","cct")]:
-                m = re.search(rf"(?mi)\b{lab}\s*:\s*(-?\d[\d.,]*)\s*(?:mm|[µμ]m|um)\b", nrm)
-                if m:
-                    unit = "µm" if lab == "CCT" else "mm"
-                    d[key] = f"{m.group(1)} {unit}"
-            return d
-
-        left_bound  = scalars_from_bound(left_norm)
-        right_bound = scalars_from_bound(right_norm)
-
-        # Rescue (tolerant)
-        left_rescue  = rescue_harvest(left_norm)
-        right_rescue = rescue_harvest(right_norm)
-
-        # Reconcile text-based
-        left_final  = reconcile(left_data,  left_bound,  left_rescue)
-        right_final = reconcile(right_data, right_bound, right_rescue)
-
-        # NEW: Merge coordinate-based values to fill any empties (esp. OS CCT)
-        for k,v in coord_vals.get("left", {}).items():
-            if v and not left_final.get(k):
-                left_final[k] = v
-        for k,v in coord_vals.get("right", {}).items():
-            if v and not right_final.get(k):
-                right_final[k] = v
-
-        # Plausibility re-score pass
-        left_final  = plausibility_rescore(left_norm,  left_final)
-        right_final = plausibility_rescore(right_norm, right_final)
-
-        # Map OD/OS by clues
-        def looks_od(s: str) -> bool:
-            u = s.upper()
-            return bool(re.search(r"\bOD\b|\bO\s*D\b|RIGHT\b", u))
-        def looks_os(s: str) -> bool:
-            u = s.upper()
-            return bool(re.search(r"\bOS\b|\bO\s*S\b|\bOE\b|\bO\s*E\b|LEFT\b", u))
-
-        left_is_od, left_is_os   = looks_od(left_txt),  looks_os(left_txt)
-        right_is_od, right_is_os = looks_od(right_txt), looks_os(right_txt)
-
-        if left_is_od and right_is_os:
-            mapping = {"OD": left_final, "OS": right_final};  debug["mapping"] = "OD<-left, OS<-right (labels)"
-        elif left_is_os and right_is_od:
-            mapping = {"OD": right_final, "OS": left_final};  debug["mapping"] = "OD<-right, OS<-left (labels)"
-        else:
-            mapping = {"OD": left_final, "OS": right_final};  debug["mapping"] = "OD<-left, OS<-right (default)"
-
-        # Copy into result
-        for eye in ("OD","OS"):
-            for k,v in mapping[eye].items():
-                if v: result[eye][k] = v
-
-        # OPTIONAL: assume_same_cct=1 copies OD->OS if OS missing
-        assume_same_cct = request.args.get("assume_same_cct") == "1"
-        if assume_same_cct and not result["OS"].get("cct") and result["OD"].get("cct"):
-            result["OS"]["cct"] = result["OD"]["cct"]
-
-        # Enforce output order (source first)
-        result["OD"] = enforce_field_order(result["OD"])
-        result["OS"] = enforce_field_order(result["OS"])
-
-        return (result, debug) if want_debug else result
-
-    # No layout info → single block → OD
     single = localize_pt_to_en(smart_fix_cct_bound(bind_disjoint_scalars(normalize_for_ocr(norm_text))))
     parsed = parse_eye_block(single)
     for k,v in parsed.items():
         if v: result["OD"][k] = v
-
     result["OD"] = enforce_field_order(result["OD"])
     result["OS"] = enforce_field_order(result["OS"])
-    debug["strategy"] = "ocr_single_block_to_OD"
-    return (result, debug) if want_debug else result
-
+    dbg = {"strategy":"ocr_single_block_to_OD"}
+    return (result, dbg) if want_debug else result
 
 # =========================
 # Routes
@@ -776,7 +705,7 @@ def parse_iol(norm_text: str, pdf_bytes: Optional[bytes], source_label: str, wan
 def health():
     return jsonify({
         "status": "running",
-        "version": "LakeCalc.ai parser v3.8 (coord harvest + strict binder + sanity + rescue + plausibility + ordered)",
+        "version": "LakeCalc.ai parser v3.11 (per-page columns + front-page-first + original pipeline)",
         "ocr_enabled": bool(vision_client)
     })
 
