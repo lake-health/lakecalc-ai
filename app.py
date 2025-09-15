@@ -1,61 +1,49 @@
-# app.py — LakeCalc.ai parser v3.11
-# Strategy: PDF layout split → per-column parse → strict OD/OS mapping (labels-first)
-# + strict binder (+CCT special) + CCT sanity (fwd/back) + coordinate harvester
-# + tolerant rescue + plausibility pass + optional LLM-only-for-OS-CCT + ordered output
+# app.py — LakeCalc.ai parser v3.8
+# v3.7 + coordinate-based harvesting (per-column) to rescue missing CCT in OS
+# layout split + strict binder (+CCT special) + CCT sanity (fwd/back)
+# + rescue + reconcile + plausibility re-score + PT→EN (clues only)
+# + µ/μ + ΔK/AK/K + ordered + safe PDF extract + coord harvester
 
-import os, io, re, json
+import os, io, re
 from collections import OrderedDict
 from io import BytesIO
 from typing import Optional, Tuple, List, Dict
 
 from flask import Flask, request, jsonify, render_template
 
-# PDF text & geometry (pdfminer.six)
+# PDF text & geometry
 from pdfminer.high_level import extract_text as pdfminer_extract_text, extract_pages
 from pdfminer.layout import (
-    LTTextBox, LTTextBoxHorizontal, LTTextLine, LTTextLineHorizontal, LAParams
+    LTTextBox, LTTextBoxHorizontal, LTTextLine, LTTextLineHorizontal, LAParams, LTChar
 )
 
-# Optional OCR fallback
+# OCR fallback
+from google.cloud import vision
 from pdf2image import convert_from_bytes
-try:
-    from google.cloud import vision
-    _has_vision = True
-except Exception:
-    vision = None
-    _has_vision = False
 
-# Optional LLM fallback (OpenAI)
-ENABLE_LLM = os.environ.get("ENABLE_LLM", "0") in ("1", "true", "True", "YES", "yes")
-LLM_MODEL  = os.environ.get("LLM_MODEL", "gpt-4o-mini")
-OPENAI_OK  = bool(os.environ.get("OPENAI_API_KEY"))
-client = None
-if ENABLE_LLM and OPENAI_OK:
-    try:
-        from openai import OpenAI
-        client = OpenAI()
-    except Exception as _e:
-        client = None
 
 app = Flask(__name__, static_folder='static', template_folder='templates')
 
+
 # =========================
-# Google Vision (OCR) init
+# Google Vision (OCR)
 # =========================
-vision_client: Optional["vision.ImageAnnotatorClient"] = None
-if _has_vision:
-    try:
-        creds_json = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
-        if creds_json:
-            from google.oauth2 import service_account
-            info = json.loads(creds_json)
-            credentials = service_account.Credentials.from_service_account_info(info)
-            vision_client = vision.ImageAnnotatorClient(credentials=credentials)
-        elif os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
-            vision_client = vision.ImageAnnotatorClient()
-    except Exception as e:
-        print(f"[INFO] Vision disabled: {e}")
-        vision_client = None
+vision_client: Optional[vision.ImageAnnotatorClient] = None
+try:
+    creds_json = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+    if creds_json:
+        from google.oauth2 import service_account
+        import json
+        info = json.loads(creds_json)
+        credentials = service_account.Credentials.from_service_account_info(info)
+        vision_client = vision.ImageAnnotatorClient(credentials=credentials)
+    elif os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
+        vision_client = vision.ImageAnnotatorClient()
+    else:
+        print("INFO: Vision credentials not set. OCR fallback disabled.")
+except Exception as e:
+    print(f"Vision init error: {e}")
+
 
 # =========================
 # Safe PDF text extraction
@@ -64,14 +52,14 @@ def extract_pdf_text_safe(file_bytes: bytes) -> str:
     try:
         bio = BytesIO(file_bytes)
         text = pdfminer_extract_text(bio) or ""
-        # collapse space-before-newline chunks
         return re.sub(r"[ \t]+\n", "\n", text).strip()
     except Exception as e:
         print(f"[WARN] pdfminer failed: {e}")
         return ""
 
+
 # =========================
-# OCR fallbacks
+# Text extraction (PDF-first, OCR fallback)
 # =========================
 def ocr_pdf_to_text(pdf_bytes: bytes) -> str:
     if not vision_client:
@@ -87,6 +75,7 @@ def ocr_pdf_to_text(pdf_bytes: bytes) -> str:
         pages_txt.append(resp.text_annotations[0].description if resp.text_annotations else "")
     return "\n\n--- Page ---\n\n".join(pages_txt).strip()
 
+
 def ocr_image_to_text(image_bytes: bytes) -> str:
     if not vision_client:
         raise RuntimeError("Vision client not initialized; cannot OCR image.")
@@ -95,6 +84,7 @@ def ocr_image_to_text(image_bytes: bytes) -> str:
     if resp.error.message:
         raise RuntimeError(f"Vision API Error: {resp.error.message}")
     return (resp.text_annotations[0].description if resp.text_annotations else "").strip()
+
 
 def get_text_from_upload(fs, force_mode: Optional[str] = None) -> Tuple[str, str, Optional[bytes]]:
     name = (fs.filename or "").lower()
@@ -113,17 +103,16 @@ def get_text_from_upload(fs, force_mode: Optional[str] = None) -> Tuple[str, str
             return txt, "pdf_text", file_bytes
         return ocr_pdf_to_text(file_bytes), "ocr_pdf", file_bytes
 
-    # image
     if force_mode == "ocr" or not force_mode:
         return ocr_image_to_text(file_bytes), "ocr_image", None
     return "", "unknown", None
 
+
 # =========================
-# Normalization & helpers
+# Normalization (OCR/PDF quirks)
 # =========================
 def normalize_for_ocr(text: str) -> str:
     t = text.replace("\u00A0", " ")
-    # glue broken lines for AL/ACD/LT/WTW/CCT & K*, axis symbols
     t = re.sub(
         r"(?mi)^(AL|ACD|LT|WTW|CCT)\s*:\s*\n\s*([-\d.,]+)\s*\n\s*(mm|[µμ]m|um)\b",
         r"\1: \2 \3", t,
@@ -132,24 +121,12 @@ def normalize_for_ocr(text: str) -> str:
         r"(?mi)^(K1|K2|K|AK|ΔK)\s*:\s*\n\s*([-\d.,]+)\s*\n\s*D\b",
         r"\1: \2 D", t,
     )
-    # normalize axis “@ 100°”
     t = re.sub(r"@\s*(?:\r?\n|\s)*(?:[°ºo])\s*(?:\r?\n|\s)*?(\d{1,3})\b", r"@ \1°", t)
     t = re.sub(r"@\s*(?:\r?\n|\s)*(\d{1,3})\s*(?:\r?\n|\s)*(?:[°ºo])\b", r"@ \1°", t)
     t = re.sub(r"(?:[°ºo])\s*(?:\r?\n|\s)*?(\d{1,3})\b", r" \1°", t)
     t = re.sub(r"[ \t]+", " ", t)
     return t
 
-def localize_pt_to_en(text: str) -> str:
-    t = text
-    for pat, repl in [
-        (r"\b(direita|olho\s+direito)\b", "RIGHT"),
-        (r"\b(esquerda|esquerdo|olho\s+esquerdo)\b", "LEFT"),
-        (r"\bpaciente\b", "PATIENT"),
-        (r"\ban[aá]lise\b", "ANALYSIS"),
-        (r"\bbranco a branco\b", "WHITE TO WHITE"),
-    ]:
-        t = re.sub(pat, repl, t, flags=re.IGNORECASE)
-    return t
 
 # =========================
 # Strict binder (CCT special)
@@ -207,6 +184,7 @@ def bind_disjoint_scalars(text: str) -> str:
     t = patch_label(t, "WTW", "mm")
     return t
 
+
 # =========================
 # CCT sanity (fwd/back)
 # =========================
@@ -239,8 +217,25 @@ def smart_fix_cct_bound(text_with_bindings: str) -> str:
 
     return re.sub(r"(?mi)\bCCT\s*:\s*([-\d.,]+)\s*(?:[µμ]m|um)\b", replace, text_with_bindings)
 
+
 # =========================
-# PDF layout split (left/right)
+# PT→EN (clues only)
+# =========================
+def localize_pt_to_en(text: str) -> str:
+    t = text
+    for pat, repl in [
+        (r"\b(direita|olho\s+direito)\b", "RIGHT"),
+        (r"\b(esquerda|esquerdo|olho\s+esquerdo)\b", "LEFT"),
+        (r"\bpaciente\b", "PATIENT"),
+        (r"\ban[aá]lise\b", "ANALYSIS"),
+        (r"\bbranco a branco\b", "WHITE TO WHITE"),
+    ]:
+        t = re.sub(pat, repl, t, flags=re.IGNORECASE)
+    return t
+
+
+# =========================
+# PDF layout split (text)
 # =========================
 def pdf_split_left_right(pdf_bytes: bytes) -> dict:
     left_chunks, right_chunks = [], []
@@ -276,6 +271,7 @@ def pdf_split_left_right(pdf_bytes: bytes) -> dict:
 
     return {"left": "\n".join(left_chunks).strip(), "right": "\n".join(right_chunks).strip()}
 
+
 # =========================
 # Coordinate-based harvester (per column)
 # =========================
@@ -289,6 +285,13 @@ def _clean(s: str) -> str:
     return re.sub(r"[ \t]+", " ", (s or "")).strip()
 
 def coordinate_harvest(pdf_bytes: bytes) -> Dict[str, Dict[str, str]]:
+    """
+    Harvest scalars by PDF coordinates per column:
+      - Find label lines (AL/ACD/LT/WTW/CCT, K1/K2/AK)
+      - Search a vertical window *above* each label within same column for number+unit
+      - Use plausibility ranges for tie-breaks (esp. CCT 400–700 µm)
+    Returns: {"left": {...fields...}, "right": {...fields...}}
+    """
     out_left = {"axial_length":"", "acd":"", "lt":"", "wtw":"", "cct":"", "k1":"", "k2":"", "ak":""}
     out_right = {"axial_length":"", "acd":"", "lt":"", "wtw":"", "cct":"", "k1":"", "k2":"", "ak":""}
 
@@ -298,6 +301,7 @@ def coordinate_harvest(pdf_bytes: bytes) -> Dict[str, Dict[str, str]]:
             width = getattr(page_layout, "width", 1000.0)
             midx = width / 2.0
 
+            # Collect lines with positions
             lines: List[tuple] = []  # (x0, y0, x1, y1, text)
             for el in page_layout:
                 if isinstance(el, (LTTextLine, LTTextLineHorizontal, LTTextBoxHorizontal, LTTextBox)):
@@ -312,13 +316,18 @@ def coordinate_harvest(pdf_bytes: bytes) -> Dict[str, Dict[str, str]]:
                     except Exception:
                         continue
 
+            # Split per column
             left_lines  = [ln for ln in lines if (ln[0]+ln[2])/2.0 <  midx]
             right_lines = [ln for ln in lines if (ln[0]+ln[2])/2.0 >= midx]
+
+            # Sort top→bottom in each column
             left_lines.sort(key=lambda r: -r[3])
             right_lines.sort(key=lambda r: -r[3])
 
             def harvest_column(col_lines: List[tuple]) -> Dict[str,str]:
                 found = {"axial_length":"", "acd":"", "lt":"", "wtw":"", "cct":"", "k1":"", "k2":"", "ak":""}
+
+                # Build quick search helpers
                 label_map = {
                     "AL":  "axial_length",
                     "ACD": "acd",
@@ -329,14 +338,16 @@ def coordinate_harvest(pdf_bytes: bytes) -> Dict[str, Dict[str, str]]:
                     "K2":  "k2",
                     "AK":  "ak",
                     "ΔK":  "ak",
-                    "K":   "ak",  # only when isolated
+                    "K":   "ak",  # later we will ignore K1/K2 for this
                 }
+                # Capture label rows (text exactly the label or "LABEL:")
                 label_rows = []
                 for x0,y0,x1,y1,txt in col_lines:
                     t = txt.upper().rstrip(":")
                     if t in ("AL","ACD","LT","WTW","CCT","K1","K2","AK","ΔK","K"):
                         label_rows.append((x0,y0,x1,y1,txt))
 
+                # For each label row, look upward within ~120 pts for value+unit in the same column box
                 def plaus_mm(v: float, key: str) -> bool:
                     if key == "axial_length": return 17.0 <= v <= 32.0
                     if key == "acd":          return 1.5  <= v <= 6.0
@@ -354,22 +365,29 @@ def coordinate_harvest(pdf_bytes: bytes) -> Dict[str, Dict[str, str]]:
                     except:
                         return None
 
+                # index lines by y to search above efficiently
                 for lx0,ly0,lx1,ly1,lbl in label_rows:
                     L = lbl.upper().rstrip(":")
                     key = label_map.get(L)
-                    if not key:
+                    if not key: 
                         continue
+
+                    # Skip K if it's actually K1 or K2; we handle AK as cylinder
                     if L == "K" and any("K1" in r[4].upper() or "K2" in r[4].upper() for r in col_lines):
                         continue
 
+                    # search window: from label baseline up by ~140 points
                     top = ly1 + 140.0
-                    bot = ly0 - 4.0
+                    bot = ly0 - 4.0  # include same line slight overlap
                     cand = []
 
                     for x0,y0,x1,y1,txt in col_lines:
                         if y1 <= top and y0 >= bot:
+                            # same column region horizontally (loose overlap with label box)
                             if not (x1 < lx0 - 5 or x0 > lx1 + 5):
+                                # collect candidates by unit
                                 if key == "cct":
+                                    # µm only
                                     m = re.search(rf"({_num_token})\s*(?:[µμ]m|um)\b", txt, flags=re.IGNORECASE)
                                     if m:
                                         v = to_num(m.group(1))
@@ -384,6 +402,7 @@ def coordinate_harvest(pdf_bytes: bytes) -> Dict[str, Dict[str, str]]:
                                             dist = abs((ly0 + ly1)/2.0 - (y0 + y1)/2.0)
                                             cand.append((dist, f"{m.group(1)} mm"))
                                 elif key in ("k1","k2","ak"):
+                                    # diopters possibly with axis nearby on same line
                                     md = re.search(rf"({_num_token})\s*D\b", txt, flags=re.IGNORECASE)
                                     if md:
                                         axis = ""
@@ -402,6 +421,7 @@ def coordinate_harvest(pdf_bytes: bytes) -> Dict[str, Dict[str, str]]:
             left_vals  = harvest_column(left_lines)
             right_vals = harvest_column(right_lines)
 
+            # Merge with page results (if multiple pages, first non-empty wins)
             for k,v in left_vals.items():
                 if v and not out_left[k]:
                     out_left[k] = v
@@ -413,6 +433,7 @@ def coordinate_harvest(pdf_bytes: bytes) -> Dict[str, Dict[str, str]]:
         print(f"coordinate_harvest error: {e}")
 
     return {"left": out_left, "right": out_right}
+
 
 # =========================
 # Patterns & parsing helpers (text-based)
@@ -455,8 +476,12 @@ def parse_eye_block(txt: str) -> dict:
                 out[key] = raw
     return out
 
+def has_measurements(d: dict) -> bool:
+    return any(d.values())
+
+
 # =========================
-# Rescue (tolerant)
+# Rescue harvester (tolerant)
 # =========================
 RESCUE = {
     "axial_length": re.compile(r"(?mi)\bAL\s*[:=]?\s*(-?\d[\d.,]*)\s*mm\b"),
@@ -496,8 +521,9 @@ def rescue_harvest(raw_text: str) -> dict:
 
     return out
 
+
 # =========================
-# Reconcile + plausibility
+# Reconcile
 # =========================
 def reconcile(base: dict, binder: dict | None, rescue: dict | None) -> dict:
     res = dict(base)
@@ -511,6 +537,10 @@ def reconcile(base: dict, binder: dict | None, rescue: dict | None) -> dict:
                 res[k] = v
     return res
 
+
+# =========================
+# Plausibility re-score (final safety net)
+# =========================
 PLAUSIBLE = {
     "axial_length": lambda x: 17.0 <= x <= 32.0,
     "acd":          lambda x: 1.5  <= x <= 6.0,
@@ -583,7 +613,7 @@ def plausibility_rescore(eye_text: str, data: dict) -> dict:
         if best[0]:
             out[key] = re.sub(r"(?i)\bum\b", "µm", best[0]) if unit == "um" else best[0]
 
-    # Extra CCT sweep anywhere near scalar labels
+    # CCT extra fallback (nearest plausible µm near any scalar label)
     if not current_ok("cct", "um"):
         anchors = []
         for lab in ("AL", "ACD", "LT", "WTW"):
@@ -604,16 +634,15 @@ def plausibility_rescore(eye_text: str, data: dict) -> dict:
 
     return out
 
+
 # =========================
-# Device label + ordering
+# Detect device & ordering
 # =========================
 def detect_source_label(text: str) -> str:
     if re.search(r"IOL\s*Master\s*700", text, re.IGNORECASE):
         return "IOL Master 700"
     if re.search(r"OCULUS\s+PENTACAM", text, re.IGNORECASE):
         return "Pentacam"
-    if re.search(r"NIDEK", text, re.IGNORECASE):
-        return "NIDEK"
     first = next((ln.strip() for ln in text.splitlines() if ln.strip()), "Unknown")
     return first[:60]
 
@@ -621,66 +650,6 @@ FIELD_ORDER = ["source", "axial_length", "acd", "k1", "k2", "ak", "wtw", "cct", 
 def enforce_field_order(eye_dict: dict) -> OrderedDict:
     return OrderedDict((k, eye_dict.get(k, "")) for k in FIELD_ORDER)
 
-# =========================
-# OD/OS detection helpers (labels-first)
-# =========================
-def looks_od(s: str) -> bool:
-    u = s.upper()
-    return bool(re.search(r"\bOD\b|\bO\s*D\b|RIGHT\b|\bDIREITA\b", u))
-
-def looks_os(s: str) -> bool:
-    u = s.upper()
-    return bool(re.search(r"\bOS\b|\bO\s*S\b|\bOE\b|\bO\s*E\b|LEFT\b|\bESQUERD[AO]\b", u))
-
-# =========================
-# LLM fallback: OS CCT only
-# =========================
-def llm_fill_os_cct(source_label: str, left_text: str, right_text: str, current_os_cct: str) -> Optional[str]:
-    if not (ENABLE_LLM and OPENAI_OK and client):
-        return None
-    if current_os_cct:
-        return None
-
-    # Give the model only what it needs
-    prompt = f"""
-You extract numeric measurements from ophthalmology reports.
-Return ONLY the Central Corneal Thickness (CCT) for the LEFT eye (OS) in micrometers.
-- If you see multiple candidate values, choose the one nearest the CCT label for LEFT/OS.
-- Output strictly as: <number> µm (no other text).
-Device hint: {source_label}
-
-LEFT/OS column text (trimmed):
----
-{right_text[:1800]}
----
-
-Examples of valid outputs: 523 µm ; 547 µm
-If unknown, output exactly: UNKNOWN
-""".strip()
-
-    try:
-        resp = client.chat.completions.create(
-            model=LLM_MODEL,
-            temperature=0,
-            max_tokens=6,
-            messages=[
-                {"role":"system","content":"You are a careful medical-text extractor. Output only what is asked, no commentary."},
-                {"role":"user","content": prompt}
-            ],
-        )
-        ans = (resp.choices[0].message.content or "").strip()
-        # basic validation
-        m = re.match(r"^\s*([-\d.,]{2,})\s*(?:µm|um)\s*$", ans, flags=re.IGNORECASE)
-        if not m:
-            return None
-        val = m.group(1)
-        num = _num(val)
-        if num is None or not PLAUSIBLE["cct_um"](num):
-            return None
-        return f"{int(round(num))} µm"
-    except Exception as e:
-        print(f"[LLM] OS CCT fallback failed: {e}")
-        return None
 
 # =========================
 # Controller
@@ -701,6 +670,7 @@ def parse_iol(norm_text: str, pdf_bytes: Optional[bytes], source_label: str, wan
         try:
             cols = pdf_split_left_right(pdf_bytes)
             left_txt, right_txt = cols.get("left",""), cols.get("right","")
+            # NEW: coordinate-based harvest (per column)
             coord_vals = coordinate_harvest(pdf_bytes)
             debug["strategy"] = "pdf_layout_split + coord_harvest"
             debug["left_len"] = len(left_txt or "")
@@ -720,7 +690,7 @@ def parse_iol(norm_text: str, pdf_bytes: Optional[bytes], source_label: str, wan
         left_data  = parse_eye_block(left_norm)
         right_data = parse_eye_block(right_norm)
 
-        # Extract scalars from bound normalized text
+        # Bound scalar dicts (from normalized text)
         def scalars_from_bound(nrm: str) -> dict:
             d = {}
             for lab, key in [("AL","axial_length"), ("ACD","acd"), ("LT","lt"), ("WTW","wtw"), ("CCT","cct")]:
@@ -741,7 +711,7 @@ def parse_iol(norm_text: str, pdf_bytes: Optional[bytes], source_label: str, wan
         left_final  = reconcile(left_data,  left_bound,  left_rescue)
         right_final = reconcile(right_data, right_bound, right_rescue)
 
-        # Merge coordinate-based values to fill any empties
+        # NEW: Merge coordinate-based values to fill any empties (esp. OS CCT)
         for k,v in coord_vals.get("left", {}).items():
             if v and not left_final.get(k):
                 left_final[k] = v
@@ -749,62 +719,42 @@ def parse_iol(norm_text: str, pdf_bytes: Optional[bytes], source_label: str, wan
             if v and not right_final.get(k):
                 right_final[k] = v
 
-        # Plausibility pass
+        # Plausibility re-score pass
         left_final  = plausibility_rescore(left_norm,  left_final)
         right_final = plausibility_rescore(right_norm, right_final)
 
-        # ===== Strict OD/OS mapping (labels-first) =====
-        # score the confidence for each side being OD/OS by scanning the *raw* column texts
-        def eye_score(txt: str, want: str) -> float:
-            if not txt: return 0.0
-            txtu = txt.upper()
-            hits = 0
-            if want == "OD":
-                # Portuguese + EN + abbreviations (OD)
-                hits += 3*len(re.findall(r"\bOD\b|\bO\s*D\b", txtu))
-                hits += 2*len(re.findall(r"\bDIREITA\b|\bOLHO\s*DIREITO\b|RIGHT\b", txtu))
-            else:
-                # OS side (LEFT)
-                hits += 3*len(re.findall(r"\bOS\b|\bO\s*S\b|\bOE\b|\bO\s*E\b", txtu))
-                hits += 2*len(re.findall(r"\bESQUERD[AO]\b|\bOLHO\s*ESQUERDO\b|LEFT\b", txtu))
-            # penalize if the *opposite* label appears more
-            if want == "OD":
-                hits -= len(re.findall(r"\bOS\b|\bO\s*S\b|\bOE\b|\bO\s*E\b|\bESQUERD[AO]\b|LEFT\b", txtu))
-            else:
-                hits -= len(re.findall(r"\bOD\b|\bO\s*D\b|\bDIREITA\b|RIGHT\b", txtu))
-            return float(hits)
+        # Map OD/OS by clues
+        def looks_od(s: str) -> bool:
+            u = s.upper()
+            return bool(re.search(r"\bOD\b|\bO\s*D\b|RIGHT\b", u))
+        def looks_os(s: str) -> bool:
+            u = s.upper()
+            return bool(re.search(r"\bOS\b|\bO\s*S\b|\bOE\b|\bO\s*E\b|LEFT\b", u))
 
-        left_is_od_score = eye_score(left_txt, "OD")
-        left_is_os_score = eye_score(left_txt, "OS")
-        right_is_od_score = eye_score(right_txt, "OD")
-        right_is_os_score = eye_score(right_txt, "OS")
+        left_is_od, left_is_os   = looks_od(left_txt),  looks_os(left_txt)
+        right_is_od, right_is_os = looks_od(right_txt), looks_os(right_txt)
 
-        mapping = None
-        if left_is_od_score > left_is_os_score and right_is_os_score > right_is_od_score:
-            mapping = {"OD": left_final, "OS": right_final}
-            debug["mapping"] = "OD<-left, OS<-right (labels-strong)"
-        elif left_is_os_score > left_is_od_score and right_is_od_score > right_is_os_score:
-            mapping = {"OD": right_final, "OS": left_final}
-            debug["mapping"] = "OD<-right, OS<-left (labels-strong)"
+        if left_is_od and right_is_os:
+            mapping = {"OD": left_final, "OS": right_final};  debug["mapping"] = "OD<-left, OS<-right (labels)"
+        elif left_is_os and right_is_od:
+            mapping = {"OD": right_final, "OS": left_final};  debug["mapping"] = "OD<-right, OS<-left (labels)"
         else:
-            # fall back to default left->OD, right->OS if ambiguous
-            mapping = {"OD": left_final, "OS": right_final}
-            debug["mapping"] = "OD<-left, OS<-right (default)"
+            mapping = {"OD": left_final, "OS": right_final};  debug["mapping"] = "OD<-left, OS<-right (default)"
 
         # Copy into result
         for eye in ("OD","OS"):
             for k,v in mapping[eye].items():
                 if v: result[eye][k] = v
 
-        # Optional: LLM fallback ONLY for missing OS CCT
-        if not result["OS"].get("cct"):
-            llm_cct = llm_fill_os_cct(source_label, left_norm, right_norm, result["OS"].get("cct",""))
-            if llm_cct:
-                result["OS"]["cct"] = llm_cct
+        # OPTIONAL: assume_same_cct=1 copies OD->OS if OS missing
+        assume_same_cct = request.args.get("assume_same_cct") == "1"
+        if assume_same_cct and not result["OS"].get("cct") and result["OD"].get("cct"):
+            result["OS"]["cct"] = result["OD"]["cct"]
 
-        # Enforce order
+        # Enforce output order (source first)
         result["OD"] = enforce_field_order(result["OD"])
         result["OS"] = enforce_field_order(result["OS"])
+
         return (result, debug) if want_debug else result
 
     # No layout info → single block → OD
@@ -818,24 +768,16 @@ def parse_iol(norm_text: str, pdf_bytes: Optional[bytes], source_label: str, wan
     debug["strategy"] = "ocr_single_block_to_OD"
     return (result, debug) if want_debug else result
 
+
 # =========================
 # Routes
 # =========================
 @app.route("/api/health")
 def health():
-    env_debug = {
-        "ENABLE_LLM": os.environ.get("ENABLE_LLM"),
-        "LLM_MODEL": LLM_MODEL if ENABLE_LLM else None,
-        "OPENAI_API_KEY_present": bool(os.environ.get("OPENAI_API_KEY")),
-        "OPENAI_API_KEY_len": len(os.environ.get("OPENAI_API_KEY","")),
-    }
     return jsonify({
         "status": "running",
-        "version": "LakeCalc.ai parser v3.11 (coord harvest + strict binder + sanity + rescue + plausibility + LLM optional + ordered)",
-        "ocr_enabled": bool(vision_client),
-        "llm_enabled": bool(ENABLE_LLM and OPENAI_OK and client is not None),
-        "llm_model": LLM_MODEL if (ENABLE_LLM and OPENAI_OK and client is not None) else None,
-        "env_debug": env_debug
+        "version": "LakeCalc.ai parser v3.8 (coord harvest + strict binder + sanity + rescue + plausibility + ordered)",
+        "ocr_enabled": bool(vision_client)
     })
 
 @app.route("/api/parse-file", methods=["POST"])
@@ -856,7 +798,7 @@ def parse_file():
 
     try:
         text, source_tag, pdf_bytes = get_text_from_upload(fs, force_mode=force_mode)
-        norm_text   = normalize_for_ocr(text)
+        norm_text = normalize_for_ocr(text)
         source_label = detect_source_label(norm_text)
 
         if raw_only:
