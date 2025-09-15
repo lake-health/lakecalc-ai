@@ -1,0 +1,6 @@
+[
+  {"brand": "Alcon", "models": ["AcrySof IQ", "PanOptix", "Vivity"], "toric": true},
+  {"brand": "Johnson & Johnson", "models": ["Tecnis", "Eyhance"], "toric": true},
+  {"brand": "Rayner", "models": ["RayOne", "Sulcoflex"], "toric": true},
+  {"brand": "Hoya", "models": ["iSert"], "toric": true}
+]

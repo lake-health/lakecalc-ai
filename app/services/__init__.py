@@ -1,0 +1,1 @@
+"""LakeCalc AI FastAPI package."""

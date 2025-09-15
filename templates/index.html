@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1, maximum-scale=1"
+  />
+  <title>LakeCalc.ai — IOL Parser</title>
+  <style>
+    :root {
+      --bg: #ffffff; --fg: #111; --muted: #666; --border: #d9d9d9;
+      --brand: #0d6efd; --panel: #f7f7f8; --code: #0b0b0b;
+    }
+    html, body { margin:0; padding:0; background:var(--bg); color:var(--fg); font:16px/1.45 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Inter,Helvetica,Arial,sans-serif; }
+    .wrap { max-width: 980px; margin: 24px auto 80px; padding: 0 16px; }
+    h1 { font-size: 28px; margin: 0 0 16px; }
+    .row { display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-bottom:10px; }
+    .btn { background:var(--brand); color:#fff; border:0; padding:10px 14px; border-radius:8px; cursor:pointer; font-weight:600; }
+    .btn:disabled { opacity:.5; cursor:not-allowed; }
+    .file { padding:8px 10px; border:1px solid var(--border); border-radius:8px; background:#fff; }
+    .drop {
+      margin: 12px 0; border:2px dashed var(--border); border-radius:12px;
+      min-height: 90px; display:flex; align-items:center; justify-content:center;
+      color:var(--muted); background:var(--panel);
+    }
+    .drop.dragover { border-color: var(--brand); color: var(--brand); background:#eef4ff; }
+    label { display:inline-flex; align-items:center; gap:8px; color:#222; }
+    .opts { display:flex; gap:22px; flex-wrap:wrap; margin:10px 0 12px; }
+    .health { margin: 6px 0 16px; color: var(--muted); }
+    pre {
+      background: var(--code); color: #e6e6e6; padding: 16px; border-radius: 10px;
+      overflow:auto; white-space:pre; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      box-shadow: inset 0 0 0 1px #00000026;
+    }
+    .bar { display:flex; gap:8px; margin:10px 0; align-items:center; }
+    .pill { padding:6px 10px; border:1px solid var(--border); border-radius:999px; background:#fff; color:#333; font-size:13px; }
+    a { color: var(--brand); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>LakeCalc.ai — IOL Parser</h1>
+
+    <div class="row">
+      <input id="file-input" class="file" type="file" accept=".pdf,image/*" />
+      <button id="upload-btn" class="btn">Upload &amp; Parse</button>
+    </div>
+
+    <div id="dropzone" class="drop">Drag &amp; drop a PDF/image here</div>
+
+    <div class="opts">
+      <label><input id="chk-raw" type="checkbox" /> Include raw text preview</label>
+      <label><input id="chk-force-pdf" type="checkbox" /> Force PDF text</label>
+      <label><input id="chk-force-ocr" type="checkbox" /> Force OCR</label>
+      <label><input id="chk-debug" type="checkbox" /> Debug</label>
+    </div>
+
+    <div class="health">Health: <a href="/api/health" target="_blank">/api/health</a></div>
+
+    <div class="bar">
+      <span class="pill" id="filename-pill" style="display:none;"></span>
+      <span class="pill" id="source-pill" style="display:none;"></span>
+    </div>
+
+    <h3>Response</h3>
+    <pre id="response">{}</pre>
+  </div>
+
+  <script>
+    const fileInput  = document.getElementById('file-input');
+    const uploadBtn  = document.getElementById('upload-btn');
+    const dropzone   = document.getElementById('dropzone');
+    const responseEl = document.getElementById('response');
+    const filePill   = document.getElementById('filename-pill');
+    const sourcePill = document.getElementById('source-pill');
+
+    // Drag & drop
+    ['dragenter','dragover'].forEach(ev => {
+      dropzone.addEventListener(ev, e => { e.preventDefault(); e.stopPropagation(); dropzone.classList.add('dragover'); });
+    });
+    ['dragleave','drop'].forEach(ev => {
+      dropzone.addEventListener(ev, e => { e.preventDefault(); e.stopPropagation(); dropzone.classList.remove('dragover'); });
+    });
+    dropzone.addEventListener('drop', (e) => {
+      if (e.dataTransfer?.files?.length) {
+        fileInput.files = e.dataTransfer.files;
+      }
+    });
+
+    async function doUpload() {
+      if (!fileInput.files.length) {
+        alert('Choose a file first.'); return;
+      }
+      uploadBtn.disabled = true;
+
+      const form = new FormData();
+      const file = fileInput.files[0];
+      form.append('file', file);
+
+      // Start with current page query (?include_raw=1&debug=1 etc.)
+      const urlParams = new URLSearchParams(window.location.search);
+
+      // Merge UI checkboxes (these override page params when checked)
+      const chkRaw  = document.getElementById('chk-raw');
+      const chkPdf  = document.getElementById('chk-force-pdf');
+      const chkOcr  = document.getElementById('chk-force-ocr');
+      const chkDbg  = document.getElementById('chk-debug');
+
+      if (chkRaw?.checked) urlParams.set('include_raw', '1');
+      if (chkPdf?.checked) urlParams.set('force_pdf', '1');
+      if (chkOcr?.checked) urlParams.set('force_ocr', '1');
+      if (chkDbg?.checked) urlParams.set('debug', '1');
+
+      const qs = urlParams.toString();
+      const endpoint = `/api/parse-file${qs ? ('?' + qs) : ''}`;
+
+      responseEl.textContent = 'Processing…';
+
+      try {
+        const resp = await fetch(endpoint, { method: 'POST', body: form });
+        const json = await resp.json();
+
+        // Show pills if present
+        filePill.style.display = 'inline-block';
+        filePill.textContent   = json.filename || file.name;
+
+        sourcePill.style.display = json.text_source ? 'inline-block' : 'none';
+        sourcePill.textContent   = json.text_source ? `source: ${json.text_source}` : '';
+
+        responseEl.textContent = JSON.stringify(json, null, 2);
+      } catch (err) {
+        responseEl.textContent = JSON.stringify({ error: String(err) }, null, 2);
+      } finally {
+        uploadBtn.disabled = false;
+      }
+    }
+
+    uploadBtn.addEventListener('click', doUpload);
+
+    // If the page already has ?include_raw=1 or ?debug=1 in the URL,
+    // reflect that in the checkboxes so users see it.
+    (function syncChecksFromURL(){
+      const url = new URL(window.location.href);
+      const qp = url.searchParams;
+      if (qp.get('include_raw') === '1') document.getElementById('chk-raw').checked = true;
+      if (qp.get('force_pdf')   === '1') document.getElementById('chk-force-pdf').checked = true;
+      if (qp.get('force_ocr')   === '1') document.getElementById('chk-force-ocr').checked = true;
+      if (qp.get('debug')       === '1') document.getElementById('chk-debug').checked = true;
+    })();
+  </script>
+</body>
+</html>

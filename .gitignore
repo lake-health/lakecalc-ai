@@ -1,0 +1,30 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+*.egg
+*.log
+
+# ---- Environments ----
+.env
+.venv/
+venv/
+env/
+ENV/
+
+# ---- OS files ----
+.DS_Store
+
+# ---- IDE/editor ----
+.vscode/
+.idea/
+
+# ---- Uploads ----
+uploads/
+
+# ---- Byte-compiled/misc ----
+*.sqlite3
+
