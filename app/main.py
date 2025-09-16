@@ -2,13 +2,14 @@ from fastapi import FastAPI, File, UploadFile, HTTPException, Request, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.templating import Jinja2Templates
+from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 from pathlib import Path
 import logging, uuid, shutil
 
 from .config import settings
 from .logging_conf import configure_logging
-from .models import UploadResponse, ExtractResult, ReviewPayload, SuggestQuery, SuggestResponse
+from .models.api import UploadResponse, ExtractResult, ReviewPayload, SuggestQuery, SuggestResponse
 from .storage import UPLOADS
 from .ocr import ocr_file
 from .parser import parse_text
@@ -19,6 +20,11 @@ configure_logging()
 log = logging.getLogger(__name__)
 
 templates = Jinja2Templates(directory="app/templates")
+
+# Serve static assets (CSS/JS) from app/static at /static
+app = FastAPI(title="Lakecalc-AI IOL Agent")
+app.mount("/static", StaticFiles(directory="app/static"), name="static")
+
 
 app = FastAPI(title="Lakecalc-AI IOL Agent")
 
