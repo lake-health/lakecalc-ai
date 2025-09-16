@@ -24,10 +24,6 @@ templates = Jinja2Templates(directory="templates")
 # Serve static assets (CSS/JS) from app/static at /static
 app = FastAPI(title="Lakecalc-AI IOL Agent")
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
-app.mount("/static", StaticFiles(directory="app/static"), name="static")
-
-
-app = FastAPI(title="Lakecalc-AI IOL Agent")
 
 app.add_middleware(
     CORSMiddleware,
