@@ -1,7 +1,7 @@
 import re, logging
 from typing import Dict, Tuple
 from .utils import to_float, check_range, hash_text
-from .models import ExtractResult, EyeData
+from .models.api import ExtractResult, EyeData
 
 log = logging.getLogger(__name__)
 
