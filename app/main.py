@@ -19,10 +19,11 @@ from .suggest import load_families, toric_decision
 configure_logging()
 log = logging.getLogger(__name__)
 
-templates = Jinja2Templates(directory="app/templates")
+templates = Jinja2Templates(directory="templates")
 
 # Serve static assets (CSS/JS) from app/static at /static
 app = FastAPI(title="Lakecalc-AI IOL Agent")
+app.mount("/static", StaticFiles(directory="app/static"), name="static")
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 
 
