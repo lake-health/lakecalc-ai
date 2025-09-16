@@ -1,6 +1,18 @@
 [
-  {"brand": "Alcon", "models": ["AcrySof IQ", "PanOptix", "Vivity"], "toric": true},
-  {"brand": "Johnson & Johnson", "models": ["Tecnis", "Eyhance"], "toric": true},
-  {"brand": "Rayner", "models": ["RayOne", "Sulcoflex"], "toric": true},
-  {"brand": "Hoya", "models": ["iSert"], "toric": true}
+  {
+    "brand": "Alcon",
+    "family": "AcrySof IQ",
+    "variants": [
+      {"name": "SN60WF", "type": "monofocal"},
+      {"name": "TORIC SN6ATx", "type": "toric"}
+    ]
+  },
+  {
+    "brand": "J&J",
+    "family": "Tecnis",
+    "variants": [
+      {"name": "ZCB00", "type": "monofocal"},
+      {"name": "ZCTx", "type": "toric"}
+    ]
+  }
 ]

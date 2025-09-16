@@ -1,0 +1,9 @@
+:root { font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell; }
+body { margin: 0; padding: 1rem; background: #0b1324; color: #e9eefb; }
+main { max-width: 900px; margin: auto; background: #111a32; padding: 1rem; border-radius: 16px; }
+h1, h2 { margin: .5rem 0; }
+label { display: grid; grid-template-columns: 160px 1fr; gap: .5rem; margin: .35rem 0; align-items: center; }
+input { padding: .5rem; border-radius: 8px; border: 1px solid #314079; background: #0b1324; color: #e9eefb; }
+button { padding: .6rem 1rem; border-radius: 10px; border: none; background: #2b64f5; color: white; font-weight: 600; }
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+pre { background: #0b1324; padding: 1rem; border-radius: 12px; overflow: auto; }

@@ -1,0 +1,79 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Lakecalc-AI Review</title>
+  <link rel="stylesheet" href="/app/static/review.css" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+</head>
+<body>
+  <main>
+    <h1>Review Parsed Fields</h1>
+    <form id="revform">
+      <label>File ID <input name="file_id" value="{{file_id}}" readonly /></label>
+      <div class="grid">
+        <div>
+          <h2>OD</h2>
+          <label>axial_length <input name="od.axial_length" /></label>
+          <label>acd <input name="od.acd" /></label>
+          <label>lt <input name="od.lt" /></label>
+          <label>cct <input name="od.cct" /></label>
+          <label>wtw <input name="od.wtw" /></label>
+          <label>k1 <input name="od.k1" /></label>
+          <label>k2 <input name="od.k2" /></label>
+          <label>ak <input name="od.ak" /></label>
+          <label>axis <input name="od.axis" /></label>
+        </div>
+        <div>
+          <h2>OS</h2>
+          <label>axial_length <input name="os.axial_length" /></label>
+          <label>acd <input name="os.acd" /></label>
+          <label>lt <input name="os.lt" /></label>
+          <label>cct <input name="os.cct" /></label>
+          <label>wtw <input name="os.wtw" /></label>
+          <label>k1 <input name="os.k1" /></label>
+          <label>k2 <input name="os.k2" /></label>
+          <label>ak <input name="os.ak" /></label>
+          <label>axis <input name="os.axis" /></label>
+        </div>
+      </div>
+      <button type="submit">Save Review</button>
+    </form>
+
+    <section>
+      <h2>Toric Suggestion</h2>
+      <form id="toric">
+        <label>deltaK <input step="0.01" name="deltaK" required /></label>
+        <label>SIA (abs) <input step="0.01" name="sia" /></label>
+        <button type="submit">Suggest</button>
+      </form>
+      <pre id="toric_out"></pre>
+    </section>
+  </main>
+
+  <script>
+  async function postJSON(url, data){
+    const r = await fetch(url,{method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(data)});
+    return await r.json();
+  }
+  document.getElementById('revform').addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const file_id = fd.get('file_id');
+    const edits = {};
+    for (const [k,v] of fd.entries()){
+      if(k==='file_id') continue; edits[k]=v;
+    }
+    const out = await postJSON('/review', {file_id, edits});
+    alert('Saved. Flags: '+ (out.flags||[]).join('; '));
+  });
+  document.getElementById('toric').addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const q = { deltaK: parseFloat(fd.get('deltaK')), sia: fd.get('sia')? parseFloat(fd.get('sia')): null };
+    const out = await postJSON('/suggest', q);
+    document.getElementById('toric_out').textContent = JSON.stringify(out, null, 2);
+  });
+  </script>
+</body>
+</html>
