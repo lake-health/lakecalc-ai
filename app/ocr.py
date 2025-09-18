@@ -19,11 +19,22 @@ except Exception as e:
 def google_vision_ocr(file_path: Path) -> tuple[str, str | None]:
     if vision is None:
         return "", "Google Vision SDK not available"
-    if not settings.google_creds:
-        return "", "GOOGLE_APPLICATION_CREDENTIALS not set"
-    creds = service_account.Credentials.from_service_account_file(settings.google_creds)
-    client = vision.ImageAnnotatorClient(credentials=creds)
 
+    from google.oauth2 import service_account
+    creds = None
+    try:
+        if settings.google_creds:  # file path method
+            creds = service_account.Credentials.from_service_account_file(settings.google_creds)
+        elif settings.google_creds_json:  # inline JSON method (Railway var)
+            creds = service_account.Credentials.from_service_account_info(
+                json.loads(settings.google_creds_json)
+            )
+        else:
+            return "", "GOOGLE_APPLICATION_CREDENTIALS not set"
+    except Exception as e:
+        return "", f"Invalid Google credentials: {e}"
+
+    client = vision.ImageAnnotatorClient(credentials=creds)
     content = file_path.read_bytes()
     image = vision.Image(content=content)
     response = client.document_text_detection(image=image)
@@ -31,7 +42,6 @@ def google_vision_ocr(file_path: Path) -> tuple[str, str | None]:
         return "", f"Vision error: {response.error.message}"
     text = response.full_text_annotation.text or ""
     return text, None
-
 
 def ocr_file(file_path: Path) -> tuple[str, str | None]:
     if settings.ocr_provider == "google":
