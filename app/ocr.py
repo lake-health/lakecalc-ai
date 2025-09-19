@@ -1,6 +1,3 @@
-## app/ocr.py
-
-```python
 import io, json, logging, hashlib, mimetypes, os
 from pathlib import Path
 import fitz  # PyMuPDF
