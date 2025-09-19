@@ -1,4 +1,4 @@
-import io, json, logging, hashlib, mimetypes, os
+import io, json, logging, hashlib, os
 from pathlib import Path
 import fitz  # PyMuPDF
 from .config import settings
@@ -31,12 +31,10 @@ def _render_pdf_pages(path: Path, max_pages: int = 1, dpi: int = 200) -> list[by
             if i >= max_pages:
                 break
             pix = page.get_pixmap(matrix=mat, alpha=False)
-            buf = io.BytesIO(pix.tobytes("png"))
-            images.append(buf.getvalue())
+            images.append(pix.tobytes("png"))
     return images
 
 def _make_creds():
-    from google.oauth2 import service_account
     if settings.google_creds:
         return service_account.Credentials.from_service_account_file(settings.google_creds)
     elif settings.google_creds_json:
@@ -81,7 +79,7 @@ def google_vision_ocr(file_path: Path) -> tuple[str, str | None]:
     return text, None
 
 def ocr_file(file_path: Path) -> tuple[str, str | None]:
-    # Cache by hash
+    # Cache by SHA256 of file bytes
     fhash = _file_hash(file_path)
     cached = TEXT_DIR / f"{fhash}.txt"
     if cached.exists():
@@ -98,10 +96,11 @@ def ocr_file(file_path: Path) -> tuple[str, str | None]:
         pages = _render_pdf_pages(file_path, MAX_OCR_PAGES, OCR_DPI)
         if not pages:
             return "", "PDF render failed (no pages)"
-        parts = []
-        for idx, png in enumerate(pages, start=1):
+        parts: list[str] = []
+        for png in pages:
             t, e = google_vision_image_bytes(png)
-            if e: err = e
+            if e:
+                err = e
             parts.append(t)
         text = "\n".join(parts).strip()
 
@@ -114,4 +113,3 @@ def ocr_file(file_path: Path) -> tuple[str, str | None]:
 
     cached.write_text(text, encoding="utf-8")
     return text, None
-```
