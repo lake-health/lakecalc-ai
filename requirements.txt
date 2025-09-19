@@ -7,6 +7,7 @@ jinja2==3.1.4
 aiofiles==24.1.0
 
 # --- OCR / PDF ---
+pymupdf==1.24.9
 pdfplumber==0.11.4
 pdfminer.six==20231228
 pypdf==4.3.1
