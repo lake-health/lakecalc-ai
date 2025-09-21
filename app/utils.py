@@ -2,7 +2,7 @@
 import openai
 import os
 
-def llm_extract_missing_fields(ocr_text: str, missing_fields: dict, model: str = "gpt-5-mini") -> dict:
+def llm_extract_missing_fields(ocr_text: str, missing_fields: dict, model: str = "gpt-4o-mini") -> dict:
     """
     Calls OpenAI LLM to extract only the missing fields for OD/OS from the OCR text.
     missing_fields: dict like {"od": ["axial_length", ...], "os": ["lt", ...]}
@@ -48,7 +48,7 @@ def llm_extract_missing_fields(ocr_text: str, missing_fields: dict, model: str =
             model=model,
             messages=[{"role": "user", "content": prompt_str}],
             temperature=0.0,
-            max_tokens=256,
+            max_completion_tokens=256,
         )
         content = response.choices[0].message.content
         import json

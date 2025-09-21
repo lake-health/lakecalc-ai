@@ -1,3 +1,12 @@
+## LLM Model Change (September 2025)
+
+The default LLM model for field extraction is now `gpt-4o-mini` (see `app/utils.py`).
+
+- The OpenAI API call uses `max_completion_tokens` instead of `max_tokens` for compatibility with newer models.
+- Set your `OPENAI_API_KEY` as an environment variable locally and on Railway.
+- You can override the model by passing a different model name to the utility function if needed.
+
+**Note:** Using GPT-4o or GPT-5 models may have different cost and latency profiles compared to previous models. Monitor your usage accordingly.
 # Lakecalc AI
 
 A FastAPI-based backend for parsing PDFs, running OCR on images, and extracting intraocular lens (IOL) data.  
