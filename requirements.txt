@@ -23,3 +23,6 @@ tiktoken==0.7.0
 pydantic==2.9.2
 # If you’re not actually using Pydantic for settings anymore, you can drop this:
 # pydantic-settings==2.5.2
+
+# Test dependencies
+pytest>=7.0.0
