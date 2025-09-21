@@ -78,6 +78,9 @@ async def upload(file: UploadFile = File(...)):
     return UploadResponse(file_id=fid, filename=file.filename)
 
 
+
+from app.utils import llm_extract_missing_fields
+
 @app.get("/extract/{file_id}", response_model=ExtractResult)
 async def extract(file_id: str, debug: bool = False):
     # find file by prefix
@@ -93,8 +96,30 @@ async def extract(file_id: str, debug: bool = False):
         return res
 
     parsed = parse_text(file_id, text)
-    write_audit("extract_ok", parsed.model_dump())
     result = parsed.model_dump()
+
+    # Identify missing/low-confidence fields for LLM fallback
+    def get_missing_fields(eye):
+        fields = ["axial_length", "lt", "cct", "ak", "axis"]
+        return [k for k in fields if not getattr(parsed, eye).__dict__.get(k)]
+    missing_fields = {
+        "od": get_missing_fields("od"),
+        "os": get_missing_fields("os"),
+    }
+
+    # Only call LLM if any fields are missing
+    if missing_fields["od"] or missing_fields["os"]:
+        llm_results = llm_extract_missing_fields(text, missing_fields)
+        for eye in ("od", "os"):
+            for k, v in llm_results.get(eye, {}).items():
+                if not result[eye][k] and v:
+                    result[eye][k] = v
+                    result["confidence"][f"{eye}.{k}"] = 0.7  # Mark as LLM-filled
+        result["llm_fallback"] = True
+    else:
+        result["llm_fallback"] = False
+
+    write_audit("extract_ok", result)
     if debug:
         result["ocr_text"] = text
     return JSONResponse(result)
