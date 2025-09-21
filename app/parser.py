@@ -240,19 +240,14 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
         k2_raw, _ = scalars.get("k2", ("", None))
         setattr(fld, "k1", k1_raw)
         setattr(fld, "k2", k2_raw)
-        # axis per K: populate k1_axis/k2_axis from paired heuristics or scalar axis
-        k1_ax = pairs.get("k1_axis")
-        k2_ax = pairs.get("k2_axis")
-        # if a generic 'axis' scalar exists, use it for k1 if neither specific axis found
-        generic_axis = scalars.get("axis", ("", None))[0] if scalars.get("axis") else ""
-        if not k1_ax and generic_axis:
-            k1_ax = generic_axis
-        if not k2_ax and generic_axis:
-            k2_ax = generic_axis
-        fld.k1_axis = k1_ax or ""
-        fld.k2_axis = k2_ax or ""
-        # Deprecated single-axis kept for backward compat: prefer k1_axis
-        fld.axis = fld.k1_axis or fld.k2_axis or ""
+        # axis per K: populate k1_axis/k2_axis from paired heuristics only
+        # Do NOT use any standalone/generic 'axis' scalar fallback to avoid leakage
+        k1_ax = pairs.get("k1_axis") or ""
+        k2_ax = pairs.get("k2_axis") or ""
+        fld.k1_axis = k1_ax
+        fld.k2_axis = k2_ax
+        # Deprecated single-axis kept for backward compat: prefer k1_axis only if present
+        fld.axis = fld.k1_axis if fld.k1_axis else (fld.k2_axis if fld.k2_axis else "")
         # ak
         ak_raw = scalars.get("ak", ("", None))[0] if scalars.get("ak") else ""
         fld.ak = ak_raw
