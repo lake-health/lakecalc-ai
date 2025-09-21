@@ -51,6 +51,17 @@ def llm_extract_missing_fields(ocr_text: str, missing_fields: dict, model: str =
             max_completion_tokens=256,
         )
         content = response.choices[0].message.content
+        # Remove Markdown code block markers if present
+        if content.strip().startswith("```"):
+            # Remove the first line (``` or ```json) and the last line (```)
+            lines = content.strip().splitlines()
+            # Remove first line if it starts with ```
+            if lines[0].startswith("```"):
+                lines = lines[1:]
+            # Remove last line if it is ```
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            content = "\n".join(lines)
         import json
         try:
             result = json.loads(content)
