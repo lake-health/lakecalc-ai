@@ -1,6 +1,8 @@
-import re, logging
-from typing import Dict, Tuple
+import re, logging, json, os
+from typing import Dict, Tuple, List
+from pathlib import Path
 from .utils import to_float, check_range, hash_text, llm_extract_missing_fields
+from .config import settings
 from .models.api import ExtractResult, EyeData
 
 log = logging.getLogger(__name__)
@@ -64,6 +66,17 @@ def detect_device(text: str) -> str:
 
 
 def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
+    # Optionally use layout-aware pairing if a layout cache exists and flag enabled
+    use_layout = os.getenv("USE_LAYOUT_PAIRING", "false").lower() in ("1", "true", "yes")
+    layout_data = None
+    if use_layout:
+        try:
+            fhash = hash_text(text)
+            layout_path = Path(settings.uploads_dir) / "ocr" / f"{fhash}.json"
+            if layout_path.exists():
+                layout_data = json.loads(layout_path.read_text(encoding="utf-8"))
+        except Exception:
+            layout_data = None
     dev = detect_device(text)
     patterns = PATTERNS.get(dev, PATTERNS["Generic"])
 
@@ -211,7 +224,71 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
                     break
                 if found_axis:
                     out[f"{kkey}_axis"] = found_axis
-        # 2) If still missing, fall back to any axis tokens but FILTER OUT axes that appear on lines with 'mm' or 'CW-Chord' (likely chord/measurement axes)
+        # 2) If still missing, try layout-based pairing (if available) before falling back to raw axis tokens
+        if ("k1_axis" not in out or "k2_axis" not in out) and layout_data:
+            try:
+                # build a flat list of words with approximate centers and text
+                words = []
+                for p in layout_data.get("pages", []):
+                    for b in p.get("blocks", []):
+                        for par in b.get("paragraphs", []):
+                            for w in par.get("words", []):
+                                txt = w.get("text", "")
+                                bbox = w.get("bbox", [])
+                                if not bbox:
+                                    continue
+                                # compute center
+                                xs = [v.get("x", 0) for v in bbox]
+                                ys = [v.get("y", 0) for v in bbox]
+                                cx = sum(xs) / len(xs)
+                                cy = sum(ys) / len(ys)
+                                words.append({"text": txt, "cx": cx, "cy": cy})
+                # find k1/k2 word positions (matching tokens like 'K1' or numeric K values nearby)
+                k_positions = {"K1": [], "K2": []}
+                for w in words:
+                    if re.fullmatch(r"K1", w["text"], re.I):
+                        k_positions["K1"].append(w)
+                    if re.fullmatch(r"K2", w["text"], re.I):
+                        k_positions["K2"].append(w)
+                # Try to locate axis tokens like '@' followed by number in neighboring words
+                axis_words = []
+                for i, w in enumerate(words):
+                    # axis may be represented as '@' token followed by '100' or '@100' or '@' in same word
+                    if re.search(r"@|°", w["text"]):
+                        # try to extract number from this word or next word
+                        mnum = re.search(r"(\d{1,3})", w["text"])
+                        if mnum:
+                            axis_words.append({"cx": w["cx"], "cy": w["cy"], "val": mnum.group(1)})
+                        else:
+                            # look ahead for a numeric word
+                            if i + 1 < len(words) and re.fullmatch(r"\d{1,3}", words[i+1]["text"]):
+                                axis_words.append({"cx": words[i+1]["cx"], "cy": words[i+1]["cy"], "val": words[i+1]["text"]})
+                # For each K, find nearest axis by vertical distance and reasonable horizontal proximity
+                for klabel in ("K1", "K2"):
+                    if f"{klabel.lower()}_axis" in out:
+                        continue
+                    candidates = k_positions.get(klabel, [])
+                    if not candidates:
+                        continue
+                    # pick the first k token position as anchor
+                    anchor = candidates[0]
+                    best = None
+                    best_dist = 1e12
+                    for a in axis_words:
+                        dy = abs(a["cy"] - anchor["cy"])
+                        dx = abs(a["cx"] - anchor["cx"])
+                        # penalize very distant vertical distances
+                        score = dy + (dx * 0.2)
+                        if score < best_dist and dy < 200:  # 200px vertical threshold empiric
+                            best_dist = score
+                            best = a
+                    if best:
+                        out[f"{klabel.lower()}_axis"] = best["val"]
+            except Exception:
+                # fallback to raw axis tokens below
+                pass
+
+        # fallback to any axis tokens but FILTER OUT axes that appear on lines with 'mm' or 'CW-Chord' (likely chord/measurement axes)
         if "k1_axis" not in out or "k2_axis" not in out:
             axis_list = []
             for m in re.finditer(r"@\s*(\d{1,3})\s*°", eye_text):
