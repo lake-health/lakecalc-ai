@@ -195,9 +195,22 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
             m = re.search(rf"\b{klabel}\b\s*[:\-]?\s*\d{{1,3}}[\.,]\d{{1,3}}\s*D", eye_text, re.I)
             if m:
                 tail = eye_text[m.end():m.end()+180]
-                m2 = re.search(r"@\s*(\d{1,3})\s*°", tail)
-                if m2:
-                    out[f"{kkey}_axis"] = m2.group(1)
+                # iterate possible axis matches in the tail and choose the first one
+                # whose line context does not look like another measurement (e.g., CW-Chord, TK, AK)
+                found_axis = None
+                for m2 in re.finditer(r"@\s*(\d{1,3})\s*°", tail):
+                    # compute absolute position of axis in eye_text
+                    abs_pos = m.end() + m2.start()
+                    line_start = eye_text.rfind('\n', 0, abs_pos) + 1
+                    line_end = eye_text.find('\n', abs_pos)
+                    line = eye_text[line_start: line_end if line_end != -1 else None]
+                    # skip if the axis line includes tokens that indicate non-keratometry measurements
+                    if re.search(r"\b(TK1|TK2|TK|ATK|AK|CW[- ]?Chord|Chord|mm|μm)\b", line, re.I):
+                        continue
+                    found_axis = m2.group(1)
+                    break
+                if found_axis:
+                    out[f"{kkey}_axis"] = found_axis
         # 2) If still missing, fall back to any axis tokens but FILTER OUT axes that appear on lines with 'mm' or 'CW-Chord' (likely chord/measurement axes)
         if "k1_axis" not in out or "k2_axis" not in out:
             axis_list = []
