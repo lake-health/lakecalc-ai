@@ -77,28 +77,36 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
     # Split text into OD/OS segments using headings or page breaks, robust to OS-only or OD-only files
     od_text = ""
     os_text = ""
-    # Try to split by 'OD' and 'OS' headings
+    # Try to split by 'OD' and 'OS' headings, but also search for OS block anywhere in text
     od_match = re.search(r"(?m)^\s*OD\b[:\-]?[\s\S]{0,800}?Valores biométricos[\s\S]{0,400}", text, re.I)
     os_match = re.search(r"(?m)^\s*OS\b[:\-]?[\s\S]{0,800}?Valores biométricos[\s\S]{0,400}", text, re.I)
     if od_match:
         od_text = od_match.group(0)
+    # For OS, if not found at top level, search for any block starting with 'OS' and containing 'Valores biométricos' or 'AL:'
     if os_match:
         os_text = os_match.group(0)
+    else:
+        os_block = re.search(r"OS[\s\S]{0,2000}?(Valores biométricos|AL:)\s*[:\-]?[\s\S]{0,400}", text, re.I)
+        if os_block:
+            os_text = os_block.group(0)
     # Fallback: try splitting by first/second page markers (\nPágina)
     pages = re.split(r"\nPágina\s+\d+\s+de\s+\d+", text)
     if not od_text and not os_text:
         if len(pages) == 1:
-            # Single page: could be OD or OS only, use full text for both and let extraction decide
-            od_text = text
+            # Single page: could be OD or OS only, use full text for OS, leave OD empty
+            od_text = ""
             os_text = text
         elif len(pages) >= 2:
             od_text = pages[0]
             os_text = pages[1]
-    # If still empty, default od_text to full text
-    if not od_text:
-        od_text = text
-    if not os_text:
+    # If still empty, default od_text to empty and os_text to full text
+    if not od_text and os_text:
+        od_text = ""
+    if not os_text and od_text:
         os_text = ""
+    if not od_text and not os_text:
+        od_text = ""
+        os_text = text
     # Determine if there's a separate OS page: if we split into multiple pages, use second page
     os_present = False
     if os_match:
@@ -125,7 +133,7 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
                 scalars[key] = (raw, val)
         return scalars
 
-    od_scalars = extract_for_eye(od_text)
+    od_scalars = extract_for_eye(od_text) if od_text else {}
     os_scalars = extract_for_eye(os_text) if os_text else {}
 
     log.debug("Parsed scalars sizes: od=%d os=%d", len(od_scalars), len(os_scalars))
@@ -145,14 +153,13 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
                 # Try to find axis on same line
                 axis_m = re.search(r"@\s*(\d{1,3})\s*°", line)
                 kaxis = axis_m.group(1) if axis_m else None
-                # If not found, look at the next non-empty line for axis, but only if it is not another measurement or label
+                # If not found, look at the next non-empty line for axis, but only if it is just an axis (e.g., '@ 100°')
                 if not kaxis:
                     for j in range(1, 3):
                         if i + j < len(lines):
                             next_line = lines[i + j].strip()
                             if not next_line:
                                 continue
-                            # Only accept axis if next line is just an axis (e.g., '@ 100°') and not a measurement or label
                             axis_only = re.fullmatch(r"@\s*(\d{1,3})\s*°", next_line)
                             if axis_only:
                                 kaxis = axis_only.group(1)
@@ -161,7 +168,8 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
                             if re.search(r"(CW-Chord|AL|WTW|CCT|ACD|LT|AK|SE|SD|TK|ATK|P|Ix|ly|Fixação|Comentário|mm|μm|D|VA|Status de olho|Resultado|Paciente|Médico|Operador|Data|Versão|Página)", next_line, re.I):
                                 break
                 k_results[kname]["val"] = kval
-                k_results[kname]["axis"] = kaxis
+                # Only assign axis if found in correct context, else leave blank
+                k_results[kname]["axis"] = kaxis if kaxis else ""
         # Assign results
         if k_results["K1"]["val"]:
             out["k1"] = k_results["K1"]["val"]
