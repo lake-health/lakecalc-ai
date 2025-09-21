@@ -16,7 +16,7 @@ pdf2image==1.17.0
 google-cloud-vision==3.7.2
 
 # --- OpenAI + token handling ---
-openai==1.43.0
+openai>=1.43.0
 tiktoken==0.7.0
 
 # --- Validation / settings ---
