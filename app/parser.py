@@ -134,47 +134,47 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
     # Heuristic pairing for K1/K2 axes if axis lines are on separate lines with @ notation
     def pair_k_values(scalars: Dict[str, Tuple[str, float | None]], eye_text: str) -> Dict[str, str]:
         out = {}
-        # New: robustly extract K1/K2 and their axes from nearby text
-        # Pattern matches lines like 'K1: 40,95 D @ 100°' or 'K1: 40,95 D\n@ 100°'
-        k_rx = re.compile(r"\b(?P<k>K1|K2)\b\s*[:\-]?\s*(?P<val>\d{1,3}[\.,]\d{1,3})\s*D(?:\s*@\s*(?P<axis>\d{1,3})\s*°)?", re.I)
-        # Search sequentially and assign k1/k2 and axes
-        found_k = {"K1": None, "K2": None}
-        for m in k_rx.finditer(eye_text):
-            kname = m.group("k").upper()
-            kval = m.group("val")
-            kaxis = m.group("axis")
-            # If axis missing, look ahead a short distance for '@ N°'
-            if not kaxis:
-                tail = eye_text[m.end():m.end()+120]
-                m2 = re.search(r"@\s*(?P<axis>\d{1,3})\s*°", tail)
-                if m2:
-                    kaxis = m2.group("axis")
-            found_k[kname] = (kval, kaxis)
-
+        # Split into lines for robust lookahead/backward matching
+        lines = eye_text.splitlines()
+        k_results = {"K1": {"val": None, "axis": None}, "K2": {"val": None, "axis": None}}
+        for i, line in enumerate(lines):
+            m = re.search(r"\b(K1|K2)\b\s*[:\-]?\s*(\d{1,3}[\.,]\d{1,3})\s*D", line, re.I)
+            if m:
+                kname = m.group(1).upper()
+                kval = m.group(2)
+                # Try to find axis on same line
+                axis_m = re.search(r"@\s*(\d{1,3})\s*°", line)
+                kaxis = axis_m.group(1) if axis_m else None
+                # If not found, look at next 2 lines for axis
+                if not kaxis:
+                    for j in range(1, 3):
+                        if i + j < len(lines):
+                            axis_m2 = re.search(r"@\s*(\d{1,3})\s*°", lines[i + j])
+                            if axis_m2:
+                                kaxis = axis_m2.group(1)
+                                break
+                k_results[kname]["val"] = kval
+                k_results[kname]["axis"] = kaxis
         # Assign results
-        if found_k.get("K1"):
-            out["k1"] = found_k["K1"][0]
-            if found_k["K1"][1]:
-                out["k1_axis"] = found_k["K1"][1]
-        if found_k.get("K2"):
-            out["k2"] = found_k["K2"][0]
-            if found_k["K2"][1]:
-                out["k2_axis"] = found_k["K2"][1]
-
+        if k_results["K1"]["val"]:
+            out["k1"] = k_results["K1"]["val"]
+            if k_results["K1"]["axis"]:
+                out["k1_axis"] = k_results["K1"]["axis"]
+        if k_results["K2"]["val"]:
+            out["k2"] = k_results["K2"]["val"]
+            if k_results["K2"]["axis"]:
+                out["k2_axis"] = k_results["K2"]["axis"]
         # Fallback: if no K1/K2 found via dedicated pattern, use scalars
         if "k1" not in out and scalars.get("k1"):
             out["k1"] = scalars.get("k1")[0]
         if "k2" not in out and scalars.get("k2"):
             out["k2"] = scalars.get("k2")[0]
-
         # Axis generic fallback: assign only to the missing axis, not both
         axis_matches = re.findall(r"@\s*(\d{1,3})\s*°", eye_text)
         if "k1_axis" not in out and axis_matches:
             out["k1_axis"] = axis_matches[0]
         if "k2_axis" not in out and len(axis_matches) > 1:
             out["k2_axis"] = axis_matches[1]
-        # If only one axis is found and only one is missing, assign to that one only
-        # Never assign the same axis to both k1_axis and k2_axis
         return out
 
     od_pairs = pair_k_values(od_scalars, od_text)
