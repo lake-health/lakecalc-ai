@@ -16,7 +16,7 @@ except Exception as e:
     vision = None
     log.exception("Failed importing Google Vision SDK: %s", e)
 
-MAX_OCR_PAGES = int(os.getenv("MAX_OCR_PAGES", "1"))
+MAX_OCR_PAGES = int(os.getenv("MAX_OCR_PAGES", "2"))  # Only process first 2 pages by default for ophthalmology docs
 OCR_DPI = int(os.getenv("OCR_DPI", "200"))
 
 def _file_hash(path: Path) -> str:
@@ -93,6 +93,7 @@ def ocr_file(file_path: Path) -> tuple[str, str | None]:
         text, err = google_vision_ocr(file_path)
 
     elif ext == ".pdf":
+        # Only process the first MAX_OCR_PAGES pages to avoid confusion from extra layouts
         pages = _render_pdf_pages(file_path, MAX_OCR_PAGES, OCR_DPI)
         if not pages:
             return "", "PDF render failed (no pages)"
