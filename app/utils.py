@@ -15,9 +15,9 @@ def llm_extract_missing_fields(ocr_text: str, missing_fields: dict, model: str =
 
     # Build prompt
     prompt = [
-        "Extract the following fields for both eyes (OD and OS) from the text below. OD and OS data may appear on either of the first two pages, and the order/layout may vary. Carefully match the correct values to each eye, even if the pages are inverted or the layout is mirrored. If a field is missing, return an empty string. Output as JSON.",
-        f"OD fields: {', '.join(missing_fields.get('od', []))}",
-        f"OS fields: {', '.join(missing_fields.get('os', []))}",
+        "Extract the following fields for both eyes (OD and OS) from the text below. OD and OS data may appear on either of the first two pages, and the order/layout may vary. Carefully match the correct values to each eye, even if the pages are inverted or the layout is mirrored. For K1 and K2, always extract both the value (in diopters) and the axis (in degrees), and output them as an object with 'value' and 'axis' keys. Do not repeat K1/K2 values for the same eye. If a field is missing, return an empty string. Output as JSON.",
+        f"OD fields: {', '.join([f'{f} (for K1/K2: value and axis)' if f in ['k1','k2'] else f for f in missing_fields.get('od', [])])}",
+        f"OS fields: {', '.join([f'{f} (for K1/K2: value and axis)' if f in ['k1','k2'] else f for f in missing_fields.get('os', [])])}",
         "Text:",
         '"""',
         ocr_text.strip(),
@@ -28,15 +28,17 @@ def llm_extract_missing_fields(ocr_text: str, missing_fields: dict, model: str =
         '    "axial_length": "",',
         '    "lt": "",',
         '    "cct": "",',
-        '    "ak": "",',
-        '    "axis": ""',
+        '    "k1": {"value": "", "axis": ""},',
+        '    "k2": {"value": "", "axis": ""},',
+        '    "ak": ""',
         '  },',
         '  "os": {',
         '    "axial_length": "",',
         '    "lt": "",',
         '    "cct": "",',
-        '    "ak": "",',
-        '    "axis": ""',
+        '    "k1": {"value": "", "axis": ""},',
+        '    "k2": {"value": "", "axis": ""},',
+        '    "ak": ""',
         '  }',
         '}'
     ]
