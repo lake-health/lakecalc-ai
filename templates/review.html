@@ -24,7 +24,7 @@
           <label>k2 <input name="od.k2" /></label>
           <label>k2 axis <input name="od.k2_axis" /></label>
           <label>ak <input name="od.ak" /></label>
-          <label>(deprecated) axis <input name="od.axis" /></label>
+          
         </div>
         <div>
           <h2>OS</h2>
@@ -38,7 +38,7 @@
           <label>k2 <input name="os.k2" /></label>
           <label>k2 axis <input name="os.k2_axis" /></label>
           <label>ak <input name="os.ak" /></label>
-          <label>(deprecated) axis <input name="os.axis" /></label>
+          
         </div>
       </div>
       <button type="submit">Save Review</button>
@@ -107,8 +107,7 @@
         setIfExists(`${eye}.k1_axis`, obj.k1?.axis ?? obj.k1_axis ?? '');
         setIfExists(`${eye}.k2`, obj.k2?.value ?? obj.k2 ?? '');
         setIfExists(`${eye}.k2_axis`, obj.k2?.axis ?? obj.k2_axis ?? '');
-        setIfExists(`${eye}.ak`, obj.ak);
-        setIfExists(`${eye}.axis`, obj.axis ?? '');
+  setIfExists(`${eye}.ak`, obj.ak);
       }
     }catch(e){
       console.warn('Autofill failed', e);

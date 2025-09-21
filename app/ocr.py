@@ -183,7 +183,14 @@ def ocr_file(file_path: Path) -> tuple[str, str | None]:
         text, layout, err = google_vision_ocr_with_layout(file_path)
         if layout is not None:
             try:
-                layout_cached.write_text(json.dumps(layout), encoding="utf-8")
+                # write a versioned layout cache to allow future format changes
+                cache_obj = {
+                    "version": "1",
+                    "source": "google-vision",
+                    "text_hash": fhash,
+                    "pages": layout.get("pages", []),
+                }
+                layout_cached.write_text(json.dumps(cache_obj), encoding="utf-8")
             except Exception:
                 log.exception("Failed writing layout cache for %s", file_path.name)
 
@@ -205,7 +212,13 @@ def ocr_file(file_path: Path) -> tuple[str, str | None]:
         # cache combined layout
         if combined_layout.get("pages"):
             try:
-                layout_cached.write_text(json.dumps(combined_layout), encoding="utf-8")
+                cache_obj = {
+                    "version": "1",
+                    "source": "google-vision",
+                    "text_hash": fhash,
+                    "pages": combined_layout.get("pages", []),
+                }
+                layout_cached.write_text(json.dumps(cache_obj), encoding="utf-8")
             except Exception:
                 log.exception("Failed writing layout cache for pdf %s", file_path.name)
         text = "\n".join(parts).strip()

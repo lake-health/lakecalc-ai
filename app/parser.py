@@ -75,7 +75,17 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
             fhash = hash_text(text)
             layout_path = Path(settings.uploads_dir) / "ocr" / f"{fhash}.json"
             if layout_path.exists():
-                layout_data = json.loads(layout_path.read_text(encoding="utf-8"))
+                raw = json.loads(layout_path.read_text(encoding="utf-8"))
+                # support versioned cache objects; ensure version matches expected schema
+                if isinstance(raw, dict) and raw.get("version"):
+                    if raw.get("version") == "1" and raw.get("pages"):
+                        layout_data = {"pages": raw.get("pages")}
+                    else:
+                        log.warning("Unsupported layout cache version %s for %s", raw.get("version"), layout_path)
+                        layout_data = None
+                else:
+                    # legacy format: assume raw is already the pages dict
+                    layout_data = raw
         except Exception:
             layout_data = None
     dev = detect_device(text)
@@ -183,6 +193,13 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
                             # If next line contains any known measurement or label, break (do not assign axis)
                             if re.search(r"(CW-Chord|AL|WTW|CCT|ACD|LT|AK|SE|SD|TK|ATK|P|Ix|ly|Fixação|Comentário|mm|μm|D|VA|Status de olho|Resultado|Paciente|Médico|Operador|Data|Versão|Página)", next_line, re.I):
                                 break
+                            # Expand excluded tokens to include TSE and TK variants, and guard against numeric-only noise lines
+                            if re.search(r"(CW-Chord|AL|WTW|CCT|ACD|LT|AK|SE|SD|TSE|TK\d*|ATK|P|Ix|ly|Fixação|Comentário|mm|μm|D|VA|Status de olho|Resultado|Paciente|Médico|Operador|Data|Versão|Página)", next_line, re.I):
+                                break
+                            # also skip if the next line is just a short numeric token (likely noise like '888' or stray degrees)
+                            if re.fullmatch(r"\s*\d{1,4}\s*", next_line):
+                                break
+                                break
                 k_results[kname]["val"] = kval
                 # Only assign axis if found in correct context, else leave blank
                 k_results[kname]["axis"] = kaxis if kaxis else ""
@@ -221,7 +238,7 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
                         line_end = eye_text.find('\n', abs_pos)
                         line = eye_text[line_start: line_end if line_end != -1 else None]
                         # skip if the axis line includes tokens that indicate non-keratometry measurements
-                        if re.search(r"\b(TK1|TK2|TK|ATK|AK|CW[- ]?Chord|Chord|mm|μm)\b", line, re.I):
+                        if re.search(r"\b(TSE|TK1|TK2|TK|ATK|AK|CW[- ]?Chord|Chord|mm|μm|SD)\b", line, re.I):
                             continue
                         found_axis = m2.group(1)
                         break
@@ -314,8 +331,11 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
                 line_start = eye_text.rfind('\n', 0, s) + 1
                 line_end = eye_text.find('\n', s)
                 line = eye_text[line_start: line_end if line_end != -1 else None]
-                # skip axes that are part of measurements in mm or explicitly CW-Chord
-                if re.search(r"\bmm\b|CW[- ]?Chord|Chord\b", line, re.I):
+                # skip axes that are part of measurements in mm or explicitly CW-Chord or TSE/TK lines
+                if re.search(r"\bmm\b|CW[- ]?Chord|Chord\b|\bTSE\b|\bSD\b|TK\d*", line, re.I):
+                    continue
+                # skip numeric-only or very short noisy lines (e.g., '888' or stray digits)
+                if re.fullmatch(r"\s*\d{1,4}\s*", line):
                     continue
                 axis_list.append(m.group(1))
             if "k1_axis" not in out and len(axis_list) >= 1:
@@ -355,8 +375,7 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
         k2_ax = pairs.get("k2_axis") or ""
         fld.k1_axis = k1_ax
         fld.k2_axis = k2_ax
-        # Deprecated single-axis kept for backward compat: prefer k1_axis only if present
-        fld.axis = fld.k1_axis if fld.k1_axis else (fld.k2_axis if fld.k2_axis else "")
+    # No deprecated single-axis field: prefer explicit per-K axes only
         # ak
         ak_raw = scalars.get("ak", ("", None))[0] if scalars.get("ak") else ""
         fld.ak = ak_raw
@@ -374,9 +393,11 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
     # If important fields like axes are missing, call LLM fallback to try to fill gaps
     missing = {"od": [], "os": []}
     for eye in ("od", "os"):
-        if not getattr(getattr(result, eye), "axis"):
+        eye_obj = getattr(result, eye)
+        # consider axis missing if neither per-K axis is present
+        if not (getattr(eye_obj, "k1_axis", None) or getattr(eye_obj, "k2_axis", None)):
             missing[eye].append("axis")
-        if not getattr(getattr(result, eye), "axial_length"):
+        if not getattr(eye_obj, "axial_length"):
             missing[eye].append("axial_length")
     # If an eye segment wasn't present in the text, don't request LLM output for it
     if not od_present:

@@ -17,7 +17,6 @@ class EyeData(BaseModel):
     k1_axis: Optional[str] = ""
     k2_axis: Optional[str] = ""
     ak: Optional[str] = ""  # astig magnitude (e.g., “-2.35 D”) or deltaK
-    axis: Optional[str] = ""  # deprecated; kept for backward compat (unused)
     source: Optional[str] = ""
 
 class ExtractResult(BaseModel):
