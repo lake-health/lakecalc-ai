@@ -74,12 +74,10 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
         "os": EyeData(source=f"Ref: {dev}"),
     }
 
-    # Split text into OD/OS segments using simple headings or positional heuristics
-    # If we can't split, keep full text for parsing
+    # Split text into OD/OS segments using headings or page breaks, robust to OS-only or OD-only files
     od_text = ""
     os_text = ""
     # Try to split by 'OD' and 'OS' headings
-    # anchor OD/OS headings to line starts to avoid matching Portuguese 'os' words
     od_match = re.search(r"(?m)^\s*OD\b[:\-]?[\s\S]{0,800}?Valores biométricos[\s\S]{0,400}", text, re.I)
     os_match = re.search(r"(?m)^\s*OS\b[:\-]?[\s\S]{0,800}?Valores biométricos[\s\S]{0,400}", text, re.I)
     if od_match:
@@ -87,16 +85,20 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
     if os_match:
         os_text = os_match.group(0)
     # Fallback: try splitting by first/second page markers (\nPágina)
-    if not od_text and not os_text:
-        pages = re.split(r"\nPágina\s+\d+\s+de\s+\d+", text)
-        if len(pages) >= 1:
-            od_text = pages[0]
-        if len(pages) >= 2:
-            os_text = pages[1]
-    # If still empty, default od_text to full text but leave os_text empty unless a second page exists
     pages = re.split(r"\nPágina\s+\d+\s+de\s+\d+", text)
+    if not od_text and not os_text:
+        if len(pages) == 1:
+            # Single page: could be OD or OS only, use full text for both and let extraction decide
+            od_text = text
+            os_text = text
+        elif len(pages) >= 2:
+            od_text = pages[0]
+            os_text = pages[1]
+    # If still empty, default od_text to full text
     if not od_text:
         od_text = text
+    if not os_text:
+        os_text = ""
     # Determine if there's a separate OS page: if we split into multiple pages, use second page
     os_present = False
     if os_match:
@@ -104,15 +106,13 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
     elif len(pages) >= 2 and pages[1].strip():
         os_text = pages[1]
         os_present = True
-    else:
-        # leave os_text empty to avoid duplicating OD
-        os_text = ""
-
+    elif os_text and not od_text:
+        # OS-only file: treat as OS present
+        os_present = True
     # If os_text is identical to od_text, treat OS as not present (avoid duplication)
     if os_text and od_text and os_text.strip() == od_text.strip():
         os_text = ""
         os_present = False
-
     # log detected presence
     if not os_present:
         log.debug("OS segment not detected; will not populate OS fields or merge LLM results")
@@ -167,15 +167,14 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
         if "k2" not in out and scalars.get("k2"):
             out["k2"] = scalars.get("k2")[0]
 
-        # Axis generic fallback: find first axis token if none paired
-        if "k1_axis" not in out and "k2_axis" not in out:
-            axis_matches = re.findall(r"@\s*(\d{1,3})\s*°", eye_text)
-            if axis_matches:
-                if len(axis_matches) >= 1:
-                    out.setdefault("k1_axis", axis_matches[0])
-                if len(axis_matches) >= 2:
-                    out.setdefault("k2_axis", axis_matches[1])
-
+        # Axis generic fallback: assign only to the missing axis, not both
+        axis_matches = re.findall(r"@\s*(\d{1,3})\s*°", eye_text)
+        if "k1_axis" not in out and axis_matches:
+            out["k1_axis"] = axis_matches[0]
+        if "k2_axis" not in out and len(axis_matches) > 1:
+            out["k2_axis"] = axis_matches[1]
+        # If only one axis is found and only one is missing, assign to that one only
+        # Never assign the same axis to both k1_axis and k2_axis
         return out
 
     od_pairs = pair_k_values(od_scalars, od_text)
