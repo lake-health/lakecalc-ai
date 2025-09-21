@@ -77,8 +77,9 @@ async def upload(file: UploadFile = File(...)):
     write_audit("upload", {"file_id": fid, "filename": file.filename, "content_type": file.content_type, "size_mb": mb})
     return UploadResponse(file_id=fid, filename=file.filename)
 
+
 @app.get("/extract/{file_id}", response_model=ExtractResult)
-async def extract(file_id: str):
+async def extract(file_id: str, debug: bool = False):
     # find file by prefix
     matches = list(UPLOADS.glob(file_id + "*"))
     if not matches:
@@ -93,7 +94,10 @@ async def extract(file_id: str):
 
     parsed = parse_text(file_id, text)
     write_audit("extract_ok", parsed.model_dump())
-    return JSONResponse(parsed.model_dump())
+    result = parsed.model_dump()
+    if debug:
+        result["ocr_text"] = text
+    return JSONResponse(result)
 
 @app.post("/review")
 async def review(payload: ReviewPayload):
