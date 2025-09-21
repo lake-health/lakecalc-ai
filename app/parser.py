@@ -117,6 +117,8 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
     elif os_text and not od_text:
         # OS-only file: treat as OS present
         os_present = True
+    # Determine whether OD segment was detected (if od_text is non-empty)
+    od_present = bool(od_text and od_text.strip())
     # If os_text is identical to od_text, treat OS as not present (avoid duplication)
     if os_text and od_text and os_text.strip() == od_text.strip():
         os_text = ""
@@ -269,6 +271,11 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
             missing[eye].append("axis")
         if not getattr(getattr(result, eye), "axial_length"):
             missing[eye].append("axial_length")
+    # If an eye segment wasn't present in the text, don't request LLM output for it
+    if not od_present:
+        missing["od"] = []
+    if not os_present:
+        missing["os"] = []
     if missing["od"] or missing["os"]:
         try:
             # use injected llm_func if provided (for testing), else default util
@@ -278,9 +285,12 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
             log.debug("LLM output: %s", llm_out)
             # merge LLM outputs carefully
             for eye in ("od", "os"):
-                # skip merging LLM outputs for OS if OS segment wasn't present
+                # skip merging LLM outputs for an eye if its segment wasn't present
                 if eye == "os" and not os_present:
                     log.debug("Skipping LLM merge for OS because OS not present")
+                    continue
+                if eye == "od" and not od_present:
+                    log.debug("Skipping LLM merge for OD because OD not present")
                     continue
                 eye_obj = getattr(result, eye)
                 eye_llm = llm_out.get(eye, {})
@@ -289,8 +299,13 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
                         # respect value/axis pairs
                         if v.get("value") and not getattr(eye_obj, k):
                             setattr(eye_obj, k, v.get("value"))
-                        if v.get("axis") and not getattr(eye_obj, "axis"):
-                            eye_obj.axis = v.get("axis")
+                        # only set per-eye axis fields if specific k1/k2 axis keys are provided
+                        if v.get("axis"):
+                            # prefer assigning to k1_axis/k2_axis, not the deprecated single 'axis'
+                            if k == "k1" and not getattr(eye_obj, "k1_axis"):
+                                eye_obj.k1_axis = v.get("axis")
+                            if k == "k2" and not getattr(eye_obj, "k2_axis"):
+                                eye_obj.k2_axis = v.get("axis")
                     else:
                         if v and not getattr(eye_obj, k):
                             setattr(eye_obj, k, v)
