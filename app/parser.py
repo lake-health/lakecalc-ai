@@ -145,14 +145,18 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
                 # Try to find axis on same line
                 axis_m = re.search(r"@\s*(\d{1,3})\s*°", line)
                 kaxis = axis_m.group(1) if axis_m else None
-                # If not found, look at next 2 lines for axis
+                # If not found, look at next 2 lines for axis, but only if the line is not another measurement
                 if not kaxis:
                     for j in range(1, 3):
                         if i + j < len(lines):
-                            axis_m2 = re.search(r"@\s*(\d{1,3})\s*°", lines[i + j])
-                            if axis_m2:
-                                kaxis = axis_m2.group(1)
-                                break
+                            next_line = lines[i + j]
+                            # Only accept axis if next line does NOT contain a known measurement (e.g., CW-Chord, AL, WTW, CCT, ACD, LT, AK, SE, SD, TK, ATK, P, Ix, ly, Fixação, Comentário, etc.)
+                            if re.search(r"@\s*(\d{1,3})\s*°", next_line):
+                                if not re.search(r"(CW-Chord|AL|WTW|CCT|ACD|LT|AK|SE|SD|TK|ATK|P|Ix|ly|Fixação|Comentário|mm|μm|D|VA|Status de olho|Resultado|Paciente|Médico|Operador|Data|Versão|Página)", next_line, re.I):
+                                    axis_m2 = re.search(r"@\s*(\d{1,3})\s*°", next_line)
+                                    if axis_m2:
+                                        kaxis = axis_m2.group(1)
+                                        break
                 k_results[kname]["val"] = kval
                 k_results[kname]["axis"] = kaxis
         # Assign results
