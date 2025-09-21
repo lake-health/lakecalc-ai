@@ -6,8 +6,10 @@ def llm_extract_missing_fields(ocr_text: str, missing_fields: dict, model: str =
     """
     Calls OpenAI LLM to extract only the missing fields for OD/OS from the OCR text.
     missing_fields: dict like {"od": ["axial_length", ...], "os": ["lt", ...]}
-    Returns: dict with structure {"od": {...}, "os": {...}}
+    Returns: dict with structure {"od": {...}, "os": {...}}. On error, returns error info in 'llm_error' key.
     """
+    import logging
+    logger = logging.getLogger("llm_fallback")
     if not missing_fields.get("od") and not missing_fields.get("os"):
         return {"od": {}, "os": {}}
 
@@ -41,20 +43,24 @@ def llm_extract_missing_fields(ocr_text: str, missing_fields: dict, model: str =
     prompt_str = "\n".join(prompt)
 
     openai.api_key = os.getenv("OPENAI_API_KEY")
-    response = openai.chat.completions.create(
-        model=model,
-        messages=[{"role": "user", "content": prompt_str}],
-        temperature=0.0,
-        max_tokens=256,
-    )
-    # Parse JSON from LLM response
-    import json
-    content = response.choices[0].message.content
     try:
-        result = json.loads(content)
-    except Exception:
-        result = {"od": {}, "os": {}}
-    return result
+        response = openai.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt_str}],
+            temperature=0.0,
+            max_tokens=256,
+        )
+        content = response.choices[0].message.content
+        import json
+        try:
+            result = json.loads(content)
+        except Exception as je:
+            logger.error(f"LLM JSON parse error: {je}; content: {content}")
+            return {"od": {}, "os": {}, "llm_error": f"JSON parse error: {je}"}
+        return result
+    except Exception as e:
+        logger.error(f"LLM API error: {e}")
+        return {"od": {}, "os": {}, "llm_error": str(e)}
 import re, hashlib
 
 DECIMAL_RX = re.compile(r"(?P<num>\d{1,3}[\.,]\d{1,3})")
