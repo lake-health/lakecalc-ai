@@ -10,5 +10,6 @@ class Settings(BaseModel):
     max_upload_mb: int = int(os.getenv("MAX_UPLOAD_MB", "30"))
     toric_threshold: float = float(os.getenv("TORIC_THRESHOLD", "1.0"))
     sia_default: float = float(os.getenv("SIA_DEFAULT", "0.3"))
+    strict_text_extraction: bool = os.getenv("STRICT_TEXT_EXTRACTION", "false").lower() in ("1", "true", "yes")
 
 settings = Settings()

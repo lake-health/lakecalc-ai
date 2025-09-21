@@ -68,6 +68,7 @@ def detect_device(text: str) -> str:
 def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
     # Optionally use layout-aware pairing if a layout cache exists and flag enabled
     use_layout = os.getenv("USE_LAYOUT_PAIRING", "false").lower() in ("1", "true", "yes")
+    strict_text = settings.strict_text_extraction
     layout_data = None
     if use_layout:
         try:
@@ -200,32 +201,35 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
         if "k2" not in out and scalars.get("k2"):
             out["k2"] = scalars.get("k2")[0]
         # Axis generic fallback: prefer axes that are near K1/K2 occurrences
-        # 1) Try to find an axis token within ~180 chars after each K1/K2 match
-        for key_label in (("k1", "K1"), ("k2", "K2")):
-            kkey, klabel = key_label
-            if f"{kkey}_axis" in out:
-                continue
-            m = re.search(rf"\b{klabel}\b\s*[:\-]?\s*\d{{1,3}}[\.,]\d{{1,3}}\s*D", eye_text, re.I)
-            if m:
-                tail = eye_text[m.end():m.end()+180]
-                # iterate possible axis matches in the tail and choose the first one
-                # whose line context does not look like another measurement (e.g., CW-Chord, TK, AK)
-                found_axis = None
-                for m2 in re.finditer(r"@\s*(\d{1,3})\s*°", tail):
-                    # compute absolute position of axis in eye_text
-                    abs_pos = m.end() + m2.start()
-                    line_start = eye_text.rfind('\n', 0, abs_pos) + 1
-                    line_end = eye_text.find('\n', abs_pos)
-                    line = eye_text[line_start: line_end if line_end != -1 else None]
-                    # skip if the axis line includes tokens that indicate non-keratometry measurements
-                    if re.search(r"\b(TK1|TK2|TK|ATK|AK|CW[- ]?Chord|Chord|mm|μm)\b", line, re.I):
-                        continue
-                    found_axis = m2.group(1)
-                    break
-                if found_axis:
-                    out[f"{kkey}_axis"] = found_axis
+        # If strict_text extraction is enabled, skip generic axis fallback entirely
+        if not strict_text:
+            # 1) Try to find an axis token within ~180 chars after each K1/K2 match
+            for key_label in (("k1", "K1"), ("k2", "K2")):
+                kkey, klabel = key_label
+                if f"{kkey}_axis" in out:
+                    continue
+                m = re.search(rf"\b{klabel}\b\s*[:\-]?\s*\d{{1,3}}[\.,]\d{{1,3}}\s*D", eye_text, re.I)
+                if m:
+                    tail = eye_text[m.end():m.end()+180]
+                    # iterate possible axis matches in the tail and choose the first one
+                    # whose line context does not look like another measurement (e.g., CW-Chord, TK, AK)
+                    found_axis = None
+                    for m2 in re.finditer(r"@\s*(\d{1,3})\s*°", tail):
+                        # compute absolute position of axis in eye_text
+                        abs_pos = m.end() + m2.start()
+                        line_start = eye_text.rfind('\n', 0, abs_pos) + 1
+                        line_end = eye_text.find('\n', abs_pos)
+                        line = eye_text[line_start: line_end if line_end != -1 else None]
+                        # skip if the axis line includes tokens that indicate non-keratometry measurements
+                        if re.search(r"\b(TK1|TK2|TK|ATK|AK|CW[- ]?Chord|Chord|mm|μm)\b", line, re.I):
+                            continue
+                        found_axis = m2.group(1)
+                        break
+                    if found_axis:
+                        out[f"{kkey}_axis"] = found_axis
+        # end of generic axis fallback
         # 2) If still missing, try layout-based pairing (if available) before falling back to raw axis tokens
-        if ("k1_axis" not in out or "k2_axis" not in out) and layout_data:
+        if ("k1_axis" not in out or "k2_axis" not in out) and layout_data and not strict_text:
             try:
                 # build a flat list of words with approximate centers and text
                 words = []
@@ -257,12 +261,25 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
                     if re.search(r"@|°", w["text"]):
                         # try to extract number from this word or next word
                         mnum = re.search(r"(\d{1,3})", w["text"])
+                        candidate = None
                         if mnum:
-                            axis_words.append({"cx": w["cx"], "cy": w["cy"], "val": mnum.group(1)})
+                            candidate = {"cx": w["cx"], "cy": w["cy"], "val": mnum.group(1)}
                         else:
                             # look ahead for a numeric word
                             if i + 1 < len(words) and re.fullmatch(r"\d{1,3}", words[i+1]["text"]):
-                                axis_words.append({"cx": words[i+1]["cx"], "cy": words[i+1]["cy"], "val": words[i+1]["text"]})
+                                candidate = {"cx": words[i+1]["cx"], "cy": words[i+1]["cy"], "val": words[i+1]["text"]}
+                        if candidate:
+                            # filter out candidates that are spatially close to words indicating CW-Chord or mm
+                            skip = False
+                            for other in words:
+                                if re.search(r"\b(CW[- ]?Chord|Chord|mm)\b", other["text"], re.I):
+                                    dy = abs(other["cy"] - candidate["cy"])
+                                    dx = abs(other["cx"] - candidate["cx"])
+                                    if dy < 20 and dx < 200:
+                                        skip = True
+                                        break
+                            if not skip:
+                                axis_words.append(candidate)
                 # For each K, find nearest axis by vertical distance and reasonable horizontal proximity
                 for klabel in ("K1", "K2"):
                     if f"{klabel.lower()}_axis" in out:
