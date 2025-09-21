@@ -184,12 +184,35 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
             out["k1"] = scalars.get("k1")[0]
         if "k2" not in out and scalars.get("k2"):
             out["k2"] = scalars.get("k2")[0]
-        # Axis generic fallback: assign only to the missing axis, not both
-        axis_matches = re.findall(r"@\s*(\d{1,3})\s*°", eye_text)
-        if "k1_axis" not in out and axis_matches:
-            out["k1_axis"] = axis_matches[0]
-        if "k2_axis" not in out and len(axis_matches) > 1:
-            out["k2_axis"] = axis_matches[1]
+        # Axis generic fallback: prefer axes that are near K1/K2 occurrences
+        # 1) Try to find an axis token within ~180 chars after each K1/K2 match
+        for key_label in (("k1", "K1"), ("k2", "K2")):
+            kkey, klabel = key_label
+            if f"{kkey}_axis" in out:
+                continue
+            m = re.search(rf"\b{klabel}\b\s*[:\-]?\s*\d{{1,3}}[\.,]\d{{1,3}}\s*D", eye_text, re.I)
+            if m:
+                tail = eye_text[m.end():m.end()+180]
+                m2 = re.search(r"@\s*(\d{1,3})\s*°", tail)
+                if m2:
+                    out[f"{kkey}_axis"] = m2.group(1)
+        # 2) If still missing, fall back to any axis tokens but FILTER OUT axes that appear on lines with 'mm' or 'CW-Chord' (likely chord/measurement axes)
+        if "k1_axis" not in out or "k2_axis" not in out:
+            axis_list = []
+            for m in re.finditer(r"@\s*(\d{1,3})\s*°", eye_text):
+                s = m.start()
+                # extract the full line containing this axis
+                line_start = eye_text.rfind('\n', 0, s) + 1
+                line_end = eye_text.find('\n', s)
+                line = eye_text[line_start: line_end if line_end != -1 else None]
+                # skip axes that are part of measurements in mm or explicitly CW-Chord
+                if re.search(r"\bmm\b|CW[- ]?Chord|Chord\b", line, re.I):
+                    continue
+                axis_list.append(m.group(1))
+            if "k1_axis" not in out and len(axis_list) >= 1:
+                out["k1_axis"] = axis_list[0]
+            if "k2_axis" not in out and len(axis_list) >= 2:
+                out["k2_axis"] = axis_list[1]
         return out
 
     od_pairs = pair_k_values(od_scalars, od_text)
