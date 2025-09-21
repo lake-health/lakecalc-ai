@@ -111,10 +111,22 @@ async def extract(file_id: str, debug: bool = False):
     if missing_fields["od"] or missing_fields["os"]:
         llm_results = llm_extract_missing_fields(text, missing_fields)
         for eye in ("od", "os"):
-            for k, v in llm_results.get(eye, {}).items():
-                if not result[eye][k] and v:
-                    result[eye][k] = v
-                    result["confidence"][f"{eye}.{k}"] = 0.7  # Mark as LLM-filled
+            eye_llm = llm_results.get(eye, {})
+            for k, v in eye_llm.items():
+                # support both simple values and {value, axis} objects for k1/k2
+                if k in ("k1", "k2") and isinstance(v, dict):
+                    if v.get("value") and not result[eye].get(k):
+                        result[eye][k] = v.get("value")
+                        result["confidence"][f"{eye}.{k}"] = 0.7
+                    # merge axis into k1_axis/k2_axis
+                    axis_key = f"{k}_axis"
+                    if v.get("axis") and not result[eye].get(axis_key):
+                        result[eye][axis_key] = v.get("axis")
+                        result["confidence"][f"{eye}.{axis_key}"] = 0.7
+                else:
+                    if v and not result[eye].get(k):
+                        result[eye][k] = v
+                        result["confidence"][f"{eye}.{k}"] = 0.7
         result["llm_fallback"] = True
     else:
         result["llm_fallback"] = False

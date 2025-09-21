@@ -187,7 +187,7 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
         # If no scalars for this eye and the eye segment wasn't present, skip populating to avoid duplication
         if eye == "os" and not os_present:
             # leave OS empty and low confidence
-            for key in ("axial_length", "acd", "lt", "cct", "wtw", "k1", "k2", "ak", "axis"):
+            for key in ("axial_length", "acd", "lt", "cct", "wtw", "k1", "k2", "k1_axis", "k2_axis", "ak", "axis"):
                 result.confidence[f"{eye}.{key}"] = 0.0
             continue
         for key in ("axial_length", "acd", "lt", "cct", "wtw"):
@@ -203,23 +203,24 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
         k2_raw, _ = scalars.get("k2", ("", None))
         setattr(fld, "k1", k1_raw)
         setattr(fld, "k2", k2_raw)
-        # axis: prefer explicit axis, else paired k1_axis/k2_axis
-        axis_val = scalars.get("axis", ("", None))[0] if scalars.get("axis") else ""
-        if not axis_val:
-            # check pairs
-            if pairs.get("k1_axis"):
-                fld.axis = pairs.get("k1_axis")
-            elif pairs.get("k2_axis"):
-                fld.axis = pairs.get("k2_axis")
-            else:
-                fld.axis = ""
-        else:
-            fld.axis = axis_val
+        # axis per K: populate k1_axis/k2_axis from paired heuristics or scalar axis
+        k1_ax = pairs.get("k1_axis")
+        k2_ax = pairs.get("k2_axis")
+        # if a generic 'axis' scalar exists, use it for k1 if neither specific axis found
+        generic_axis = scalars.get("axis", ("", None))[0] if scalars.get("axis") else ""
+        if not k1_ax and generic_axis:
+            k1_ax = generic_axis
+        if not k2_ax and generic_axis:
+            k2_ax = generic_axis
+        fld.k1_axis = k1_ax or ""
+        fld.k2_axis = k2_ax or ""
+        # Deprecated single-axis kept for backward compat: prefer k1_axis
+        fld.axis = fld.k1_axis or fld.k2_axis or ""
         # ak
         ak_raw = scalars.get("ak", ("", None))[0] if scalars.get("ak") else ""
         fld.ak = ak_raw
         # confidences for keratometry
-        for key in ("k1", "k2", "ak", "axis"):
+        for key in ("k1", "k2", "ak", "k1_axis", "k2_axis"):
             result.confidence[f"{eye}.{key}"] = 0.8 if getattr(fld, key) else 0.2
 
     result.od = fields["od"]

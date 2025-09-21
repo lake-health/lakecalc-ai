@@ -98,12 +98,14 @@ def test_parser_skips_os_when_missing():
     # OD should have K values and an axis
     assert res.od.k1 != "", "OD.k1 should be extracted"
     assert res.od.k2 != "", "OD.k2 should be extracted"
-    assert res.od.axis != "", "OD.axis should be extracted"
+    # axis information should now be per-K
+    assert res.od.k1_axis != "" or res.od.k2_axis != "", "OD k1_axis or k2_axis should be extracted"
 
     # OS should remain empty when there's no OS segment
     assert res.os.k1 == "", "OS.k1 should be empty when OS segment missing"
     assert res.os.k2 == "", "OS.k2 should be empty when OS segment missing"
     # confidence for OS keys should be 0.0
     assert res.confidence.get("os.k1", None) == 0.0
-    assert res.confidence.get("os.axis", None) == 0.0
+    assert res.confidence.get("os.k1_axis", None) == 0.0
+    assert res.confidence.get("os.k2_axis", None) == 0.0
 
