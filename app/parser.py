@@ -14,6 +14,23 @@ UM = r"(?:\s*(?:µm|um))"
 DIOP = r"(?:\s*D)"
 DEG = r"(?:\s*°)"
 
+
+def sanitize_axis(raw_candidate: str) -> str | None:
+    """Sanitize a raw numeric axis candidate: take rightmost 1-3 digits and validate 0-180."""
+    if not raw_candidate:
+        return None
+    groups = re.findall(r"(\d{1,3})", raw_candidate)
+    if not groups:
+        return None
+    candidate = groups[-1]
+    try:
+        iv = int(candidate)
+    except Exception:
+        return None
+    if 0 <= iv <= 180:
+        return str(iv)
+    return None
+
 # Device-specific patterns (extend as needed)
 PATTERNS = {
     "IOLMaster700": {
@@ -91,6 +108,29 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
     dev = detect_device(text)
     patterns = PATTERNS.get(dev, PATTERNS["Generic"])
 
+    # Device-specific normalization for messy text exports
+    def normalize_for_device(dev_name: str, raw_text: str) -> str:
+        t = raw_text
+        if dev_name == "IOLMaster700":
+            # common issues in device export: tokens glued like '43,80 D88875°' or 'K1: 41,45 D @K2:'
+            # 1) ensure degree symbol separated: '75°' or '@ 75°' -> keep degree but add space before '@' and '°'
+            t = re.sub(r"\s*@\s*", " @ ", t)
+            t = re.sub(r"(\d)°", r"\1 °", t)
+            # 2) ensure 'D@' and 'D@' variants are spaced: 'D@' -> 'D @'
+            t = re.sub(r"D\s*@", "D @", t)
+            t = re.sub(r"D@", "D @", t)
+            # 3) ensure K1/K2/AK tokens have a separating space if collapsed (do NOT force newlines)
+            t = re.sub(r"\b(K1:|K2:|AK:|K1|K2|AK)\s*", lambda m: m.group(1) + " ", t)
+            # 4) remove repeated digit garbage before degrees (e.g., '88875 °' -> '75 °')
+            t = re.sub(r"(\d{3,})(\d{1,3})\s*°", lambda m: m.group(2) + " °", t)
+            # 4b) if an axis appears alone on its own line (e.g., '\n@ 100°\n'), merge it onto the previous line
+            t = re.sub(r"\n\s*(@\s*\d{1,3}\s*°)\s*\n", lambda m: " " + m.group(1) + "\n", t)
+            # 5) collapse multiple spaces to single
+            t = re.sub(r"[ \t]+", " ", t)
+        return t
+
+    text = normalize_for_device(dev, text)
+
     result = ExtractResult(file_id=file_id, text_hash=hash_text(text))
 
     fields = {
@@ -117,16 +157,23 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
     pages = re.split(r"\nPágina\s+\d+\s+de\s+\d+", text)
     if not od_text and not os_text:
         if len(pages) == 1:
-            # Single page: could be OD or OS only, use full text for OS, leave OD empty
-            od_text = ""
-            os_text = text
+            # Single page: ambiguous. Prefer to treat it as OD if the text contains 'OD' markers,
+            # otherwise as OS. This avoids blindly copying OD values into OS later.
+            if re.search(r"\bOD\b", text, re.I):
+                od_text = text
+                os_text = ""
+            else:
+                od_text = ""
+                os_text = text
         elif len(pages) >= 2:
             od_text = pages[0]
             os_text = pages[1]
     # If still empty, default od_text to empty and os_text to full text
+    # If one side has explicit detections, do not mirror the same full-text into the other side.
     if not od_text and os_text:
         od_text = ""
     if not os_text and od_text:
+        # keep os_text empty to avoid leaking OD values into OS
         os_text = ""
     if not od_text and not os_text:
         od_text = ""
@@ -176,30 +223,79 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
             if m:
                 kname = m.group(1).upper()
                 kval = m.group(2)
+                # sanitize candidate axis tokens: accept up to 3 digits, pick rightmost group, validate 0-180
+                def sanitize_axis(raw_candidate: str) -> str | None:
+                    if not raw_candidate:
+                        return None
+                    # strip non-digits, but keep degree digits; capture rightmost 1-3 digit group
+                    groups = re.findall(r"(\d{1,3})", raw_candidate)
+                    if not groups:
+                        return None
+                    candidate = groups[-1]
+                    try:
+                        iv = int(candidate)
+                    except Exception:
+                        return None
+                    if 0 <= iv <= 180:
+                        return str(iv)
+                    return None
+
                 # Try to find axis on same line
+                # 1) Prefer explicit '@ 100°' pattern
                 axis_m = re.search(r"@\s*(\d{1,3})\s*°", line)
                 kaxis = axis_m.group(1) if axis_m else None
+                # 2) If not found, allow tolerant trailing-degree capture like '... 75°' or '...75°' possibly glued to other tokens
+                if not kaxis:
+                    # search for any 'number + degree symbol' occurrence after the K value
+                    # find the position of the K numeric match and look to the right
+                    kval_pos = m.end()
+                    right_slice = line[kval_pos:]
+                    # attempt to find '@100°' or '100°' even if glued
+                    m2 = re.search(r"@?\s*(\d{1,3})\s*°", right_slice)
+                    if m2:
+                        kaxis = sanitize_axis(m2.group(1))
+                    else:
+                        # fallback: find the rightmost degree-like token anywhere in the line
+                        m3 = list(re.finditer(r"(\d{1,3})\s*°", line))
+                        if m3:
+                            kaxis = sanitize_axis(m3[-1].group(1))
                 # If not found, look at the next non-empty line for axis, but only if it is just an axis (e.g., '@ 100°')
                 if not kaxis:
-                    for j in range(1, 3):
+                    # look forward a small number of lines for an axis-only token like '75°' or '@ 100°'
+                    window = 6 if dev == "IOLMaster700" else 3
+                    for j in range(1, window):
                         if i + j < len(lines):
                             next_line = lines[i + j].strip()
                             if not next_line:
                                 continue
-                            axis_only = re.fullmatch(r"@\s*(\d{1,3})\s*°", next_line)
+                            # Accept both '@ 100°' and '75°' formats
+                            axis_only = re.fullmatch(r"@?\s*(\d{1,3})\s*°", next_line)
                             if axis_only:
-                                kaxis = axis_only.group(1)
+                                kaxis = sanitize_axis(axis_only.group(1))
+                                if kaxis:
+                                    break
                                 break
                             # If next line contains any known measurement or label, break (do not assign axis)
-                            if re.search(r"(CW-Chord|AL|WTW|CCT|ACD|LT|AK|SE|SD|TK|ATK|P|Ix|ly|Fixação|Comentário|mm|μm|D|VA|Status de olho|Resultado|Paciente|Médico|Operador|Data|Versão|Página)", next_line, re.I):
+                            if re.search(r"(CW[- ]?Chord|AL|WTW|CCT|ACD|LT|AK|SE|SD|TK|TSE|ATK|P|Ix|ly|Fixação|Comentário|mm|μm|D|VA|Status de olho|Resultado|Paciente|Médico|Operador|Data|Versão|Página)", next_line, re.I):
                                 break
-                            # Expand excluded tokens to include TSE and TK variants, and guard against numeric-only noise lines
-                            if re.search(r"(CW-Chord|AL|WTW|CCT|ACD|LT|AK|SE|SD|TSE|TK\d*|ATK|P|Ix|ly|Fixação|Comentário|mm|μm|D|VA|Status de olho|Resultado|Paciente|Médico|Operador|Data|Versão|Página)", next_line, re.I):
-                                break
-                            # also skip if the next line is just a short numeric token (likely noise like '888' or stray degrees)
+                            # also skip if the next line is just a short numeric token (likely noise like '888')
                             if re.fullmatch(r"\s*\d{1,4}\s*", next_line):
                                 break
-                                break
+                    # also look backward in case OCR put the axis above the K line
+                    if not kaxis:
+                        window = 6 if dev == "IOLMaster700" else 3
+                        for j in range(1, window):
+                            if i - j >= 0:
+                                prev_line = lines[i - j].strip()
+                                if not prev_line:
+                                    continue
+                                axis_only = re.fullmatch(r"@?\s*(\d{1,3})\s*°", prev_line)
+                                if axis_only:
+                                    # ensure previous line isn't a known measurement/label
+                                    if re.search(r"(CW[- ]?Chord|AL|WTW|CCT|ACD|LT|AK|SE|SD|TK|TSE|ATK|P|Ix|ly|Fixação|Comentário|mm|μm|D|VA|Status de olho|Resultado|Paciente|Médico|Operador|Data|Versão|Página)", prev_line, re.I):
+                                        break
+                                    kaxis = axis_only.group(1)
+                                    break
                 k_results[kname]["val"] = kval
                 # Only assign axis if found in correct context, else leave blank
                 k_results[kname]["axis"] = kaxis if kaxis else ""
@@ -324,7 +420,7 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
 
         # fallback to any axis tokens but FILTER OUT axes that appear on lines with 'mm' or 'CW-Chord' (likely chord/measurement axes)
         if "k1_axis" not in out or "k2_axis" not in out:
-            axis_list = []
+            axis_occurrences: List[Tuple[int, str]] = []
             for m in re.finditer(r"@\s*(\d{1,3})\s*°", eye_text):
                 s = m.start()
                 # extract the full line containing this axis
@@ -337,11 +433,34 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
                 # skip numeric-only or very short noisy lines (e.g., '888' or stray digits)
                 if re.fullmatch(r"\s*\d{1,4}\s*", line):
                     continue
-                axis_list.append(m.group(1))
-            if "k1_axis" not in out and len(axis_list) >= 1:
-                out["k1_axis"] = axis_list[0]
-            if "k2_axis" not in out and len(axis_list) >= 2:
-                out["k2_axis"] = axis_list[1]
+                # sanitize the matched token
+                clean = sanitize_axis(m.group(1))
+                if clean:
+                    axis_occurrences.append((s, clean))
+            # find K1/K2 anchor positions and assign nearest axis by proximity
+            anchors = {}
+            for klabel in ("K1", "K2"):
+                m = re.search(rf"\b{klabel}\b\s*[:\-]?\s*\d{{1,3}}[\.,]\d{{1,3}}\s*D", eye_text, re.I)
+                if m:
+                    anchors[klabel.lower()] = m.start()
+            # for each anchor, choose nearest axis occurrence
+            for kkey, apos in anchors.items():
+                if f"{kkey}_axis" in out:
+                    continue
+                best = None
+                best_dist = None
+                for pos, val in axis_occurrences:
+                    dist = abs(pos - apos)
+                    if best is None or dist < best_dist:
+                        best = val
+                        best_dist = dist
+                if best:
+                    out[f"{kkey}_axis"] = best
+            # if anchors not found, fall back to first/second occurrence as before
+            if "k1_axis" not in out and len(axis_occurrences) >= 1:
+                out["k1_axis"] = axis_occurrences[0][1]
+            if "k2_axis" not in out and len(axis_occurrences) >= 2:
+                out["k2_axis"] = axis_occurrences[1][1]
         return out
 
     od_pairs = pair_k_values(od_scalars, od_text)
@@ -410,6 +529,9 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
             if llm_func is None:
                 llm_func = llm_extract_missing_fields
             llm_out = llm_func(text, missing)
+            # tolerate llm_func returning None (tests may inject a noop) by coercing to empty dict
+            if llm_out is None:
+                llm_out = {}
             log.debug("LLM output: %s", llm_out)
             # merge LLM outputs carefully
             for eye in ("od", "os"):
@@ -445,4 +567,50 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
 
     if not od_scalars and not os_scalars:
         result.notes = "Parsing found no matches; consider LLM fallback"
+    # Final deterministic proximity assignment: if K values exist but per-K axes are empty,
+    # try a last-pass proximity match within the same eye_text using sanitized '@ N°' tokens.
+    def final_proximity_assign(eye_name: str, eye_text: str):
+        eye_obj = getattr(result, eye_name)
+        # only apply when K values exist but axes missing
+        if not (getattr(eye_obj, 'k1') or getattr(eye_obj, 'k2')):
+            return
+        need_k1 = bool(getattr(eye_obj, 'k1')) and not getattr(eye_obj, 'k1_axis')
+        need_k2 = bool(getattr(eye_obj, 'k2')) and not getattr(eye_obj, 'k2_axis')
+        if not (need_k1 or need_k2):
+            return
+        # collect sanitized axis occurrences with positions
+        occ = []
+        for m in re.finditer(r"@\s*(\d{1,3})\s*°", eye_text):
+            clean = sanitize_axis(m.group(1))
+            if clean:
+                occ.append((m.start(), clean))
+        if not occ:
+            return
+        # anchors
+        anchors = {}
+        if getattr(eye_obj, 'k1'):
+            m1 = re.search(r"\bK1\b\s*[:\-]?\s*\d{1,3}[\.,]\d{1,3}\s*D", eye_text, re.I)
+            if m1:
+                anchors['k1'] = m1.start()
+        if getattr(eye_obj, 'k2'):
+            m2 = re.search(r"\bK2\b\s*[:\-]?\s*\d{1,3}[\.,]\d{1,3}\s*D", eye_text, re.I)
+            if m2:
+                anchors['k2'] = m2.start()
+        for kkey, apos in anchors.items():
+            best = None
+            best_dist = None
+            for pos, val in occ:
+                d = abs(pos - apos)
+                if best is None or d < best_dist:
+                    best = val
+                    best_dist = d
+            if best:
+                setattr(eye_obj, f"{kkey}_axis", best)
+
+    # apply per-eye final proximity assignment
+    try:
+        final_proximity_assign('od', od_text)
+        final_proximity_assign('os', os_text)
+    except Exception:
+        pass
     return result
