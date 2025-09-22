@@ -28,3 +28,4 @@ uploads/
 # ---- Byte-compiled/misc ----
 *.sqlite3
 
+lakecalc-sa-key.json

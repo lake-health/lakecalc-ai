@@ -3,6 +3,7 @@ from pathlib import Path
 import fitz  # PyMuPDF
 from .config import settings
 from .storage import TEXT_DIR
+from .storage import gcs_upload_bytes, gcs_download_bytes
 
 log = logging.getLogger(__name__)
 
@@ -170,6 +171,28 @@ def ocr_file(file_path: Path) -> tuple[str, str | None]:
     fhash = _file_hash(file_path)
     cached = TEXT_DIR / f"{fhash}.txt"
     layout_cached = TEXT_DIR / f"{fhash}.json"
+    # Try to load cached text/layout from GCS if configured
+    try:
+        bucket = os.getenv("GCS_BUCKET_NAME") or os.getenv("GCS_BUCKET")
+        if bucket:
+            # try text first
+            txt_blob = f"ocr_texts/{fhash}.txt"
+            txt_bytes = gcs_download_bytes(bucket, txt_blob)
+            if txt_bytes is not None:
+                return txt_bytes.decode("utf-8"), None
+            # try layout JSON
+            layout_blob = f"ocr_layouts/{fhash}.json"
+            layout_bytes = gcs_download_bytes(bucket, layout_blob)
+            if layout_bytes is not None:
+                try:
+                    # save a local copy for compatibility
+                    layout_cached.write_bytes(layout_bytes)
+                except Exception:
+                    pass
+    except Exception:
+        # ignore gcs errors and fall back to local files
+        pass
+
     if cached.exists():
         # read existing cache; if a layout JSON exists, leave it as-is
         return cached.read_text(encoding="utf-8"), None
@@ -190,7 +213,17 @@ def ocr_file(file_path: Path) -> tuple[str, str | None]:
                     "text_hash": fhash,
                     "pages": layout.get("pages", []),
                 }
-                layout_cached.write_text(json.dumps(cache_obj), encoding="utf-8")
+                # Attempt to write to GCS first (if configured), otherwise local file
+                written = False
+                try:
+                    bucket = os.getenv("GCS_BUCKET_NAME") or os.getenv("GCS_BUCKET")
+                    if bucket:
+                        blob_name = f"ocr_layouts/{fhash}.json"
+                        written = gcs_upload_bytes(bucket, blob_name, json.dumps(cache_obj).encode("utf-8"))
+                except Exception:
+                    written = False
+                if not written:
+                    layout_cached.write_text(json.dumps(cache_obj), encoding="utf-8")
             except Exception:
                 log.exception("Failed writing layout cache for %s", file_path.name)
 
@@ -218,7 +251,16 @@ def ocr_file(file_path: Path) -> tuple[str, str | None]:
                     "text_hash": fhash,
                     "pages": combined_layout.get("pages", []),
                 }
-                layout_cached.write_text(json.dumps(cache_obj), encoding="utf-8")
+                written = False
+                try:
+                    bucket = settings.google_creds_json and (os.getenv("GCS_BUCKET_NAME") or os.getenv("GCS_BUCKET"))
+                    if bucket:
+                        blob_name = f"ocr_layouts/{fhash}.json"
+                        written = gcs_upload_bytes(bucket, blob_name, json.dumps(cache_obj).encode("utf-8"))
+                except Exception:
+                    written = False
+                if not written:
+                    layout_cached.write_text(json.dumps(cache_obj), encoding="utf-8")
             except Exception:
                 log.exception("Failed writing layout cache for pdf %s", file_path.name)
         text = "\n".join(parts).strip()
