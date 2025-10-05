@@ -201,16 +201,16 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
         # Split into lines for robust lookahead/backward matching
         lines = eye_text.splitlines()
         k_results = {"K1": {"val": None, "axis": None}, "K2": {"val": None, "axis": None}}
+
         for i, line in enumerate(lines):
             m = re.search(r"\b(K1|K2)\b\s*[:\-]?\s*(\d{1,3}[\.,]\d{1,3})\s*D", line, re.I)
             if m:
                 kname = m.group(1).upper()
                 kval = m.group(2)
-                # sanitize candidate axis tokens: accept up to 3 digits, pick rightmost group, validate 0-180
+
                 def sanitize_axis(raw_candidate: str) -> str | None:
                     if not raw_candidate:
                         return None
-                    # strip non-digits, but keep degree digits; capture rightmost 1-3 digit group
                     groups = re.findall(r"(\d{1,3})", raw_candidate)
                     if not groups:
                         return None
@@ -224,12 +224,11 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
                     return None
 
                 # Try to find axis on same line
-                # 1) Prefer explicit '@ 100°' pattern
                 axis_m = re.search(r"@\s*(\d{1,3})\s*°", line)
                 kaxis = axis_m.group(1) if axis_m else None
-                # 2) If not found, allow tolerant trailing-degree capture like '... 75°' or '...75°' possibly glued to other tokens
+
+                # Tolerant trailing-degree capture after the K value
                 if not kaxis:
-                    # search for any 'number + degree symbol' occurrence after the K value
                     kval_pos = m.end()
                     right_slice = line[kval_pos:]
                     m2 = re.search(r"@?\s*(\d{1,3})\s*°", right_slice)
@@ -239,7 +238,8 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
                         m3 = list(re.finditer(r"(\d{1,3})\s*°", line))
                         if m3:
                             kaxis = sanitize_axis(m3[-1].group(1))
-                # If not found, look at the next non-empty line for axis, but only if it is just an axis (e.g., '@ 100°')
+
+                # Look forward for axis-only lines
                 if not kaxis:
                     window = 6 if dev == "IOLMaster700" else 3
                     for j in range(1, window):
@@ -257,22 +257,25 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
                                 break
                             if re.fullmatch(r"\s*\d{1,4}\s*", next_line):
                                 break
-                    # backward search
-                    if not kaxis:
-                        window = 6 if dev == "IOLMaster700" else 3
-                        for j in range(1, window):
-                            if i - j >= 0:
-                                prev_line = lines[i - j].strip()
-                                if not prev_line:
-                                    continue
-                                axis_only = re.fullmatch(r"@?\s*(\d{1,3})\s*°", prev_line)
-                                if axis_only:
-                                    if re.search(r"(CW[- ]?Chord|AL|WTW|CCT|ACD|LT|AK|SE|SD|TK|TSE|ATK|P|Ix|ly|Fixação|Comentário|mm|μm|D|VA|Status de olho|Resultado|Paciente|Médico|Operador|Data|Versão|Página)", prev_line, re.I):
-                                        break
-                                    kaxis = axis_only.group(1)
+
+                # Backward search for axis-only line
+                if not kaxis:
+                    window = 6 if dev == "IOLMaster700" else 3
+                    for j in range(1, window):
+                        if i - j >= 0:
+                            prev_line = lines[i - j].strip()
+                            if not prev_line:
+                                continue
+                            axis_only = re.fullmatch(r"@?\s*(\d{1,3})\s*°", prev_line)
+                            if axis_only:
+                                if re.search(r"(CW[- ]?Chord|AL|WTW|CCT|ACD|LT|AK|SE|SD|TK|TSE|ATK|P|Ix|ly|Fixação|Comentário|mm|μm|D|VA|Status de olho|Resultado|Paciente|Médico|Operador|Data|Versão|Página)", prev_line, re.I):
                                     break
+                                kaxis = axis_only.group(1)
+                                break
+
                 k_results[kname]["val"] = kval
                 k_results[kname]["axis"] = kaxis if kaxis else ""
+
         # Assign results found by line heuristics first
         if k_results["K1"]["val"]:
             out["k1"] = k_results["K1"]["val"]
@@ -319,7 +322,7 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
                             if val:
                                 axis_cands.append({"idx": i_w, "cx": w["cx"], "cy": w["cy"], "val": val, "used": False})
 
-                # identify K anchors: prefer explicit 'K1'/'K2' tokens; otherwise find numeric keratometry values (number + D) nearby
+                # identify K anchors: prefer explicit 'K1'/'K2' tokens; otherwise numeric keratometry tokens
                 k_anchors = {"K1": [], "K2": []}
                 for i_w, w in enumerate(words):
                     # direct label tokens
@@ -339,18 +342,16 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
                             k_anchors["K2"].append({"cx": w["cx"], "cy": w["cy"], "text": w["text"], "idx": i_w})
 
                 # resolve a single anchor per K by picking the first (or nearest) candidate
-                def pick_anchor(klist):
+                def pick_anchor(klist, prefer_left=True):
                     if not klist:
                         return None
-                    # if multiple anchors, pick left-most (smaller cx) for K1, right-most for K2 as tie-breaker
                     if len(klist) == 1:
                         return klist[0]
-                    # sort by cx
                     sorted_by_x = sorted(klist, key=lambda a: a["cx"])
-                    return sorted_by_x[0]  # conservative: choose left-most (likely K1) for first pass
+                    return sorted_by_x[0] if prefer_left else sorted_by_x[-1]
 
-                anchor_k1 = pick_anchor(k_anchors["K1"])
-                anchor_k2 = pick_anchor(k_anchors["K2"]) if k_anchors["K2"] else None
+                anchor_k1 = pick_anchor(k_anchors["K1"], prefer_left=True)
+                anchor_k2 = pick_anchor(k_anchors["K2"], prefer_left=False)
 
                 # helper to compute distance
                 import math
@@ -373,7 +374,6 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
                         best["used"] = True
 
                 if anchor_k2 and "k2_axis" not in out:
-                    # prefer axis candidates that are vertically close (same row) or slightly to the right
                     best = None
                     best_d = None
                     for a in axis_cands:
@@ -391,7 +391,7 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
                 # keep previous fallbacks if layout matching fails
                 pass
 
-        # If still missing, try existing generic axis token heuristics (but avoid assigning same axis twice)
+        # Generic fallback heuristics, ensuring unique assignment where possible
         if ("k1_axis" not in out or "k2_axis" not in out):
             axis_occurrences: List[Tuple[int, str]] = []
             for m in re.finditer(r"@\s*(\d{1,3})\s*°", eye_text):
@@ -411,7 +411,6 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
                 m = re.search(rf"\b{klabel}\b\s*[:\-]?\s*\d{{1,3}}[\.,]\d{{1,3}}\s*D", eye_text, re.I)
                 if m:
                     anchors[klabel.lower()] = m.start()
-            # assign nearest unused axis occurrence per anchor
             used_positions = set()
             for kkey, apos in anchors.items():
                 if f"{kkey}_axis" in out:
@@ -428,16 +427,12 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
                 if best:
                     out[f"{kkey}_axis"] = best[1]
                     used_positions.add(best[0])
-            # fallback: if still missing, assign first/second occurrence uniquely
             if "k1_axis" not in out and len(axis_occurrences) >= 1:
                 out["k1_axis"] = axis_occurrences[0][1]
             if "k2_axis" not in out and len(axis_occurrences) >= 2:
                 out["k2_axis"] = axis_occurrences[1][1]
 
-        return out
-
-    od_pairs = pair_k_values(od_scalars, od_text)
-    os_pairs = pair_k_values(os_scalars, os_text)
+    return out
 
     # Populate fields with extracted scalars and paired axes
     for eye, scalars, pairs in (("od", od_scalars, od_pairs), ("os", os_scalars, os_pairs)):
@@ -582,6 +577,11 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
 
     # apply per-eye final proximity assignment
     try:
+        final_proximity_assign('od', od_text)
+        final_proximity_assign('os', os_text)
+    except Exception:
+        pass
+    return result
         final_proximity_assign('od', od_text)
         final_proximity_assign('os', os_text)
     except Exception:
