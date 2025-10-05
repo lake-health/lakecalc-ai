@@ -86,7 +86,7 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
     # Optionally use layout-aware pairing if flag enabled and layout was provided
     use_layout = os.getenv("USE_LAYOUT_PAIRING", "false").lower() in ("1", "true", "yes")
     strict_text = settings.strict_text_extraction
-    layout_data = layout if (use_layout and layout) else None
+    layout_data = None  # Ensure layout_data is initialized
 
     dev = detect_device(text)
     patterns = PATTERNS.get(dev, PATTERNS["Generic"])
@@ -426,7 +426,9 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
             if "k2_axis" not in out and len(axis_occurrences) >= 2:
                 out["k2_axis"] = axis_occurrences[1][1]
 
-    return out
+    # Compute paired-axis heuristics for each eye
+    od_pairs = pair_k_values(od_scalars, od_text) if od_scalars else {}
+    os_pairs = pair_k_values(os_scalars, os_text) if os_scalars else {}
 
     # Populate fields with extracted scalars and paired axes
     for eye, scalars, pairs in (("od", od_scalars, od_pairs), ("os", os_scalars, os_pairs)):
@@ -451,15 +453,15 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
         setattr(fld, "k1", k1_raw)
         setattr(fld, "k2", k2_raw)
         # axis per K: populate k1_axis/k2_axis from paired heuristics only
-        # Do NOT use any standalone/generic 'axis' scalar fallback to avoid leakage
         k1_ax = pairs.get("k1_axis") or ""
         k2_ax = pairs.get("k2_axis") or ""
         fld.k1_axis = k1_ax
         fld.k2_axis = k2_ax
-    # No deprecated single-axis field: prefer explicit per-K axes only
+
         # ak
         ak_raw = scalars.get("ak", ("", None))[0] if scalars.get("ak") else ""
         fld.ak = ak_raw
+
         # confidences for keratometry
         for key in ("k1", "k2", "ak", "k1_axis", "k2_axis"):
             result.confidence[f"{eye}.{key}"] = 0.8 if getattr(fld, key) else 0.2
@@ -467,9 +469,8 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
     result.od = fields["od"]
     result.os = fields["os"]
 
-    # previously we appended debug entries to result.flags for debugging
-    # switch to logging so flags remain clean for production
-    log.debug("debug: os_present=%s od_scalars=%d os_scalars=%d od_match=%s os_match=%s", os_present, len(od_scalars), len(os_scalars), 'yes' if od_match else 'no', 'yes' if os_match else 'no')
+    log.debug("debug: os_present=%s od_scalars=%d os_scalars=%d od_match=%s os_match=%s",
+              os_present, len(od_scalars), len(os_scalars), 'yes' if od_match else 'no', 'yes' if os_match else 'no')
 
     # If important fields like axes are missing, call LLM fallback to try to fill gaps
     missing = {"od": [], "os": []}
@@ -480,18 +481,19 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
             missing[eye].append("axis")
         if not getattr(eye_obj, "axial_length"):
             missing[eye].append("axial_length")
+
     # If an eye segment wasn't present in the text, don't request LLM output for it
     if not od_present:
         missing["od"] = []
     if not os_present:
         missing["os"] = []
+
     if missing["od"] or missing["os"]:
         try:
             # use injected llm_func if provided (for testing), else default util
             if llm_func is None:
                 llm_func = llm_extract_missing_fields
             llm_out = llm_func(text, missing)
-            # tolerate llm_func returning None (tests may inject a noop) by coercing to empty dict
             if llm_out is None:
                 llm_out = {}
             log.debug("LLM output: %s", llm_out)
@@ -511,9 +513,7 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
                         # respect value/axis pairs
                         if v.get("value") and not getattr(eye_obj, k):
                             setattr(eye_obj, k, v.get("value"))
-                        # only set per-eye axis fields if specific k1/k2 axis keys are provided
                         if v.get("axis"):
-                            # prefer assigning to k1_axis/k2_axis, not the deprecated single 'axis'
                             if k == "k1" and not getattr(eye_obj, "k1_axis"):
                                 eye_obj.k1_axis = v.get("axis")
                             if k == "k2" and not getattr(eye_obj, "k2_axis"):
@@ -529,19 +529,20 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
 
     if not od_scalars and not os_scalars:
         result.notes = "Parsing found no matches; consider LLM fallback"
+
     # Final deterministic proximity assignment: if K values exist but per-K axes are empty,
     # try a last-pass proximity match within the same eye_text using sanitized '@ N°' tokens.
     def final_proximity_assign(eye_name: str, eye_text: str):
         eye_obj = getattr(result, eye_name)
         # only apply when K values exist but axes missing
-        if not (getattr(eye_obj, 'k1') or getattr(eye_obj, 'k2')):
+        if not (getattr(eye_obj, "k1") or getattr(eye_obj, "k2")):
             return
-        need_k1 = bool(getattr(eye_obj, 'k1')) and not getattr(eye_obj, 'k1_axis')
-        need_k2 = bool(getattr(eye_obj, 'k2')) and not getattr(eye_obj, 'k2_axis')
+        need_k1 = bool(getattr(eye_obj, "k1")) and not getattr(eye_obj, "k1_axis")
+        need_k2 = bool(getattr(eye_obj, "k2")) and not getattr(eye_obj, "k2_axis")
         if not (need_k1 or need_k2):
             return
         # collect sanitized axis occurrences with positions
-        occ = []
+        occ: List[Tuple[int, str]] = []
         for m in re.finditer(r"@\s*(\d{1,3})\s*°", eye_text):
             clean = sanitize_axis(m.group(1))
             if clean:
@@ -549,15 +550,16 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
         if not occ:
             return
         # anchors
-        anchors = {}
-        if getattr(eye_obj, 'k1'):
+        anchors: Dict[str, int] = {}
+        if getattr(eye_obj, "k1"):
             m1 = re.search(r"\bK1\b\s*[:\-]?\s*\d{1,3}[\.,]\d{1,3}\s*D", eye_text, re.I)
             if m1:
-                anchors['k1'] = m1.start()
-        if getattr(eye_obj, 'k2'):
+                anchors["k1"] = m1.start()
+        if getattr(eye_obj, "k2"):
             m2 = re.search(r"\bK2\b\s*[:\-]?\s*\d{1,3}[\.,]\d{1,3}\s*D", eye_text, re.I)
             if m2:
-                anchors['k2'] = m2.start()
+                anchors["k2"] = m2.start()
+
         for kkey, apos in anchors.items():
             best = None
             best_dist = None
@@ -571,46 +573,9 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
 
     # apply per-eye final proximity assignment
     try:
-        final_proximity_assign('od', od_text)
-        final_proximity_assign('os', os_text)
+        final_proximity_assign("od", od_text)
+        final_proximity_assign("os", os_text)
     except Exception:
-        pass
-    return result
-    try:
-        final_proximity_assign('od', od_text)
-        final_proximity_assign('os', os_text)
-    except Exception:
-        pass
-    return result
-        final_proximity_assign('od', od_text)
-        final_proximity_assign('os', os_text)
-    except Exception:
-        pass
-    return result
-            if best:
-                setattr(eye_obj, f"{kkey}_axis", best)
+        log.exception("final_proximity_assign failed")
 
-    # apply per-eye final proximity assignment
-    try:
-        final_proximity_assign('od', od_text)
-        final_proximity_assign('os', os_text)
-    except Exception:
-        pass
-    return result
-            best = None
-            best_dist = None
-            for pos, val in occ:
-                d = abs(pos - apos)
-                if best is None or d < best_dist:
-                    best = val
-                    best_dist = d
-            if best:
-                setattr(eye_obj, f"{kkey}_axis", best)
-
-    # apply per-eye final proximity assignment
-    try:
-        final_proximity_assign('od', od_text)
-        final_proximity_assign('os', os_text)
-    except Exception:
-        pass
     return result
