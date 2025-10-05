@@ -86,3 +86,43 @@ def gcs_download_bytes(bucket_name: str, blob_name: str) -> Optional[bytes]:
     except Exception:
         logger.exception("failed downloading layout blob from gs://%s/%s", bucket_name, blob_name)
         return None
+
+
+# new helper for quick debugging of whether GCS client creation succeeds
+def gcs_available() -> bool:
+    """Return True if a google cloud storage client can be created (credentials present/valid)."""
+    client = _make_gcs_client()
+    available = client is not None
+    logger.info("gcs_available=%s", available)
+    return available
+
+# new helper: expose whether paid/premium requests are enabled in configuration
+def premium_requests_enabled() -> bool:
+    """Return True if paid/premium requests are enabled in settings (safe default False)."""
+    enabled = getattr(settings, "premium_requests_enabled", False)
+    logger.info("premium_requests_enabled=%s", enabled)
+    return bool(enabled)
+
+# new helper: return basic workspace/debug info to confirm context and environment
+def workspace_debug_info() -> dict:
+    """
+    Return a small dict useful for debugging workspace context:
+      - uploads_dir path
+      - top-level files in uploads dir
+      - gcs_available flag
+      - premium_requests_enabled flag
+    """
+    try:
+        files = [p.name for p in UPLOADS.iterdir() if p.exists()]
+    except Exception:
+        files = []
+    info = {
+        "uploads_dir": str(UPLOADS),
+        "uploads_files": files,
+        "gcs_available": gcs_available(),
+        "premium_requests_enabled": premium_requests_enabled(),
+    }
+    logger.info("workspace_debug_info: %s", info)
+    return info
+
+# ...staged changes present; storage.workspace_debug_info() can help verify paths

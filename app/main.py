@@ -1,10 +1,4 @@
-
 # ...existing code...
-
-
-# ...existing code...
-
-
 
 
 # ...existing code...
@@ -17,6 +11,8 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 from pathlib import Path
 import logging, uuid, shutil
+from urllib.parse import unquote
+import re
 
 from .config import settings
 from .logging_conf import configure_logging
@@ -83,19 +79,37 @@ from app.utils import llm_extract_missing_fields
 
 @app.get("/extract/{file_id}", response_model=ExtractResult)
 async def extract(file_id: str, debug: bool = False):
-    # find file by prefix
-    matches = list(UPLOADS.glob(file_id + "*"))
+    # Sanitize and decode incoming file_id to tolerate encoded slashes or wrapped URLs
+    raw_file_id = file_id
+    try:
+        decoded = unquote(raw_file_id)
+    except Exception:
+        decoded = raw_file_id
+
+    # Prefer extracting a UUID-like token if present (handles cases like ".../featur33e60f58-27f6-4be8-8b63-35361f2dac61es/...")
+    m = re.search(r"[0-9a-fA-F\-]{8,36}", decoded)
+    if m:
+        cleaned_id = m.group(0)
+    else:
+        # fallback: take last path segment
+        cleaned_id = decoded.split("/")[-1]
+
+    log.debug("extract requested raw_file_id=%s decoded=%s cleaned_id=%s", raw_file_id, decoded, cleaned_id)
+
+    # find file by prefix using the cleaned id
+    matches = list(UPLOADS.glob(cleaned_id + "*"))
     if not matches:
-        raise HTTPException(status_code=404, detail="file_id not found")
+        # helpful 404 message that includes the cleaned id we attempted
+        raise HTTPException(status_code=404, detail=f"file_id not found (attempted id: {cleaned_id})")
     file_path = matches[0]
 
     text, err = ocr_file(file_path)
     if not text:
-        res = ExtractResult(file_id=file_id, text_hash="", notes=f"OCR failed: {err}")
+        res = ExtractResult(file_id=cleaned_id, text_hash="", notes=f"OCR failed: {err}")
         write_audit("extract_fail", res.model_dump())
         return res
 
-    parsed = parse_text(file_id, text)
+    parsed = parse_text(cleaned_id, text)
     result = parsed.model_dump()
 
     # Identify missing/low-confidence fields for LLM fallback
