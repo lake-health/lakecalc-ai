@@ -276,7 +276,8 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
                                     break
                                 break
                             # If next line contains any known measurement or label, break (do not assign axis)
-                            if re.search(r"(CW[- ]?Chord|AL|WTW|CCT|ACD|LT|AK|SE|SD|TK|TSE|ATK|P|Ix|ly|Fixação|Comentário|mm|μm|D|VA|Status de olho|Resultado|Paciente|Médico|Operador|Data|Versão|Página)", next_line, re.I):
+                            # Note: AK (astigmatism) is related to keratometry, so don't break on it
+                            if re.search(r"(CW[- ]?Chord|AL|WTW|CCT|ACD|LT|SE|SD|TK|TSE|ATK|P|Ix|ly|Fixação|Comentário|mm|μm|D|VA|Status de olho|Resultado|Paciente|Médico|Operador|Data|Versão|Página)", next_line, re.I):
                                 break
                             # also skip if the next line is just a short numeric token (likely noise like '888')
                             if re.fullmatch(r"\s*\d{1,4}\s*", next_line):
@@ -292,7 +293,8 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
                                 axis_only = re.fullmatch(r"@?\s*(\d{1,3})\s*°", prev_line)
                                 if axis_only:
                                     # ensure previous line isn't a known measurement/label
-                                    if re.search(r"(CW[- ]?Chord|AL|WTW|CCT|ACD|LT|AK|SE|SD|TK|TSE|ATK|P|Ix|ly|Fixação|Comentário|mm|μm|D|VA|Status de olho|Resultado|Paciente|Médico|Operador|Data|Versão|Página)", prev_line, re.I):
+                                    # Note: AK (astigmatism) is related to keratometry, so don't break on it
+                                    if re.search(r"(CW[- ]?Chord|AL|WTW|CCT|ACD|LT|SE|SD|TK|TSE|ATK|P|Ix|ly|Fixação|Comentário|mm|μm|D|VA|Status de olho|Resultado|Paciente|Médico|Operador|Data|Versão|Página)", prev_line, re.I):
                                         break
                                     kaxis = axis_only.group(1)
                                     break
@@ -304,10 +306,29 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
             out["k1"] = k_results["K1"]["val"]
             if k_results["K1"]["axis"]:
                 out["k1_axis"] = k_results["K1"]["axis"]
+                log.debug("MAIN: K1 axis assigned: %s", k_results["K1"]["axis"])
         if k_results["K2"]["val"]:
             out["k2"] = k_results["K2"]["val"]
             if k_results["K2"]["axis"]:
                 out["k2_axis"] = k_results["K2"]["axis"]
+                log.debug("MAIN: K2 axis assigned: %s", k_results["K2"]["axis"])
+        
+        # Fix: If both K1 and K2 have the same axis (which is incorrect in keratometry),
+        # calculate the perpendicular for one of them
+        if (out.get("k1_axis") == out.get("k2_axis") and 
+            out.get("k1_axis") and out.get("k2_axis") and
+            k_results["K1"]["val"] and k_results["K2"]["val"]):
+            try:
+                # Calculate perpendicular axis for K2 (K1 and K2 are typically 90 degrees apart)
+                k1_axis_num = int(out["k1_axis"])
+                k2_axis_num = (k1_axis_num + 90) % 180
+                log.debug("MAIN FIX APPLIED: K1 axis %s, K2 axis changed from %s to %s", 
+                         out["k1_axis"], out["k2_axis"], k2_axis_num)
+                out["k2_axis"] = str(k2_axis_num)
+            except (ValueError, TypeError) as e:
+                # If we can't calculate perpendicular, leave K2 axis empty
+                log.debug("MAIN FIX FAILED: Error calculating perpendicular: %s", e)
+                out["k2_axis"] = ""
         # Fallback: if no K1/K2 found via dedicated pattern, use scalars
         if "k1" not in out and scalars.get("k1"):
             out["k1"] = scalars.get("k1")[0]
@@ -456,11 +477,43 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
                         best_dist = dist
                 if best:
                     out[f"{kkey}_axis"] = best
+                    log.debug("FALLBACK: %s axis assigned: %s", kkey, best)
+            
+            # Fix: If both K1 and K2 have the same axis (which is incorrect in keratometry),
+            # calculate the perpendicular for one of them
+            if (out.get("k1_axis") == out.get("k2_axis") and 
+                out.get("k1_axis") and out.get("k2_axis") and
+                "k1" in out and "k2" in out):
+                try:
+                    # Calculate perpendicular axis for K2 (K1 and K2 are typically 90 degrees apart)
+                    k1_axis_num = int(out["k1_axis"])
+                    k2_axis_num = (k1_axis_num + 90) % 180
+                    log.debug("FIX APPLIED: K1 axis %s, K2 axis changed from %s to %s", 
+                             out["k1_axis"], out["k2_axis"], k2_axis_num)
+                    out["k2_axis"] = str(k2_axis_num)
+                except (ValueError, TypeError) as e:
+                    # If we can't calculate perpendicular, leave K2 axis empty
+                    log.debug("FIX FAILED: Error calculating perpendicular: %s", e)
+                    out["k2_axis"] = ""
             # if anchors not found, fall back to first/second occurrence as before
+            # BUT: Don't assign the same axis to both K1 and K2 if there's only one occurrence
             if "k1_axis" not in out and len(axis_occurrences) >= 1:
                 out["k1_axis"] = axis_occurrences[0][1]
             if "k2_axis" not in out and len(axis_occurrences) >= 2:
                 out["k2_axis"] = axis_occurrences[1][1]
+            elif "k2_axis" not in out and len(axis_occurrences) == 1:
+                # If only one axis occurrence and K2 needs an axis, calculate the perpendicular
+                # In keratometry, K1 and K2 are typically 90 degrees apart
+                k1_axis_val = out.get("k1_axis")
+                if k1_axis_val:
+                    try:
+                        k1_axis_num = int(k1_axis_val)
+                        # Calculate perpendicular axis (add 90 degrees, wrap around 180)
+                        k2_axis_num = (k1_axis_num + 90) % 180
+                        out["k2_axis"] = str(k2_axis_num)
+                    except (ValueError, TypeError):
+                        # If we can't calculate perpendicular, leave K2 axis empty
+                        pass
         return out
 
     od_pairs = pair_k_values(od_scalars, od_text)
@@ -606,6 +659,39 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
                     best_dist = d
             if best:
                 setattr(eye_obj, f"{kkey}_axis", best)
+                log.debug("FINAL PROXIMITY: %s axis assigned: %s", kkey, best)
+        
+        # Fix: If both K1 and K2 have the same axis (which is incorrect in keratometry),
+        # calculate the perpendicular for one of them
+        k1_axis = getattr(eye_obj, 'k1_axis', '')
+        k2_axis = getattr(eye_obj, 'k2_axis', '')
+        if (k1_axis == k2_axis and k1_axis and k2_axis and
+            getattr(eye_obj, 'k1') and getattr(eye_obj, 'k2')):
+            try:
+                k1_axis_num = int(k1_axis)
+                k2_axis_num = (k1_axis_num + 90) % 180
+                log.debug("FINAL PROXIMITY FIX: K1 axis %s, K2 axis changed from %s to %s", 
+                         k1_axis, k2_axis, k2_axis_num)
+                eye_obj.k2_axis = str(k2_axis_num)
+            except (ValueError, TypeError) as e:
+                log.debug("FINAL PROXIMITY FIX FAILED: Error calculating perpendicular: %s", e)
+        
+        # If we only found one axis and both K1 and K2 need axes, calculate perpendicular for the second one
+        elif len(occ) == 1 and need_k1 and need_k2:
+            if k1_axis and not k2_axis:
+                try:
+                    k1_axis_num = int(k1_axis)
+                    k2_axis_num = (k1_axis_num + 90) % 180
+                    eye_obj.k2_axis = str(k2_axis_num)
+                except (ValueError, TypeError):
+                    pass
+            elif k2_axis and not k1_axis:
+                try:
+                    k2_axis_num = int(k2_axis)
+                    k1_axis_num = (k2_axis_num - 90) % 180
+                    eye_obj.k1_axis = str(k1_axis_num)
+                except (ValueError, TypeError):
+                    pass
 
     # apply per-eye final proximity assignment
     try:
