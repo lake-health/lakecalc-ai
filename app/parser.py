@@ -453,8 +453,13 @@ def parse_text(file_id: str, text: str, llm_func=None) -> ExtractResult:
         setattr(fld, "k1", k1_raw)
         setattr(fld, "k2", k2_raw)
         # axis per K: populate k1_axis/k2_axis from paired heuristics only
-        k1_ax = pairs.get("k1_axis") or ""
-        k2_ax = pairs.get("k2_axis") or ""
+        if pairs is None:
+            log.warning("Pairs is None. Unable to retrieve k1_axis and k2_axis.")
+            k1_ax = ""
+            k2_ax = ""
+        else:
+            k1_ax = pairs.get("k1_axis") or ""
+            k2_ax = pairs.get("k2_axis") or ""
         fld.k1_axis = k1_ax
         fld.k2_axis = k2_ax
 
