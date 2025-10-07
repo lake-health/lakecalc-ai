@@ -91,21 +91,31 @@ async def extract(file_id: str, debug: bool = False):
 
     text, err = ocr_file(file_path)
     if not text:
-        res = ExtractResult(file_id=file_id, text_hash="", notes=f"OCR failed: {err}")
-        write_audit("extract_fail", res.model_dump())
-        return res
+        # OCR failed, but we can still try LLM fallback with file metadata
+        # Create a basic text representation for LLM processing
+        text = f"Medical document: {file_path.name} - File type: {file_path.suffix} - OCR failed: {err}"
+        log.warning("OCR failed for %s, using LLM fallback with minimal context", file_path.name)
 
     parsed = parse_text(file_id, text)
     result = parsed.model_dump()
 
     # Identify missing/low-confidence fields for LLM fallback
     def get_missing_fields(eye):
-        fields = ["axial_length", "lt", "cct", "ak", "axis"]
+        fields = ["axial_length", "lt", "cct", "ak", "axis", "k1", "k2", "k1_axis", "k2_axis", "acd", "wtw"]
         return [k for k in fields if not getattr(parsed, eye).__dict__.get(k)]
     missing_fields = {
         "od": get_missing_fields("od"),
         "os": get_missing_fields("os"),
     }
+
+    # If OCR failed, be more aggressive with LLM fallback
+    ocr_failed = bool(err)
+    if ocr_failed:
+        # When OCR fails, request all important fields from LLM
+        missing_fields = {
+            "od": ["axial_length", "lt", "cct", "ak", "k1", "k2", "k1_axis", "k2_axis", "acd", "wtw"],
+            "os": ["axial_length", "lt", "cct", "ak", "k1", "k2", "k1_axis", "k2_axis", "acd", "wtw"]
+        }
 
     # Only call LLM if any fields are missing
     if missing_fields["od"] or missing_fields["os"]:
@@ -128,6 +138,8 @@ async def extract(file_id: str, debug: bool = False):
                         result[eye][k] = v
                         result["confidence"][f"{eye}.{k}"] = 0.7
         result["llm_fallback"] = True
+        if ocr_failed:
+            result["notes"] = f"OCR failed: {err}. Used LLM fallback for data extraction."
     else:
         result["llm_fallback"] = False
 
