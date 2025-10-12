@@ -1,0 +1,24 @@
+This is a test file with biometry data in an unusual format that should trigger LLM parsing.
+
+Patient: John Doe
+Date of Birth: 01/01/1980
+
+Right Eye (OD):
+- Length: 24.5 millimeters
+- K1: 43.2 diopters at 90 degrees
+- K2: 44.1 diopters at 180 degrees
+- Anterior Chamber Depth: 3.2 millimeters
+- Lens Thickness: 4.8 millimeters
+- White to White: 12.3 millimeters
+- Central Corneal Thickness: 545 micrometers
+
+Left Eye (OS):
+- Length: 24.3 millimeters  
+- K1: 43.0 diopters at 85 degrees
+- K2: 44.3 diopters at 175 degrees
+- Anterior Chamber Depth: 3.1 millimeters
+- Lens Thickness: 4.9 millimeters
+- White to White: 12.2 millimeters
+- Central Corneal Thickness: 552 micrometers
+
+This format should not match any existing regex patterns and force LLM usage.

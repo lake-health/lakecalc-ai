@@ -17,7 +17,7 @@ except Exception as e:
     vision = None
     log.exception("Failed importing Google Vision SDK: %s", e)
 
-MAX_OCR_PAGES = int(os.getenv("MAX_OCR_PAGES", "2"))  # Only process first 2 pages by default for ophthalmology docs
+MAX_OCR_PAGES = int(os.getenv("MAX_OCR_PAGES", "4"))  # Process first 4 pages for dual-eye reports
 OCR_DPI = int(os.getenv("OCR_DPI", "200"))
 
 def _file_hash(path: Path) -> str:

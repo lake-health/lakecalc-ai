@@ -11,6 +11,7 @@ pymupdf==1.24.9
 pdfplumber==0.11.4
 pdfminer.six==20231228
 pypdf==4.3.1
+PyPDF2==3.0.1
 Pillow==10.4.0
 pdf2image==1.17.0
 google-cloud-vision==3.7.2
@@ -22,8 +23,14 @@ tiktoken==0.7.0
 
 # --- Validation / settings ---
 pydantic==2.9.2
-# If you’re not actually using Pydantic for settings anymore, you can drop this:
+# If you're not actually using Pydantic for settings anymore, you can drop this:
 # pydantic-settings==2.5.2
+
+# --- Scientific computing ---
+numpy>=1.24.0
+
+# --- HTTP requests ---
+requests>=2.31.0
 
 # Test dependencies
 pytest>=7.0.0

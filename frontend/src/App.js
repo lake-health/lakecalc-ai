@@ -4,12 +4,14 @@ import FileUpload from './components/FileUpload';
 import DataExtraction from './components/DataExtraction';
 import DataReview from './components/DataReview';
 import IOLSuggestion from './components/IOLSuggestion';
+import IOLCalculation from './components/IOLCalculation';
 
 function App() {
   const [currentStep, setCurrentStep] = useState('upload');
   const [fileId, setFileId] = useState(null);
   const [extractedData, setExtractedData] = useState(null);
   const [reviewedData, setReviewedData] = useState(null);
+  const [selectedFamilies, setSelectedFamilies] = useState({});
 
   const handleUploadSuccess = (uploadResponse) => {
     setFileId(uploadResponse.file_id);
@@ -26,6 +28,15 @@ function App() {
     setCurrentStep('suggest');
   };
 
+  const handleSuggestionSuccess = (families) => {
+    setSelectedFamilies(families);
+    setCurrentStep('calculate');
+  };
+
+  const handleSuggestionComplete = () => {
+    setCurrentStep('calculate');
+  };
+
   const resetFlow = () => {
     setCurrentStep('upload');
     setFileId(null);
@@ -38,9 +49,9 @@ function App() {
       <header className="app-header">
         <div className="header-content">
           <div className="logo-section">
-            <img src="/logo.svg?v=1" alt="Lakecalc AI" className="header-logo" />
+                    <img src="/logo.svg?v=1" alt="LakeCalc.ai" className="header-logo" />
             <div className="header-text">
-              <h1>Lakecalc AI</h1>
+              <h1>LakeCalc.ai</h1>
               <p>Intraocular Lens AI Agent</p>
             </div>
           </div>
@@ -54,21 +65,25 @@ function App() {
 
       <main className="app-main">
         <div className="step-indicator">
-          <div className={`step ${currentStep === 'upload' ? 'active' : currentStep === 'extract' || currentStep === 'review' || currentStep === 'suggest' ? 'completed' : ''}`}>
+          <div className={`step ${currentStep === 'upload' ? 'active' : ['extract', 'review', 'suggest', 'calculate'].includes(currentStep) ? 'completed' : ''}`}>
             <span className="step-number">1</span>
             <span className="step-label">Upload</span>
           </div>
-          <div className={`step ${currentStep === 'extract' ? 'active' : currentStep === 'review' || currentStep === 'suggest' ? 'completed' : ''}`}>
+          <div className={`step ${currentStep === 'extract' ? 'active' : ['review', 'suggest', 'calculate'].includes(currentStep) ? 'completed' : ''}`}>
             <span className="step-number">2</span>
             <span className="step-label">Extract</span>
           </div>
-          <div className={`step ${currentStep === 'review' ? 'active' : currentStep === 'suggest' ? 'completed' : ''}`}>
+          <div className={`step ${currentStep === 'review' ? 'active' : ['suggest', 'calculate'].includes(currentStep) ? 'completed' : ''}`}>
             <span className="step-number">3</span>
             <span className="step-label">Review</span>
           </div>
-          <div className={`step ${currentStep === 'suggest' ? 'active' : ''}`}>
+          <div className={`step ${currentStep === 'suggest' ? 'active' : currentStep === 'calculate' ? 'completed' : ''}`}>
             <span className="step-number">4</span>
             <span className="step-label">Suggest</span>
+          </div>
+          <div className={`step ${currentStep === 'calculate' ? 'active' : ''}`}>
+            <span className="step-number">5</span>
+            <span className="step-label">Calculate</span>
           </div>
         </div>
 
@@ -95,6 +110,15 @@ function App() {
           {currentStep === 'suggest' && reviewedData && (
             <IOLSuggestion 
               reviewedData={reviewedData}
+              onSuggestionComplete={handleSuggestionComplete}
+              onSuggestionSuccess={handleSuggestionSuccess}
+            />
+          )}
+          
+          {currentStep === 'calculate' && reviewedData && (
+            <IOLCalculation 
+              reviewedData={reviewedData}
+              selectedFamilies={selectedFamilies}
             />
           )}
         </div>

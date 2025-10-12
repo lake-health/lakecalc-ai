@@ -24,7 +24,14 @@ const DataReview = ({ fileId, extractedData, onReviewSuccess }) => {
   }, [extractedData]);
 
   const handleFieldChange = (eye, field, value) => {
-    const key = `${eye}.${field}`;
+    let key;
+    if (eye === 'patient' && field === 'gender') {
+      key = 'gender';
+    } else if (eye === 'assumed_sia') {
+      key = `${eye}_${field}`;
+    } else {
+      key = `${eye}.${field}`;
+    }
     setEditedData(prev => ({
       ...prev,
       [key]: value
@@ -174,6 +181,91 @@ const DataReview = ({ fileId, extractedData, onReviewSuccess }) => {
           {renderEyeSection('os', 'Left Eye (OS)')}
         </div>
 
+        {/* Patient Demographics Section */}
+        <div className="demographics-section">
+          <h3>Patient Demographics</h3>
+          <p>Required for advanced IOL calculations (Hill-RBF 3.0, Kane)</p>
+          <div className="demographics-inputs">
+            <div className="demographics-input">
+              <label>Gender {extractedData.gender && <span className="extracted-badge">Auto-extracted</span>}</label>
+              <select
+                value={editedData['gender'] || extractedData.gender || ''}
+                onChange={(e) => handleFieldChange('patient', 'gender', e.target.value)}
+                className="gender-select"
+              >
+                <option value="">Select Gender</option>
+                <option value="M">Male</option>
+                <option value="F">Female</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        {/* Assumed SIA Section */}
+        <div className="assumed-sia-section">
+          <h3>Assumed SIA (Surgeon-Induced Astigmatism)</h3>
+          <p>Enter your personal SIA values for advanced toric calculations</p>
+          <div className="sia-inputs">
+            {/* OD (Right Eye) SIA */}
+            <div className="sia-input">
+              <label>OD (Right Eye)</label>
+              <div className="sia-magnitude-axis">
+                <input
+                  type="number"
+                  step="0.1"
+                  min="0"
+                  max="2"
+                  value={editedData['assumed_sia_od_magnitude'] || 0.1}
+                  onChange={(e) => handleFieldChange('assumed_sia_od_magnitude', 'value', e.target.value)}
+                  placeholder="0.1"
+                  title="SIA Magnitude (diopters)"
+                />
+                <span className="sia-label">D @</span>
+                <input
+                  type="number"
+                  step="1"
+                  min="0"
+                  max="180"
+                  value={editedData['assumed_sia_od_axis'] || 120}
+                  onChange={(e) => handleFieldChange('assumed_sia_od_axis', 'value', e.target.value)}
+                  placeholder="120"
+                  title="SIA Axis (degrees)"
+                />
+                <span className="sia-label">°</span>
+              </div>
+            </div>
+            
+            {/* OS (Left Eye) SIA */}
+            <div className="sia-input">
+              <label>OS (Left Eye)</label>
+              <div className="sia-magnitude-axis">
+                <input
+                  type="number"
+                  step="0.1"
+                  min="0"
+                  max="2"
+                  value={editedData['assumed_sia_os_magnitude'] || 0.2}
+                  onChange={(e) => handleFieldChange('assumed_sia_os_magnitude', 'value', e.target.value)}
+                  placeholder="0.2"
+                  title="SIA Magnitude (diopters)"
+                />
+                <span className="sia-label">D @</span>
+                <input
+                  type="number"
+                  step="1"
+                  min="0"
+                  max="180"
+                  value={editedData['assumed_sia_os_axis'] || 120}
+                  onChange={(e) => handleFieldChange('assumed_sia_os_axis', 'value', e.target.value)}
+                  placeholder="120"
+                  title="SIA Axis (degrees)"
+                />
+                <span className="sia-label">°</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
         {validationFlags.length > 0 && (
           <div className="validation-warnings">
             <h4>Validation Warnings</h4>
@@ -215,7 +307,7 @@ const DataReview = ({ fileId, extractedData, onReviewSuccess }) => {
                 Submitting...
               </>
             ) : (
-              'Continue to IOL Suggestions'
+              'Continue to IOL Selection'
             )}
           </button>
         </div>

@@ -1,0 +1,23 @@
+Eyestar Biometry Report
+Patient: Maria Silva
+Birth Date: 15/03/1970
+
+OD right eye measurements:
+AL [mm] 25.25
+K1 [D/mm/] 42.60/7.92@ 14
+K2 [D/mm/] 43.52/7.76@ 104
+ACD [mm] 3.12
+LT [mm] 4.85
+WTW [mm] 12.1
+CCT [μm] 545
+
+OS left eye measurements:
+AL [mm] 24.82
+K1 [D/mm/] 42.68/7.91@ 8
+K2 [D/mm/] 43.45/7.78@ 98
+ACD [mm] 3.08
+LT [mm] 4.92
+WTW [mm] 12.0
+CCT [μm] 552
+
+This is a test file to trigger LLM parsing.

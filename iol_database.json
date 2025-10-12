@@ -1,0 +1,173 @@
+{
+  "families": [
+    {
+      "id": "alcon_clareon",
+      "brand": "Alcon",
+      "family": "Clareon",
+      "a_constant": 118.9,
+      "models": [
+        {
+          "id": "clareon_iq_wf",
+          "name": "Clareon IQ/WF",
+          "type": "monofocal",
+          "description": "Monofocal aspheric IOL",
+          "toric_available": true,
+          "toric_models": ["Clareon Toric IQ/WF"]
+        },
+        {
+          "id": "clareon_panoptix",
+          "name": "Clareon PanOptix",
+          "type": "trifocal",
+          "description": "Trifocal presbyopia-correcting IOL",
+          "toric_available": true,
+          "toric_models": ["Clareon PanOptix Toric"]
+        },
+        {
+          "id": "clareon_vivity",
+          "name": "Clareon Vivity",
+          "type": "extended_depth_of_focus",
+          "description": "Extended depth of focus IOL",
+          "toric_available": true,
+          "toric_models": ["Clareon Vivity Toric"]
+        }
+      ]
+    },
+    {
+      "id": "jj_tecnis",
+      "brand": "Johnson & Johnson",
+      "family": "Tecnis",
+      "a_constant": 119.0,
+      "models": [
+        {
+          "id": "tecnis_odyssey",
+          "name": "Tecnis Odyssey",
+          "type": "monofocal",
+          "description": "Monofocal aspheric IOL",
+          "toric_available": true,
+          "toric_models": ["Tecnis Toric Odyssey"]
+        },
+        {
+          "id": "tecnis_puresee",
+          "name": "Tecnis PureSee",
+          "type": "extended_depth_of_focus",
+          "description": "Extended depth of focus IOL",
+          "toric_available": true,
+          "toric_models": ["Tecnis Toric PureSee"]
+        },
+        {
+          "id": "tecnis_synergy",
+          "name": "Tecnis Synergy",
+          "type": "extended_depth_of_focus",
+          "description": "Extended depth of focus IOL with intermediate vision",
+          "toric_available": true,
+          "toric_models": ["Tecnis Toric Synergy"]
+        },
+        {
+          "id": "tecnis_symfony",
+          "name": "Tecnis Symfony",
+          "type": "extended_depth_of_focus",
+          "description": "Extended range of vision IOL",
+          "toric_available": true,
+          "toric_models": ["Tecnis Toric Symfony"]
+        },
+        {
+          "id": "tecnis_one",
+          "name": "Tecnis One",
+          "type": "monofocal",
+          "description": "Monofocal IOL with enhanced intermediate vision",
+          "toric_available": true,
+          "toric_models": ["Tecnis Toric One"]
+        }
+      ]
+    },
+    {
+      "id": "zeiss",
+      "brand": "Zeiss",
+      "family": "Zeiss",
+      "a_constant": 118.8,
+      "models": [
+        {
+          "id": "zeiss_at_lisa_tri",
+          "name": "AT LISA tri",
+          "type": "trifocal",
+          "description": "Trifocal presbyopia-correcting IOL",
+          "toric_available": true,
+          "toric_models": ["AT LISA tri Toric"]
+        },
+        {
+          "id": "zeiss_at_lisa_toric",
+          "name": "AT LISA Toric",
+          "type": "bifocal",
+          "description": "Bifocal toric IOL",
+          "toric_available": true,
+          "toric_models": ["AT LISA Toric"]
+        },
+        {
+          "id": "zeiss_at_lisa_809mp",
+          "name": "AT LISA 809MP",
+          "type": "monofocal",
+          "description": "Monofocal aspheric IOL",
+          "toric_available": true,
+          "toric_models": ["AT LISA 809MP Toric"]
+        }
+      ]
+    },
+    {
+      "id": "hoya_geometric",
+      "brand": "Hoya",
+      "family": "Geometric",
+      "a_constant": 118.7,
+      "models": [
+        {
+          "id": "hoya_geometric_iol",
+          "name": "Geometric IOL",
+          "type": "monofocal",
+          "description": "Geometric monofocal IOL",
+          "toric_available": true,
+          "toric_models": ["Geometric Toric IOL"]
+        },
+        {
+          "id": "hoya_geometric_multifocal",
+          "name": "Geometric Multifocal",
+          "type": "multifocal",
+          "description": "Geometric multifocal IOL",
+          "toric_available": false,
+          "toric_models": []
+        }
+      ]
+    },
+    {
+      "id": "rayner_iol",
+      "brand": "Rayner",
+      "family": "Rayner IOL",
+      "a_constant": 118.6,
+      "models": [
+        {
+          "id": "rayner_superflex",
+          "name": "SuperFlex",
+          "type": "monofocal",
+          "description": "Monofocal aspheric IOL",
+          "toric_available": true,
+          "toric_models": ["SuperFlex Toric"]
+        },
+        {
+          "id": "rayner_triflex",
+          "name": "Triflex",
+          "type": "trifocal",
+          "description": "Trifocal presbyopia-correcting IOL",
+          "toric_available": true,
+          "toric_models": ["Triflex Toric"]
+        },
+        {
+          "id": "rayner_enhance",
+          "name": "Enhance",
+          "type": "extended_depth_of_focus",
+          "description": "Extended depth of focus IOL",
+          "toric_available": true,
+          "toric_models": ["Enhance Toric"]
+        }
+      ]
+    }
+  ]
+}
+

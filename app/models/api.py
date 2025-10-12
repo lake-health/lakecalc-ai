@@ -27,6 +27,8 @@ class ExtractResult(BaseModel):
     confidence: Dict[str, float] = Field(default_factory=dict)
     flags: list[str] = Field(default_factory=list)
     notes: Optional[str] = None
+    gender: Optional[str] = None
+    device: Optional[str] = None
 
 class ReviewPayload(BaseModel):
     file_id: str
@@ -34,7 +36,12 @@ class ReviewPayload(BaseModel):
 
 class SuggestQuery(BaseModel):
     deltaK: float
+    sia_magnitude: Optional[float] = None
+    sia_axis: Optional[float] = None
+    # Legacy field for backward compatibility
     sia: Optional[float] = None
+    # Toric policy selection
+    toric_policy: Optional[str] = "lifetime_atr"  # Default to lifetime_atr policy
 
 class SuggestResponse(BaseModel):
     recommend_toric: bool

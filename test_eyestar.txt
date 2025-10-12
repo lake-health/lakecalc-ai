@@ -1,0 +1,17 @@
+franciosi, carina
+12/19/1973
+ID: 2935194
+OD (right eye)
+AL [mm]: 25.25
+CCT [µm]: 484
+ACD [mm]: 3.72
+K1 [D/mm/°]: 42.60/7.92@ 14
+K2 [D/mm/°]: 43.61/7.74@ 104
+WTW [mm]: 12.95
+OS (left eye)
+AL [mm]: 24.82
+CCT [µm]: 514
+ACD [mm]: 3.76
+K1 [D/mm/°]: 42.68/7.91@ 8
+K2 [D/mm/°]: 43.98/7.67@ 98
+WTW [mm]: 12.85

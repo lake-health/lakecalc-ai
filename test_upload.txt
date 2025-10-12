@@ -1,0 +1,16 @@
+IOLMaster 700 Biometry Report
+
+Patient: Test Patient
+Date: 2024-01-15
+
+OD (Right Eye):
+Axial Length: 23.45 mm
+K1: 42.75 D @ 90°
+K2: 43.50 D @ 180°
+ACD: 2.95 mm
+LT: 4.32 mm
+WTW: 11.8 mm
+CCT: 540 μm
+
+Target: Emmetropia (0.00 D)
+Age: 65 years

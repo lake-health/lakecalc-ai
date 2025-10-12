@@ -25,7 +25,8 @@ from .storage import UPLOADS, TEXT_DIR
 from .ocr import ocr_file
 from .parser import parse_text
 from .audit import write_audit
-from .suggest import load_families, toric_decision
+from .suggest import toric_decision
+from .services.iol_database import get_iol_database
 
 configure_logging()
 log = logging.getLogger(__name__)
@@ -53,6 +54,14 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
         return response
 
 app.add_middleware(RequestIdMiddleware)
+
+# Include routers
+from .routes.suggest import router as suggest_router
+from .routes.calculate import router as calculate_router
+from .routes.parser import router as parser_router
+app.include_router(suggest_router, prefix="/suggest", tags=["suggest"])
+app.include_router(calculate_router, prefix="/calculate", tags=["calculate"])
+app.include_router(parser_router, tags=["parser"])
 
 @app.get("/")
 def root():
@@ -98,6 +107,12 @@ async def extract(file_id: str, debug: bool = False):
 
     parsed = parse_text(file_id, text)
     result = parsed.model_dump()
+    
+    # Extract gender and device using the enhanced parser
+    from app.services.parsing import parse_biometry
+    biometry_data = parse_biometry(text)
+    result["gender"] = biometry_data.gender
+    result["device"] = biometry_data.device
 
     # Identify missing/low-confidence fields for LLM fallback
     def get_missing_fields(eye):
@@ -143,6 +158,16 @@ async def extract(file_id: str, debug: bool = False):
     else:
         result["llm_fallback"] = False
 
+    # Add default Assumed SIA values - separated into magnitude and axis
+    result["assumed_sia_od_magnitude"] = 0.1
+    result["assumed_sia_od_axis"] = 120.0
+    result["assumed_sia_os_magnitude"] = 0.2
+    result["assumed_sia_os_axis"] = 120.0
+    
+    # Legacy string format for backward compatibility
+    result["assumed_sia_od"] = "0.1 deg 120"
+    result["assumed_sia_os"] = "0.2 deg 120"
+    
     write_audit("extract_ok", result)
     if debug:
         result["ocr_text"] = text
@@ -170,23 +195,116 @@ async def review_form(request: Request, file_id: str):
 
 @app.post("/suggest", response_model=SuggestResponse)
 async def suggest(q: SuggestQuery):
-    recommend, effective, th = toric_decision(q.deltaK, q.sia)
-    fams = load_families()
-    rationale = (
-        f"effective_astig = deltaK - |SIA| = {q.deltaK:.2f} - {abs(q.sia) if q.sia is not None else settings.sia_default:.2f} = {effective:.2f}; "
-        f"threshold = {th:.2f} → {'RECOMMEND TORIC' if recommend else 'NON‑TORIC OK'}"
-    )
-    return SuggestResponse(
-        recommend_toric=recommend,
-        effective_astig=effective,
-        threshold=th,
-        rationale=rationale,
-        families=fams,
-    )
+    """Advanced suggest endpoint using the new Advanced Toric Calculator."""
+    try:
+        from app.services.toric_calculator import ToricCalculator
+        
+        # Initialize Advanced Toric Calculator
+        calculator = ToricCalculator()
+        
+        # For the legacy endpoint, we need to estimate some parameters
+        # Use reasonable defaults for suggestion purposes
+        k1 = 43.0  # Default K1
+        k2 = k1 + q.deltaK  # Estimate K2 from deltaK
+        k1_axis = 90  # Default steep axis
+        k2_axis = 180  # Default flat axis
+        
+        # Use provided SIA values or eye-specific defaults
+        # Note: For the legacy endpoint, we don't know which eye, so use OD default
+        sia_magnitude = q.sia_magnitude or q.sia or 0.1  # Default to OD value (0.1D)
+        sia_axis = q.sia_axis or 120.0  # Use provided axis or default
+        
+        # Calculate Haigis ELP for accurate toricity ratio
+        from app.services.calculations import IOLCalculator, IOLCalculationInput
+        
+        # Create minimal biometry for Haigis ELP calculation
+        calc_input = IOLCalculationInput(
+            axial_length=23.77,  # Default AL for suggestion
+            k_avg=(k1 + k2) / 2,  # Average K
+            acd=2.83,  # Default ACD
+            target_refraction=0.0,
+            k1=k1,  # Explicit K1
+            k2=k2,  # Explicit K2
+            lt=None,  # Not required for Haigis
+            wtw=None,  # Not required for Haigis
+            cct=None  # Not required for Haigis
+        )
+        
+        iol_calculator = IOLCalculator()
+        haigis_result = iol_calculator._calculate_haigis(calc_input, {})
+        elp_mm = haigis_result.formula_specific_data.get("ELP_mm", 5.0)
+        
+        log.info(f"Calculated Haigis ELP: {elp_mm}mm for K1={k1}, K2={k2}, deltaK={q.deltaK}")
+        
+        # Calculate advanced toric IOL recommendation
+        toric_result = calculator.calculate_toric_iol(
+            k1=k1, k2=k2, k1_axis=k1_axis, k2_axis=k2_axis,
+            sia_magnitude=sia_magnitude, sia_axis=sia_axis,
+            elp_mm=elp_mm, target_refraction=0.0,
+            policy_key=q.toric_policy or "lifetime_atr"
+        )
+        
+        # Use new IOL database
+        db = get_iol_database()
+        families_data = db.get_families_for_recommendation(recommend_toric=toric_result.recommend_toric)
+        fams = [{"brand": f['brand'], "family": f['family'], "name": f"{f['brand']} {f['family']}"} for f in families_data]
+        
+        # Use the detailed rationale from the toric calculator
+        if isinstance(toric_result.rationale, list):
+            rationale = " | ".join(toric_result.rationale)
+        else:
+            rationale = toric_result.rationale
+        
+        return SuggestResponse(
+            recommend_toric=toric_result.recommend_toric,
+            effective_astig=toric_result.total_astigmatism,  # Use total astigmatism as effective
+            threshold=1.25,  # Advanced calculator threshold
+            rationale=rationale,
+            families=fams,
+        )
+    except Exception as e:
+        log.error(f"Error in advanced suggest endpoint: {e}")
+        import traceback
+        log.error(f"Full traceback: {traceback.format_exc()}")
+        # Fallback to basic calculation
+        recommend, effective, th = toric_decision(q.deltaK, q.sia)
+        fams = [
+            {"brand": "Alcon", "family": "AcrySof IQ", "name": "Alcon AcrySof IQ"},
+            {"brand": "J&J", "family": "Tecnis", "name": "J&J Tecnis"}
+        ]  # Basic fallback
+        rationale = f"Fallback calculation: effective_astig = {effective:.2f}D"
+        return SuggestResponse(
+            recommend_toric=recommend,
+            effective_astig=effective,
+            threshold=th,
+            rationale=rationale,
+            families=fams,
+        )
 
 @app.get("/suggest/families")
 async def get_families():
-    return load_families()
+    """Get all available IOL families from the comprehensive database."""
+    try:
+        db = get_iol_database()
+        families = db.get_all_families()
+        return families
+    except Exception as e:
+        log.error(f"Error loading IOL families: {e}")
+        # Fallback to legacy format for backward compatibility
+        return [
+            {"brand": "Alcon", "family": "AcrySof IQ", "variants": [{"name": "SN60WF", "type": "monofocal"}, {"name": "TORIC SN6ATx", "type": "toric"}]},
+            {"brand": "J&J", "family": "Tecnis", "variants": [{"name": "ZCB00", "type": "monofocal"}, {"name": "ZCTx", "type": "toric"}]}
+        ]
+
+@app.get("/suggest/policies")
+async def get_toric_policies():
+    """Get available toric IOL policies."""
+    try:
+        from app.services.toric_policy import get_available_policies
+        return {"policies": get_available_policies()}
+    except Exception as e:
+        log.error(f"Error getting toric policies: {e}")
+        return {"policies": {}}
 
 # Debug endpoint to fetch raw OCR text by file hash
 @app.get("/debug/ocr_text/{file_hash}", response_class=PlainTextResponse)

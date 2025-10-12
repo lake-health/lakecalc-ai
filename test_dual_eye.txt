@@ -1,0 +1,22 @@
+BIOMETRY REPORT - DUAL EYE TEST
+
+PATIENT: Test Patient
+DATE: 01/02/2023
+
+OD (RIGHT EYE) ANALYSIS:
+Axial Length: 23.73 mm
+K1: 40.95 D @ 100°
+K2: 43.74 D @ 10°
+ACD: 2.89 mm
+CCT: 554 μm
+Age: 80 years
+
+OS (LEFT EYE) ANALYSIS:
+Axial Length: 23.77 mm
+K1: 41.45 D @ 75°
+K2: 43.80 D @ 165°
+ACD: 2.83 mm
+CCT: 544 μm
+Age: 80 years
+
+END OF REPORT

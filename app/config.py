@@ -2,7 +2,7 @@ import os
 from pydantic import BaseModel
 
 class Settings(BaseModel):
-    uploads_dir: str = os.getenv("UPLOADS_DIR", "/data/uploads")
+    uploads_dir: str = os.getenv("UPLOADS_DIR", "uploads")
     allow_origin: str = os.getenv("ALLOW_ORIGIN", "*")
     ocr_provider: str = os.getenv("OCR_PROVIDER", "google")
     google_creds: str | None = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")

@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Local LLM Parser Test</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        
+        .container {
+            background: white;
+            border-radius: 12px;
+            padding: 30px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+        
+        h1 {
+            color: #2563eb;
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        
+        .upload-section {
+            border: 2px dashed #d1d5db;
+            border-radius: 8px;
+            padding: 40px;
+            text-align: center;
+            margin-bottom: 30px;
+            transition: border-color 0.3s;
+        }
+        
+        .upload-section:hover {
+            border-color: #2563eb;
+        }
+        
+        .upload-section.dragover {
+            border-color: #2563eb;
+            background-color: #eff6ff;
+        }
+        
+        input[type="file"] {
+            margin: 20px 0;
+        }
+        
+        .btn {
+            background: #2563eb;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 16px;
+            margin: 10px;
+        }
+        
+        .btn:hover {
+            background: #1d4ed8;
+        }
+        
+        .btn:disabled {
+            background: #9ca3af;
+            cursor: not-allowed;
+        }
+        
+        .results {
+            margin-top: 30px;
+            padding: 20px;
+            background: #f8fafc;
+            border-radius: 8px;
+            border-left: 4px solid #10b981;
+        }
+        
+        .results h3 {
+            color: #059669;
+            margin-top: 0;
+        }
+        
+        .data-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-top: 20px;
+        }
+        
+        .data-item {
+            background: white;
+            padding: 15px;
+            border-radius: 6px;
+            border: 1px solid #e5e7eb;
+        }
+        
+        .data-label {
+            font-weight: 600;
+            color: #374151;
+            margin-bottom: 5px;
+        }
+        
+        .data-value {
+            color: #2563eb;
+            font-size: 18px;
+        }
+        
+        .loading {
+            text-align: center;
+            padding: 40px;
+        }
+        
+        .spinner {
+            border: 4px solid #f3f4f6;
+            border-top: 4px solid #2563eb;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 20px;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        .error {
+            background: #fef2f2;
+            border-left: 4px solid #ef4444;
+            color: #dc2626;
+            padding: 20px;
+            border-radius: 8px;
+            margin-top: 20px;
+        }
+        
+        .info {
+            background: #eff6ff;
+            border-left: 4px solid #2563eb;
+            color: #1e40af;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+        
+        .dual-eye-container {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 30px;
+            margin-top: 20px;
+        }
+        
+        .eye-section {
+            background: #f8fafc;
+            padding: 20px;
+            border-radius: 8px;
+            border: 2px solid #e5e7eb;
+        }
+        
+        .eye-section h4 {
+            color: #2563eb;
+            margin: 0 0 15px 0;
+            font-size: 18px;
+            text-align: center;
+        }
+        
+        .patient-info {
+            background: #f0f9ff;
+            border: 2px solid #0ea5e9;
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 20px;
+        }
+        
+        .patient-info h4 {
+            color: #0c4a6e;
+            margin: 0 0 10px 0;
+        }
+        
+        .privacy-toggle {
+            background: #fef3c7;
+            border: 1px solid #f59e0b;
+            border-radius: 6px;
+            padding: 10px;
+            margin: 10px 0;
+            font-size: 14px;
+        }
+        
+        .privacy-toggle input[type="checkbox"] {
+            margin-right: 8px;
+        }
+        
+        @media (max-width: 768px) {
+            .dual-eye-container {
+                grid-template-columns: 1fr;
+                gap: 20px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🧠 Universal LLM Biometry Parser</h1>
+        
+        <div class="info">
+            <strong>Universal LLM Parser:</strong> This interface uses a local LLM-first approach to extract biometry data from ANY format. 
+            Handles Zeiss, Eyestar, Pentacam, Lenstar, and all other biometers automatically - zero costs, completely local!
+        </div>
+        
+        <div class="upload-section" id="uploadSection">
+            <h3>📄 Upload Biometry File</h3>
+            <p>Drag and drop a biometry file here, or click to select</p>
+            <input type="file" id="fileInput" accept=".pdf,.png,.jpg,.jpeg,.txt" />
+            <br>
+            <button class="btn" id="parseBtn" disabled>🤖 Parse with Universal LLM</button>
+        </div>
+        
+        <div id="results"></div>
+    </div>
+
+    <script>
+        const fileInput = document.getElementById('fileInput');
+        const parseBtn = document.getElementById('parseBtn');
+        const uploadSection = document.getElementById('uploadSection');
+        const results = document.getElementById('results');
+
+        // File input handling
+        fileInput.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (file) {
+                parseBtn.disabled = false;
+                parseBtn.textContent = `🤖 Parse "${file.name}" with Universal LLM`;
+            }
+        });
+
+        // Drag and drop handling
+        uploadSection.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadSection.classList.add('dragover');
+        });
+
+        uploadSection.addEventListener('dragleave', () => {
+            uploadSection.classList.remove('dragover');
+        });
+
+        uploadSection.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadSection.classList.remove('dragover');
+            
+            const files = e.dataTransfer.files;
+            if (files.length > 0) {
+                fileInput.files = files;
+                parseBtn.disabled = false;
+                parseBtn.textContent = `🤖 Parse "${files[0].name}" with Universal LLM`;
+            }
+        });
+
+        // Parse button click
+        parseBtn.addEventListener('click', async () => {
+            const file = fileInput.files[0];
+            if (!file) return;
+
+            // Show loading
+            results.innerHTML = `
+                <div class="loading">
+                    <div class="spinner"></div>
+                    <h3>🤖 Universal LLM Processing...</h3>
+                    <p>Processing with TinyLlama - handles any biometry format automatically...</p>
+                    <p><small>This may take 1-2 minutes for the first run</small></p>
+                </div>
+            `;
+
+            parseBtn.disabled = true;
+            parseBtn.textContent = '⏳ Processing...';
+
+            try {
+                const formData = new FormData();
+                formData.append('file', file);
+
+                const response = await fetch('/parser/parse', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                }
+
+                const result = await response.json();
+                
+                if (result.success) {
+                    displayResults(result);
+                } else {
+                    throw new Error(result.error || 'Parsing failed');
+                }
+
+            } catch (error) {
+                console.error('Parse error:', error);
+                results.innerHTML = `
+                    <div class="error">
+                        <h3>❌ Parsing Failed</h3>
+                        <p><strong>Error:</strong> ${error.message}</p>
+                        <p>Make sure Ollama is running: <code>brew services start ollama</code></p>
+                    </div>
+                `;
+            } finally {
+                parseBtn.disabled = false;
+                parseBtn.textContent = '🤖 Parse with Universal LLM';
+            }
+        });
+
+        function displayResults(result) {
+            const extractedData = result.extracted_data || {};
+            
+            // Check if we have dual-eye data
+            const hasDualEyes = extractedData.od && extractedData.os;
+            
+            // Patient information (with privacy toggle)
+            let patientInfo = '';
+            if (extractedData.patient_name) {
+                patientInfo = `
+                    <div class="patient-info">
+                        <h4>👤 Patient Information</h4>
+                        <div class="privacy-toggle">
+                            <input type="checkbox" id="showName" onchange="togglePatientName()">
+                            <label for="showName">Show patient name (kept private, never stored)</label>
+                        </div>
+                        <div id="patientName" style="display: none;">
+                            <strong>Name:</strong> ${extractedData.patient_name}
+                        </div>
+                        ${extractedData.age ? `<div><strong>Age:</strong> ${extractedData.age} years</div>` : ''}
+                        ${extractedData.birth_date ? `<div><strong>Birth Date:</strong> ${extractedData.birth_date}</div>` : ''}
+                    </div>
+                `;
+            }
+            
+            let dataDisplay = '';
+            
+            if (hasDualEyes) {
+                // Dual-eye display
+                dataDisplay = `
+                    <div class="dual-eye-container">
+                        <div class="eye-section">
+                            <h4>👁️ Right Eye (OD)</h4>
+                            <div class="data-grid">
+                                ${createDataGrid(extractedData.od)}
+                            </div>
+                        </div>
+                        <div class="eye-section">
+                            <h4>👁️ Left Eye (OS)</h4>
+                            <div class="data-grid">
+                                ${createDataGrid(extractedData.os)}
+                            </div>
+                        </div>
+                    </div>
+                `;
+            } else {
+                // Single-eye display
+                dataDisplay = `
+                    <div class="data-grid">
+                        ${createDataGrid(extractedData)}
+                    </div>
+                `;
+            }
+            
+            results.innerHTML = `
+                <div class="results">
+                    <h3>✅ Universal LLM Parse Results</h3>
+                    <p><strong>Method:</strong> ${result.method || 'Local LLM'}</p>
+                    <p><strong>Confidence:</strong> ${(result.confidence * 100).toFixed(1)}%</p>
+                    <p><strong>Processing Time:</strong> ${result.processing_time?.toFixed(2) || 'N/A'} seconds</p>
+                    <p><strong>Cost:</strong> $${result.cost?.toFixed(2) || '0.00'} (Local processing)</p>
+                    ${hasDualEyes ? '<p><strong>Eyes:</strong> Both OD and OS detected</p>' : ''}
+                    
+                    ${patientInfo}
+                    
+                    <details style="margin-top: 15px;">
+                        <summary><strong>🔧 Debug Information</strong></summary>
+                        <div style="background: #f8fafc; padding: 15px; border-radius: 6px; margin-top: 10px; font-family: monospace; font-size: 12px;">
+                            <p><strong>File Hash:</strong> ${result.file_hash || 'Not available'}</p>
+                            <p><strong>Original Filename:</strong> ${result.original_filename || 'Not available'}</p>
+                            <p><strong>Processing Steps:</strong> ${result.processing_steps || 'Not available'}</p>
+                            <p><strong>Error Details:</strong> ${result.error_details || 'None'}</p>
+                        </div>
+                    </details>
+                    
+                    ${dataDisplay}
+                    
+                    ${result.raw_text ? `
+                        <details style="margin-top: 20px;">
+                            <summary><strong>Raw Extracted Text</strong></summary>
+                            <pre style="background: #f1f5f9; padding: 15px; border-radius: 6px; overflow-x: auto; margin-top: 10px;">${result.raw_text}</pre>
+                        </details>
+                    ` : ''}
+                </div>
+            `;
+        }
+        
+        function togglePatientName() {
+            const checkbox = document.getElementById('showName');
+            const nameDiv = document.getElementById('patientName');
+            if (checkbox && nameDiv) {
+                nameDiv.style.display = checkbox.checked ? 'block' : 'none';
+            }
+        }
+        
+        function createDataGrid(data) {
+            return `
+                <div class="data-item">
+                    <div class="data-label">Axial Length</div>
+                    <div class="data-value">${data.axial_length || 'N/A'} mm</div>
+                </div>
+                <div class="data-item">
+                    <div class="data-label">K1</div>
+                    <div class="data-value">${data.k1 || 'N/A'} D</div>
+                </div>
+                <div class="data-item">
+                    <div class="data-label">K1 Axis</div>
+                    <div class="data-value">${data.k_axis_1 || 'N/A'}°</div>
+                </div>
+                <div class="data-item">
+                    <div class="data-label">K2</div>
+                    <div class="data-value">${data.k2 || 'N/A'} D</div>
+                </div>
+                <div class="data-item">
+                    <div class="data-label">K2 Axis</div>
+                    <div class="data-value">${data.k_axis_2 || 'N/A'}°</div>
+                </div>
+                <div class="data-item">
+                    <div class="data-label">ACD</div>
+                    <div class="data-value">${data.acd || 'N/A'} mm</div>
+                </div>
+                <div class="data-item">
+                    <div class="data-label">Lens Thickness</div>
+                    <div class="data-value">${data.lt || 'N/A'} mm</div>
+                </div>
+                <div class="data-item">
+                    <div class="data-label">WTW</div>
+                    <div class="data-value">${data.wtw || 'N/A'} mm</div>
+                </div>
+                <div class="data-item">
+                    <div class="data-label">CCT</div>
+                    <div class="data-value">${data.cct || 'N/A'} μm</div>
+                </div>
+                <div class="data-item">
+                    <div class="data-label">Age</div>
+                    <div class="data-value">${data.age || 'N/A'} years</div>
+                </div>
+                <div class="data-item">
+                    <div class="data-label">Eye</div>
+                    <div class="data-value">${data.eye || 'N/A'}</div>
+                </div>
+            `;
+        }
+    </script>
+</body>
+</html>

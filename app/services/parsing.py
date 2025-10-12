@@ -25,6 +25,27 @@ def parse_biometry(raw_text: str) -> ExtractedBiometry:
     eye = eye_match.group(1) if eye_match else None
     eye_conf = 0.7 if eye else 0.0
 
+    # Extract gender from patient information
+    gender = None
+    gender_conf = 0.0
+    
+    # Try multiple gender patterns
+    gender_patterns = [
+        (r"Sexo[:\s]*(Masculino|Male|M)", "M"),
+        (r"Sexo[:\s]*(Feminino|Female|F)", "F"),
+        (r"Gender[:\s]*(Male|M|Masculino)", "M"),
+        (r"Gender[:\s]*(Female|F|Feminino)", "F"),
+        (r"\b(Male|Masculino)\b", "M"),
+        (r"\b(Female|Feminino)\b", "F")
+    ]
+    
+    for pattern, gender_code in gender_patterns:
+        match = re.search(pattern, raw_text, re.I)
+        if match:
+            gender = gender_code
+            gender_conf = 0.9
+            break
+
     al, al_c   = _find_float(r"AL[:\s]*([0-9]+(?:[.,][0-9]+)?)\s*" + MM, raw_text)
     acd, acd_c = _find_float(r"ACD[:\s]*([0-9]+(?:[.,][0-9]+)?)\s*" + MM, raw_text)
     lt, lt_c   = _find_float(r"LT[:\s]*([0-9]+(?:[.,][0-9]+)?)\s*" + MM, raw_text)
@@ -51,6 +72,7 @@ def parse_biometry(raw_text: str) -> ExtractedBiometry:
     confidence: Dict[str, float] = {
         "device": device_conf,
         "eye": eye_conf,
+        "gender": gender_conf,
         "al_mm": al_c,
         "acd_mm": acd_c,
         "lt_mm": lt_c,
@@ -70,7 +92,9 @@ def parse_biometry(raw_text: str) -> ExtractedBiometry:
         lt_mm=lt,
         wtw_mm=wtw,
         cct_um=int(cct) if cct is not None else None,
+        gender=gender,
         ks=ks,
+        notes=None,
         confidence=confidence,
     )
 

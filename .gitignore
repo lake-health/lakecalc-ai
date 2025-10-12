@@ -1,34 +1,79 @@
-# ---- Python ----
+# Python
 __pycache__/
 *.py[cod]
-*.pyo
-*.pyd
+*$py.class
 *.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
 *.egg-info/
+.installed.cfg
 *.egg
-*.log
 
-# ---- Environments ----
-.env
-.venv/
+# Virtual Environment
 venv/
 env/
 ENV/
 
-# ---- OS files ----
-.DS_Store
+# Environment Variables
+.env
+.env.local
+.env.production
 
-# ---- IDE/editor ----
+# IDE
 .vscode/
 .idea/
+*.swp
+*.swo
 
-# ---- Uploads ----
-uploads/
+# OS
+.DS_Store
+Thumbs.db
 
-# ---- Byte-compiled/misc ----
-*.sqlite3
+# Project Specific
+uploads/*.pdf
+uploads/*.png
+uploads/*.jpg
+uploads/*.jpeg
+uploads/audit/
+uploads/ocr/
+uploads/parsed/
 
-lakecalc-sa-key.json
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Database files (if large)
+*.db
+*.sqlite
+
+# Backup files
+*.tar.gz
+*.zip
+
+# API Keys (keep secure)
 lakecalc-ai-key.json
-*-key.json
-*service-account*.json
+*.pem
+*.key
+
+# Node modules (if any)
+node_modules/
+
+# Build outputs
+build/
+dist/

@@ -18,9 +18,19 @@ class ExtractedBiometry(BaseModel):
     cct_um: Optional[int]
     wtw_mm: Optional[float]
     lt_mm: Optional[float]
+    gender: Optional[str] = Field(None, description="Patient gender (M/F)")
     ks: ExtractedKs = ExtractedKs()
     notes: Optional[str]
     confidence: dict = {}
+    # Assumed SIA for advanced toric calculations - separated into magnitude and axis
+    assumed_sia_od_magnitude: Optional[float] = Field(None, description="Assumed SIA magnitude for OD eye (diopters)")
+    assumed_sia_od_axis: Optional[float] = Field(None, description="Assumed SIA axis for OD eye (degrees)")
+    assumed_sia_os_magnitude: Optional[float] = Field(None, description="Assumed SIA magnitude for OS eye (diopters)")
+    assumed_sia_os_axis: Optional[float] = Field(None, description="Assumed SIA axis for OS eye (degrees)")
+    
+    # Legacy string format for backward compatibility (deprecated)
+    assumed_sia_od: Optional[str] = Field(None, description="[DEPRECATED] Use assumed_sia_od_magnitude and assumed_sia_od_axis")
+    assumed_sia_os: Optional[str] = Field(None, description="[DEPRECATED] Use assumed_sia_os_magnitude and assumed_sia_os_axis")
 
 class UploadResponse(BaseModel):
     file_id: str
