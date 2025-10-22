@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LakeCalc LLM Parser</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #2563eb;
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        .upload-area {
+            border: 2px dashed #d1d5db;
+            border-radius: 8px;
+            padding: 40px;
+            text-align: center;
+            margin-bottom: 20px;
+            transition: border-color 0.3s;
+        }
+        .upload-area:hover {
+            border-color: #2563eb;
+        }
+        .upload-area.dragover {
+            border-color: #2563eb;
+            background-color: #eff6ff;
+        }
+        input[type="file"] {
+            margin: 20px 0;
+        }
+        button {
+            background: #2563eb;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 16px;
+            margin: 10px 5px;
+        }
+        button:hover {
+            background: #1d4ed8;
+        }
+        button:disabled {
+            background: #9ca3af;
+            cursor: not-allowed;
+        }
+        .results {
+            margin-top: 30px;
+            padding: 20px;
+            background: #f9fafb;
+            border-radius: 8px;
+            border-left: 4px solid #2563eb;
+        }
+        .error {
+            background: #fef2f2;
+            border-left-color: #dc2626;
+            color: #dc2626;
+        }
+        .loading {
+            text-align: center;
+            color: #6b7280;
+        }
+        .spinner {
+            border: 2px solid #f3f4f6;
+            border-top: 2px solid #2563eb;
+            border-radius: 50%;
+            width: 20px;
+            height: 20px;
+            animation: spin 1s linear infinite;
+            display: inline-block;
+            margin-right: 10px;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        .data-display {
+            background: white;
+            padding: 15px;
+            border-radius: 6px;
+            margin-top: 15px;
+        }
+        .data-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid #e5e7eb;
+        }
+        .data-item:last-child {
+            border-bottom: none;
+        }
+        .data-label {
+            font-weight: 600;
+            color: #374151;
+        }
+        .data-value {
+            color: #6b7280;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔬 LakeCalc LLM Parser</h1>
+        
+        <div class="upload-area" id="uploadArea">
+            <p>📄 Drag and drop your biometry file here</p>
+            <p>or</p>
+            <input type="file" id="fileInput" accept=".pdf,.txt,.csv,.png,.jpg,.jpeg">
+            <br>
+            <button onclick="parseFile()" id="parseBtn">🚀 Parse with LLM</button>
+        </div>
+        
+        <div id="results"></div>
+    </div>
+
+    <script>
+        const uploadArea = document.getElementById('uploadArea');
+        const fileInput = document.getElementById('fileInput');
+        const parseBtn = document.getElementById('parseBtn');
+        const results = document.getElementById('results');
+        
+        // Drag and drop functionality
+        uploadArea.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadArea.classList.add('dragover');
+        });
+        
+        uploadArea.addEventListener('dragleave', () => {
+            uploadArea.classList.remove('dragover');
+        });
+        
+        uploadArea.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadArea.classList.remove('dragover');
+            const files = e.dataTransfer.files;
+            if (files.length > 0) {
+                fileInput.files = files;
+            }
+        });
+        
+        // File input change
+        fileInput.addEventListener('change', (e) => {
+            if (e.target.files.length > 0) {
+                parseBtn.disabled = false;
+            }
+        });
+        
+        async function parseFile() {
+            const file = fileInput.files[0];
+            if (!file) {
+                alert('Please select a file first');
+                return;
+            }
+            
+            parseBtn.disabled = true;
+            parseBtn.textContent = '⏳ Parsing...';
+            
+            results.innerHTML = `
+                <div class="loading">
+                    <div class="spinner"></div>
+                    Processing your biometry file with LLM...
+                </div>
+            `;
+            
+            try {
+                const formData = new FormData();
+                formData.append('file', file);
+                
+                const response = await fetch('http://localhost:8000/parse', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    displayResults(result);
+                } else {
+                    displayError(result.error || 'Parsing failed');
+                }
+                
+            } catch (error) {
+                displayError('Error: ' + error.message);
+            } finally {
+                parseBtn.disabled = false;
+                parseBtn.textContent = '🚀 Parse with LLM';
+            }
+        }
+        
+        function displayResults(result) {
+            const data = result.data;
+            let html = `
+                <div class="results">
+                    <h3>✅ Parsing Successful!</h3>
+                    <p><strong>Confidence:</strong> ${(result.confidence * 100).toFixed(1)}%</p>
+                    <p><strong>Processing Time:</strong> ${result.processing_time.toFixed(2)}s</p>
+                    <p><strong>Method:</strong> ${result.method}</p>
+                    
+                    <div class="data-display">
+                        <h4>📊 Extracted Data:</h4>
+            `;
+            
+            // Display the extracted data
+            for (const [key, value] of Object.entries(data)) {
+                html += `
+                    <div class="data-item">
+                        <span class="data-label">${key}:</span>
+                        <span class="data-value">${value}</span>
+                    </div>
+                `;
+            }
+            
+            html += `
+                    </div>
+                </div>
+            `;
+            
+            results.innerHTML = html;
+        }
+        
+        function displayError(error) {
+            results.innerHTML = `
+                <div class="results error">
+                    <h3>❌ Parsing Failed</h3>
+                    <p>${error}</p>
+                </div>
+            `;
+        }
+    </script>
+</body>
+</html>
