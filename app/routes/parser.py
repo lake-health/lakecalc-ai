@@ -89,7 +89,7 @@ async def parse_document(
             options = json.loads(processing_options) if processing_options else {}
             
             # Parse document
-            result = universal_parser.parse(temp_file_path, user_id)
+            result = await universal_parser.parse(temp_file_path, user_id)
             
             # Generate file hash for debug
             import hashlib
@@ -108,7 +108,7 @@ async def parse_document(
                 # Debug information
                 file_hash=file_hash,
                 original_filename=file.filename,
-                processing_steps=getattr(result, 'processing_steps', None),
+                processing_steps=str(getattr(result, 'processing_steps', None)),
                 error_details=getattr(result, 'error_details', None),
                 raw_text=result.raw_text[:1000] if result.raw_text else None
             )
@@ -153,7 +153,7 @@ async def parse_multiple_documents(
             # Parse each document
             results = {}
             for i, temp_file_path in enumerate(temp_files):
-                file_result = universal_parser.parse(temp_file_path, user_id)
+                file_result = await universal_parser.parse(temp_file_path, user_id)
                 results[files[i].filename] = file_result
             
             if merge_results and len(results) > 1:

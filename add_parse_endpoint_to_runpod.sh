@@ -1,3 +1,13 @@
+#!/bin/bash
+# Script to add the missing /parse endpoint to RunPod LLM API
+
+echo "🔧 Adding /parse endpoint to RunPod LLM API..."
+
+# Create a backup of the original file
+cp runpod_llm_api.py runpod_llm_api.py.backup
+
+# Create the new file with the parse endpoint
+cat > runpod_llm_api.py << 'EOF'
 #!/usr/bin/env python3
 """
 RunPod LLM API Service for LakeCalc-AI
@@ -46,7 +56,7 @@ class HealthResponse(BaseModel):
 # Ollama configuration
 OLLAMA_BASE_URL = "http://localhost:11434"
 DEFAULT_MODEL = "llama3.1:8b"
-FALLBACK_MODEL = "mistral:7b"
+FALLBACK_MODEL = "tinyllama:1.1b"
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
@@ -267,5 +277,25 @@ def calculate_confidence(data: Dict[str, Any]) -> float:
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8001, log_level="info")
+EOF
+
+echo "✅ Updated runpod_llm_api.py with /parse endpoint"
+
+# Make the file executable
+chmod +x runpod_llm_api.py
+
+echo "🔧 Restarting the LLM API service..."
+
+# Kill any existing processes
+pkill -f "runpod_llm_api.py" || true
+
+# Start the updated service
+nohup python3 runpod_llm_api.py > llm_api.log 2>&1 &
+
+echo "✅ LLM API service restarted with /parse endpoint"
+echo "📋 Check the service status:"
+echo "   - Health: curl https://nko8ymjws3px2s-8001.proxy.runpod.net/health"
+echo "   - Parse: curl -X POST https://nko8ymjws3px2s-8001.proxy.runpod.net/parse"
+echo "   - Logs: tail -f llm_api.log"
 
 

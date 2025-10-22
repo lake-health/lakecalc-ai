@@ -185,19 +185,44 @@ Extract numbers and return JSON only:
         critical_fields = ['axial_length', 'k1', 'k2', 'eye']
         found_critical = sum(1 for field in critical_fields if extracted_data.get(field) is not None)
         
+        # Validate field values to prevent hallucination
+        validation_penalty = 0.0
+        if extracted_data.get('axial_length') and (extracted_data['axial_length'] < 15 or extracted_data['axial_length'] > 35):
+            validation_penalty += 0.2  # Penalty for unrealistic AL values
+        if extracted_data.get('k1') and (extracted_data['k1'] < 30 or extracted_data['k1'] > 50):
+            validation_penalty += 0.2  # Penalty for unrealistic K1 values
+        if extracted_data.get('k2') and (extracted_data['k2'] < 30 or extracted_data['k2'] > 50):
+            validation_penalty += 0.2  # Penalty for unrealistic K2 values
+        if extracted_data.get('age') and (extracted_data['age'] < 0 or extracted_data['age'] > 120):
+            validation_penalty += 0.3  # Penalty for unrealistic age values
+        
         # Base confidence on critical fields found
-        base_confidence = found_critical / len(critical_fields)
+        base_confidence = found_critical / len(critical_fields) - validation_penalty
         
         # Bonus for additional fields
         additional_fields = ['acd', 'lt', 'wtw', 'cct', 'age', 'k_axis_1', 'k_axis_2']
         found_additional = sum(1 for field in additional_fields if extracted_data.get(field) is not None)
         bonus_confidence = found_additional / len(additional_fields) * 0.2
         
-        total_confidence = min(base_confidence + bonus_confidence, 1.0)
+        # Cross-validation checks
+        cross_validation_penalty = 0.0
+        if extracted_data.get('k1') and extracted_data.get('k2'):
+            k_diff = abs(extracted_data['k1'] - extracted_data['k2'])
+            if k_diff > 10:  # Unrealistic difference between K1 and K2
+                cross_validation_penalty += 0.2
+        
+        if extracted_data.get('k_axis_1') and extracted_data.get('k_axis_2'):
+            axis_diff = abs(extracted_data['k_axis_1'] - extracted_data['k_axis_2'])
+            if axis_diff < 70 or axis_diff > 110:  # K1 and K2 axes should be roughly perpendicular
+                cross_validation_penalty += 0.1
+        
+        total_confidence = min(base_confidence + bonus_confidence - cross_validation_penalty, 1.0)
         
         logger.debug(f"Local LLM confidence assessment: {total_confidence:.2f} "
                     f"(critical: {found_critical}/{len(critical_fields)}, "
-                    f"additional: {found_additional}/{len(additional_fields)})")
+                    f"additional: {found_additional}/{len(additional_fields)}, "
+                    f"validation_penalty: {validation_penalty:.2f}, "
+                    f"cross_validation_penalty: {cross_validation_penalty:.2f})")
         
         return total_confidence
 
