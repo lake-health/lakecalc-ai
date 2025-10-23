@@ -127,13 +127,21 @@ async def call_llama_7b(text: str) -> Dict[str, Any]:
 
 {text}
 
-Return JSON with:
+Return ONLY valid JSON with:
 - patient_name (string)
 - age (number)
 - od (object with: axial_length, k1, k2, k_axis_1, k_axis_2, acd, lt, wtw, cct)
 - os (object with: axial_length, k1, k2, k_axis_1, k_axis_2, acd, lt, wtw, cct)
 
-IMPORTANT: Extract axis values (k_axis_1, k_axis_2) from patterns like "K1: 40.95 D @ 100°" where 100° is the axis."""
+IMPORTANT: Extract axis values (k_axis_1, k_axis_2) from patterns like "K1: 40.95 D @ 100°" where 100° is the axis.
+
+Example format:
+{{
+  "patient_name": "John Doe",
+  "age": 65,
+  "od": {{"axial_length": 23.5, "k1": 42.0, "k2": 43.5, "k_axis_1": 90, "k_axis_2": 0, "acd": 3.0, "lt": 4.5, "wtw": 11.0, "cct": 550}},
+  "os": {{"axial_length": 23.7, "k1": 41.8, "k2": 43.2, "k_axis_1": 85, "k_axis_2": 175, "acd": 2.9, "lt": 4.6, "wtw": 11.2, "cct": 545}}
+}}"""
 
         url = f"{OLLAMA_BASE_URL}/api/generate"
         payload = {
@@ -199,13 +207,21 @@ async def call_llava_vision(file_path: str) -> Dict[str, Any]:
         # Create vision prompt for biometry parsing
         prompt = """Extract biometry data from this image in JSON format:
 
-Return JSON with:
+Return ONLY valid JSON with:
 - patient_name (string)
 - age (number)
 - od (object with: axial_length, k1, k2, k_axis_1, k_axis_2, acd, lt, wtw, cct)
 - os (object with: axial_length, k1, k2, k_axis_1, k_axis_2, acd, lt, wtw, cct)
 
-IMPORTANT: Extract axis values (k_axis_1, k_axis_2) from patterns like "K1: 40.95 D @ 100°" where 100° is the axis."""
+IMPORTANT: Extract axis values (k_axis_1, k_axis_2) from patterns like "K1: 40.95 D @ 100°" where 100° is the axis.
+
+Example format:
+{
+  "patient_name": "John Doe",
+  "age": 65,
+  "od": {"axial_length": 23.5, "k1": 42.0, "k2": 43.5, "k_axis_1": 90, "k_axis_2": 0, "acd": 3.0, "lt": 4.5, "wtw": 11.0, "cct": 550},
+  "os": {"axial_length": 23.7, "k1": 41.8, "k2": 43.2, "k_axis_1": 85, "k_axis_2": 175, "acd": 2.9, "lt": 4.6, "wtw": 11.2, "cct": 545}
+}"""
 
         # Call LLaVA with vision
         url = f"{OLLAMA_BASE_URL}/api/generate"
