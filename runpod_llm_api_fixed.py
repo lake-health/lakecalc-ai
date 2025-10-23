@@ -127,7 +127,13 @@ async def call_llama_7b(text: str) -> Dict[str, Any]:
 
 {text}
 
-Return JSON with patient_name, age, od (axial_length, k1, k2), os (axial_length, k1, k2):"""
+Return JSON with:
+- patient_name (string)
+- age (number)
+- od (object with: axial_length, k1, k2, k_axis_1, k_axis_2, acd, lt, wtw, cct)
+- os (object with: axial_length, k1, k2, k_axis_1, k_axis_2, acd, lt, wtw, cct)
+
+IMPORTANT: Extract axis values (k_axis_1, k_axis_2) from patterns like "K1: 40.95 D @ 100°" where 100° is the axis."""
 
         url = f"{OLLAMA_BASE_URL}/api/generate"
         payload = {
@@ -193,7 +199,13 @@ async def call_llava_vision(file_path: str) -> Dict[str, Any]:
         # Create vision prompt for biometry parsing
         prompt = """Extract biometry data from this image in JSON format:
 
-Return JSON with patient_name, age, od (axial_length, k1, k2), os (axial_length, k1, k2):"""
+Return JSON with:
+- patient_name (string)
+- age (number)
+- od (object with: axial_length, k1, k2, k_axis_1, k_axis_2, acd, lt, wtw, cct)
+- os (object with: axial_length, k1, k2, k_axis_1, k_axis_2, acd, lt, wtw, cct)
+
+IMPORTANT: Extract axis values (k_axis_1, k_axis_2) from patterns like "K1: 40.95 D @ 100°" where 100° is the axis."""
 
         # Call LLaVA with vision
         url = f"{OLLAMA_BASE_URL}/api/generate"
