@@ -53,7 +53,7 @@ def extract_patient_info_with_ocr(image_path):
                 if len(patient_name) > 3:  # Basic validation
                     break
         
-        # Extract age using simple patterns
+        # Extract age using improved patterns
         age = None
         age_patterns = [
             r'AGE[:\s]+(\d+)',
@@ -61,6 +61,8 @@ def extract_patient_info_with_ocr(image_path):
             r'(\d+)\s*YEARS?',
             r'(\d+)\s*ANOS?',
             r'BIRTH[:\s]+(\d{4})',  # Birth year
+            r'(\d{1,2})/(\d{1,2})/(\d{4})',  # Date format DD/MM/YYYY
+            r'(\d{4})-(\d{1,2})-(\d{1,2})',  # Date format YYYY-MM-DD
         ]
         
         for pattern in age_patterns:
@@ -70,9 +72,24 @@ def extract_patient_info_with_ocr(image_path):
                     # Calculate age from birth year
                     birth_year = int(match.group(1))
                     age = 2024 - birth_year
+                elif '/' in pattern or '-' in pattern:
+                    # Date format - calculate age from birth date
+                    if '/' in pattern:  # DD/MM/YYYY
+                        day, month, year = match.groups()
+                        birth_year = int(year)
+                        age = 2024 - birth_year
+                    else:  # YYYY-MM-DD
+                        year, month, day = match.groups()
+                        birth_year = int(year)
+                        age = 2024 - birth_year
                 else:
                     age = int(match.group(1))
-                break
+                
+                # Validate age is reasonable (18-100)
+                if age and 18 <= age <= 100:
+                    break
+                else:
+                    age = None
         
         print(f"DEBUG: OCR extracted - Name: {patient_name}, Age: {age}")
         return patient_name, age, text
@@ -201,22 +218,43 @@ async def parse_document(file: UploadFile = File(...)):
                     if "error" not in llava_result:
                         # Parse LLaVA response
                         llava_response = llava_result.get("response", "")
+                        print(f"DEBUG: LLaVA response: {llava_response[:500]}...")
+                        
                         try:
-                            # Extract JSON from LLaVA response
+                            # Try multiple JSON extraction methods
+                            biometry_json = None
+                            
+                            # Method 1: Look for JSON between curly braces
                             json_start = llava_response.find('{')
                             json_end = llava_response.rfind('}') + 1
                             if json_start != -1 and json_end != -1:
-                                biometry_json = json.loads(llava_response[json_start:json_end])
-                                
+                                json_str = llava_response[json_start:json_end]
+                                biometry_json = json.loads(json_str)
+                            
+                            # Method 2: Look for JSON in code blocks
+                            if not biometry_json:
+                                import re
+                                json_match = re.search(r'```json\s*(\{.*?\})\s*```', llava_response, re.DOTALL)
+                                if json_match:
+                                    biometry_json = json.loads(json_match.group(1))
+                            
+                            # Method 3: Look for JSON without code blocks
+                            if not biometry_json:
+                                json_match = re.search(r'(\{.*?\})', llava_response, re.DOTALL)
+                                if json_match:
+                                    biometry_json = json.loads(json_match.group(1))
+                            
+                            if biometry_json:
                                 # Add patient info
                                 biometry_json["patient_name"] = patient_name or "Not found"
                                 biometry_json["age"] = age or "Not found"
                                 
                                 result = {"response": json.dumps(biometry_json)}
                             else:
-                                result = {"error": "Could not parse LLaVA response"}
-                        except json.JSONDecodeError:
-                            result = {"error": "Invalid JSON from LLaVA"}
+                                result = {"error": f"Could not extract JSON from LLaVA response: {llava_response[:200]}"}
+                                
+                        except json.JSONDecodeError as e:
+                            result = {"error": f"Invalid JSON from LLaVA: {str(e)}. Response: {llava_response[:200]}"}
                     else:
                         result = llava_result
                     
