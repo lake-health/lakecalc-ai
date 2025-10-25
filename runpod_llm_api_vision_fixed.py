@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-RunPod LLM API with Vision Support and PDF-to-Image Conversion
+RunPod LLM API with Vision Support - Fixed Version for Image-based PDFs
 """
 import os
 import json
@@ -214,24 +214,24 @@ async def call_llava_vision_pdf(file_path: str) -> Dict[str, Any]:
         
         logger.info(f"PDF converted to image, base64 length: {len(image_data)}")
         
-        # Create vision prompt for biometry parsing
-        prompt = """Extract biometry data from this image in JSON format:
+        # Fixed prompt for image-based PDFs
+        prompt = """Look at this medical document image and extract the biometry data.
 
-Return ONLY valid JSON with:
-- patient_name (string)
-- age (number)
-- od (object with: axial_length, k1, k2, k_axis_1, k_axis_2, acd, lt, wtw, cct)
-- os (object with: axial_length, k1, k2, k_axis_1, k_axis_2, acd, lt, wtw, cct)
+Look carefully for:
+1. Patient name (usually in header, title, or patient info section)
+2. Patient age (look for numbers that could be age, birth date, or "age: XX")
+3. Biometry measurements for both eyes (OD and OS)
 
-IMPORTANT: Extract axis values (k_axis_1, k_axis_2) from patterns like "K1: 40.95 D @ 100°" where 100° is the axis.
-
-Example format:
+Return ONLY valid JSON in this exact format:
 {
-  "patient_name": "John Doe",
-  "age": 65,
-  "od": {"axial_length": 23.5, "k1": 42.0, "k2": 43.5, "k_axis_1": 90, "k_axis_2": 0, "acd": 3.0, "lt": 4.5, "wtw": 11.0, "cct": 550},
-  "os": {"axial_length": 23.7, "k1": 41.8, "k2": 43.2, "k_axis_1": 85, "k_axis_2": 175, "acd": 2.9, "lt": 4.6, "wtw": 11.2, "cct": 545}
-}"""
+  "patient_name": "extracted name or null",
+  "age": extracted_age_number_or_null,
+  "od": {"axial_length": number, "k1": number, "k2": number, "k_axis_1": number, "k_axis_2": number, "acd": number, "lt": number, "wtw": number, "cct": number},
+  "os": {"axial_length": number, "k1": number, "k2": number, "k_axis_1": number, "k_axis_2": number, "acd": number, "lt": number, "wtw": number, "cct": number}
+}
+
+Extract axis values from patterns like "K1: 40.95 D @ 100°" where 100° is the axis.
+If you cannot find patient name or age, use null."""
 
         # Call LLaVA with vision
         url = f"{OLLAMA_BASE_URL}/api/generate"
@@ -252,25 +252,38 @@ Example format:
         result = response.json()
         response_text = result.get("response", "")
         
-        # Parse JSON response
+        # Log the full response for debugging
+        logger.info(f"LLaVA full response: {response_text}")
+        
+        # Parse JSON response - handle markdown formatting
         try:
-            json_start = response_text.find('{')
-            json_end = response_text.rfind('}') + 1
-            if json_start >= 0 and json_end > json_start:
-                json_str = response_text[json_start:json_end]
-                extracted_data = json.loads(json_str)
-                
-                # Calculate confidence based on data completeness
-                confidence = calculate_confidence(extracted_data)
-                
-                return {
-                    "success": True,
-                    "extracted_data": extracted_data,
-                    "confidence": confidence
-                }
+            # Remove markdown formatting if present
+            if "```json" in response_text:
+                json_start = response_text.find("```json") + 7
+                json_end = response_text.find("```", json_start)
+                if json_end > json_start:
+                    json_str = response_text[json_start:json_end].strip()
+                else:
+                    raise ValueError("No closing ``` found")
             else:
-                raise ValueError("No valid JSON found in response")
-                
+                json_start = response_text.find('{')
+                json_end = response_text.rfind('}') + 1
+                if json_start >= 0 and json_end > json_start:
+                    json_str = response_text[json_start:json_end]
+                else:
+                    raise ValueError("No valid JSON found in response")
+            
+            extracted_data = json.loads(json_str)
+            
+            # Calculate confidence based on data completeness
+            confidence = calculate_confidence(extracted_data)
+            
+            return {
+                "success": True,
+                "extracted_data": extracted_data,
+                "confidence": confidence
+            }
+            
         except (json.JSONDecodeError, ValueError) as e:
             logger.error(f"JSON parsing error: {str(e)}")
             return {
@@ -296,24 +309,24 @@ async def call_llava_vision_direct(file_path: str) -> Dict[str, Any]:
         with open(file_path, "rb") as image_file:
             image_data = base64.b64encode(image_file.read()).decode('utf-8')
         
-        # Create vision prompt for biometry parsing
-        prompt = """Extract biometry data from this image in JSON format:
+        # Fixed prompt for image-based PDFs
+        prompt = """Look at this medical document image and extract the biometry data.
 
-Return ONLY valid JSON with:
-- patient_name (string)
-- age (number)
-- od (object with: axial_length, k1, k2, k_axis_1, k_axis_2, acd, lt, wtw, cct)
-- os (object with: axial_length, k1, k2, k_axis_1, k_axis_2, acd, lt, wtw, cct)
+Look carefully for:
+1. Patient name (usually in header, title, or patient info section)
+2. Patient age (look for numbers that could be age, birth date, or "age: XX")
+3. Biometry measurements for both eyes (OD and OS)
 
-IMPORTANT: Extract axis values (k_axis_1, k_axis_2) from patterns like "K1: 40.95 D @ 100°" where 100° is the axis.
-
-Example format:
+Return ONLY valid JSON in this exact format:
 {
-  "patient_name": "John Doe",
-  "age": 65,
-  "od": {"axial_length": 23.5, "k1": 42.0, "k2": 43.5, "k_axis_1": 90, "k_axis_2": 0, "acd": 3.0, "lt": 4.5, "wtw": 11.0, "cct": 550},
-  "os": {"axial_length": 23.7, "k1": 41.8, "k2": 43.2, "k_axis_1": 85, "k_axis_2": 175, "acd": 2.9, "lt": 4.6, "wtw": 11.2, "cct": 545}
-}"""
+  "patient_name": "extracted name or null",
+  "age": extracted_age_number_or_null,
+  "od": {"axial_length": number, "k1": number, "k2": number, "k_axis_1": number, "k_axis_2": number, "acd": number, "lt": number, "wtw": number, "cct": number},
+  "os": {"axial_length": number, "k1": number, "k2": number, "k_axis_1": number, "k_axis_2": number, "acd": number, "lt": number, "wtw": number, "cct": number}
+}
+
+Extract axis values from patterns like "K1: 40.95 D @ 100°" where 100° is the axis.
+If you cannot find patient name or age, use null."""
 
         # Call LLaVA with vision
         url = f"{OLLAMA_BASE_URL}/api/generate"
@@ -334,25 +347,38 @@ Example format:
         result = response.json()
         response_text = result.get("response", "")
         
-        # Parse JSON response
+        # Log the full response for debugging
+        logger.info(f"LLaVA full response: {response_text}")
+        
+        # Parse JSON response - handle markdown formatting
         try:
-            json_start = response_text.find('{')
-            json_end = response_text.rfind('}') + 1
-            if json_start >= 0 and json_end > json_start:
-                json_str = response_text[json_start:json_end]
-                extracted_data = json.loads(json_str)
-                
-                # Calculate confidence based on data completeness
-                confidence = calculate_confidence(extracted_data)
-                
-                return {
-                    "success": True,
-                    "extracted_data": extracted_data,
-                    "confidence": confidence
-                }
+            # Remove markdown formatting if present
+            if "```json" in response_text:
+                json_start = response_text.find("```json") + 7
+                json_end = response_text.find("```", json_start)
+                if json_end > json_start:
+                    json_str = response_text[json_start:json_end].strip()
+                else:
+                    raise ValueError("No closing ``` found")
             else:
-                raise ValueError("No valid JSON found in response")
-                
+                json_start = response_text.find('{')
+                json_end = response_text.rfind('}') + 1
+                if json_start >= 0 and json_end > json_start:
+                    json_str = response_text[json_start:json_end]
+                else:
+                    raise ValueError("No valid JSON found in response")
+            
+            extracted_data = json.loads(json_str)
+            
+            # Calculate confidence based on data completeness
+            confidence = calculate_confidence(extracted_data)
+            
+            return {
+                "success": True,
+                "extracted_data": extracted_data,
+                "confidence": confidence
+            }
+            
         except (json.JSONDecodeError, ValueError) as e:
             logger.error(f"JSON parsing error: {str(e)}")
             return {
