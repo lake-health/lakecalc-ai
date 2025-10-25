@@ -88,9 +88,9 @@ Example format:
 }}"""
 
     payload = {
+        "model": "llama3.1:8b",
         "prompt": prompt,
-        "max_tokens": 1000,
-        "temperature": 0.1
+        "stream": False
     }
     
     try:
