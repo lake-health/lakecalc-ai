@@ -50,10 +50,10 @@ Please describe what you see in detail, then extract the biometry data in JSON f
 }"""
 
     payload = {
+        "model": "llava:latest",
         "prompt": prompt,
-        "image": image_base64,
-        "max_tokens": 1000,
-        "temperature": 0.1
+        "images": [image_base64],
+        "stream": False
     }
     
     try:
