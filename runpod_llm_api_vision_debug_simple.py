@@ -23,7 +23,7 @@ app.add_middleware(
 )
 
 # RunPod LLaVA endpoint
-LLAVA_ENDPOINT = "http://127.0.0.1:5000/generate"
+LLAVA_ENDPOINT = "http://127.0.0.1:11434/api/generate"
 
 def call_llava_vision_pdf(image_path):
     """Call LLaVA vision model with a simple debug prompt"""
