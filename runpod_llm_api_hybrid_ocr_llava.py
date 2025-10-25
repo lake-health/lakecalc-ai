@@ -229,6 +229,8 @@ async def parse_document(file: UploadFile = File(...)):
                             json_end = llava_response.rfind('}') + 1
                             if json_start != -1 and json_end != -1:
                                 json_str = llava_response[json_start:json_end]
+                                # Fix escaped underscores
+                                json_str = json_str.replace('\\_', '_')
                                 biometry_json = json.loads(json_str)
                             
                             # Method 2: Look for JSON in code blocks
@@ -236,13 +238,17 @@ async def parse_document(file: UploadFile = File(...)):
                                 import re
                                 json_match = re.search(r'```json\s*(\{.*?\})\s*```', llava_response, re.DOTALL)
                                 if json_match:
-                                    biometry_json = json.loads(json_match.group(1))
+                                    json_str = json_match.group(1)
+                                    json_str = json_str.replace('\\_', '_')
+                                    biometry_json = json.loads(json_str)
                             
                             # Method 3: Look for JSON without code blocks
                             if not biometry_json:
                                 json_match = re.search(r'(\{.*?\})', llava_response, re.DOTALL)
                                 if json_match:
-                                    biometry_json = json.loads(json_match.group(1))
+                                    json_str = json_match.group(1)
+                                    json_str = json_str.replace('\\_', '_')
+                                    biometry_json = json.loads(json_str)
                             
                             if biometry_json:
                                 # Add patient info
