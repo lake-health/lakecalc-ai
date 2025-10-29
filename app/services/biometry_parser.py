@@ -19,9 +19,12 @@ logger = logging.getLogger(__name__)
 class BiometryParser:
     """Universal biometry parser for medical PDFs"""
     
-    def __init__(self, ollama_base_url: str = "http://localhost:11434"):
-        self.ollama_base_url = ollama_base_url
+    def __init__(self, ollama_base_url: Optional[str] = None):
+        # Use environment variable or default to localhost
+        import os
+        self.ollama_base_url = ollama_base_url or os.getenv("RUNPOD_OLLAMA_URL", "http://localhost:11434")
         self.model_name = "biometry-llama"
+        logger.info(f"BiometryParser initialized with Ollama URL: {self.ollama_base_url}")
     
     def extract_text_from_pdf(self, pdf_path: str, page_num: int = 0) -> str:
         """Extract text from specific PDF page using OCR"""
