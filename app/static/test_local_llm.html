@@ -278,7 +278,7 @@
                 const formData = new FormData();
                 formData.append('file', file);
 
-                const response = await fetch('/parser/parse', {
+                const response = await fetch('https://nko8ymjws3px2s-8001.proxy.runpod.net/parse', {
                     method: 'POST',
                     body: formData
                 });

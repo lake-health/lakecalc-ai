@@ -466,7 +466,7 @@ class IOLCalculator:
         # Target: spectacle-plane (R) → corneal-plane equivalent (Rc), then subtract at IOL plane
         Rc = round(spectacle_to_corneal_refraction(R, 0.012), 6) if abs(R) > 1e-6 else 0.0
         iol_power = round(P_plano - Rc, 6)
-
+        
         return IOLCalculationResult(
             formula_name="Haigis",
             iol_power=round(float(iol_power), 2),  # Round only once at the end

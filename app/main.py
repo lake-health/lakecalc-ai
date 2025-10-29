@@ -59,9 +59,11 @@ app.add_middleware(RequestIdMiddleware)
 from .routes.suggest import router as suggest_router
 from .routes.calculate import router as calculate_router
 from .routes.parser import router as parser_router
+from .routes.parse import router as parse_router
 app.include_router(suggest_router, prefix="/suggest", tags=["suggest"])
 app.include_router(calculate_router, prefix="/calculate", tags=["calculate"])
 app.include_router(parser_router, tags=["parser"])
+app.include_router(parse_router, prefix="/parse", tags=["parse"])
 
 @app.get("/")
 def root():

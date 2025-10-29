@@ -1,26 +1,34 @@
-# Small, reliable image
 FROM python:3.11-slim
 
-WORKDIR /app
-
-# System deps for Pillow (pdfplumber) are minimal; add locales/ghostscript if later needed
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    tesseract-ocr \
+    tesseract-ocr-eng \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
+    libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python deps
+# Set working directory
+WORKDIR /app
+
+# Copy requirements first for better caching
 COPY requirements.txt .
+
+# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# App
-COPY . /app
+# Copy application code
+COPY . .
 
-# Ensure uploads dir exists and set USE_LAYOUT_PAIRING by default
-ENV USE_LAYOUT_PAIRING=true
-RUN mkdir -p /data/uploads/ocr
+# Create uploads directory
+RUN mkdir -p uploads
 
-# Railway sets $PORT; default 5000
-EXPOSE 5000
+# Expose port
+EXPOSE 8000
 
-# Use the same entrypoint as Procfile (Uvicorn worker via Gunicorn)
-CMD sh -c 'PORT=${PORT:-5000}; gunicorn -k uvicorn.workers.UvicornWorker -w 4 -b 0.0.0.0:$PORT app.main:app'
+# Run the application
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
