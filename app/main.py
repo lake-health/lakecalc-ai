@@ -69,6 +69,11 @@ app.include_router(parse_router, prefix="/parse", tags=["parse"])
 def root():
     return {"ok": True, "service": "lakecalc-ai", "uploads_dir": settings.uploads_dir}
 
+@app.get("/health")
+def health_check():
+    """Health check endpoint for Railway deployment."""
+    return {"status": "healthy", "service": "lakecalc-ai", "version": "1.0.0"}
+
 @app.post("/upload", response_model=UploadResponse)
 async def upload(file: UploadFile = File(...)):
     if file.content_type not in {"application/pdf", "image/png", "image/jpeg"}:
