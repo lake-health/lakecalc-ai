@@ -1,13 +1,59 @@
-# 🧮 IOL Power Calculator API Documentation
+# 🧮 LakeCalc AI API Documentation
 
 ## 📋 Overview
 
-The IOL Power Calculator provides three validated formulas for calculating intraocular lens power:
-- **SRK/T**: Theoretical formula with vergence model and retinal thickness correction
-- **Haigis**: Three-constant formula with 6-decimal precision
-- **Cooke K6**: API-based formula with advanced biometry integration
+The LakeCalc AI provides comprehensive biometry parsing and IOL power calculation:
+- **Biometry Parser**: Universal PDF extraction using OCR + LLM
+- **IOL Calculator**: Three validated formulas (SRK/T, Haigis, Cooke K6)
+- **Toric Calculator**: Advanced astigmatism correction
+- **IOL Database**: Comprehensive IOL family recommendations
 
 ## 🚀 Quick Start
+
+### Parse Biometry PDF
+
+**Endpoint**: `POST /parse/parse`
+
+**Request**:
+```bash
+curl -X POST "http://localhost:8000/parse/parse" \
+  -F "file=@biometry_report.pdf"
+```
+
+**Response**:
+```json
+{
+  "success": true,
+  "data": {
+    "patient_name": "Carina Franciosi",
+    "age": 51,
+    "device": "HAAG-STREIT",
+    "od": {
+      "axial_length": 25.25,
+      "k1": 42.60,
+      "k2": 43.61,
+      "k_axis_1": 14,
+      "k_axis_2": 104,
+      "acd": 3.72,
+      "lt": 4.08,
+      "wtw": 12.95,
+      "cct": 484
+    },
+    "os": {
+      "axial_length": 24.82,
+      "k1": 42.68,
+      "k2": 43.98,
+      "k_axis_1": 8,
+      "k_axis_2": 98,
+      "acd": 3.76,
+      "lt": 3.94,
+      "wtw": 12.85,
+      "cct": 514
+    }
+  },
+  "filename": "carina.pdf"
+}
+```
 
 ### Calculate IOL Power
 
@@ -122,7 +168,28 @@ The IOL Power Calculator provides three validated formulas for calculating intra
 
 ## 🔧 Available Endpoints
 
-### Get Available Formulas
+### Biometry Parser
+
+#### Parse PDF
+**Endpoint**: `POST /parse/parse`
+
+**Description**: Extract biometry data from uploaded PDF files using OCR + LLM hybrid approach.
+
+**Request**: Multipart form data with PDF file
+**Response**: Complete biometry data with demographics, keratometry, and ocular measurements
+
+#### Health Check
+**Endpoint**: `GET /parse/health`
+
+**Response**:
+```json
+{
+  "status": "healthy",
+  "service": "biometry_parser"
+}
+```
+
+### IOL Calculator
 **Endpoint**: `GET /formulas`
 
 **Response**:
