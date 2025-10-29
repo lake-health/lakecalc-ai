@@ -18,20 +18,17 @@ pytesseract==0.3.13
 google-cloud-vision==3.7.2
 google-cloud-storage==2.10.0
 
-# --- OpenAI + token handling ---
-openai>=1.43.0
+# --- Token handling (for Ollama models) ---
 tiktoken==0.7.0
 
 # --- Validation / settings ---
 pydantic==2.9.2
-# If you're not actually using Pydantic for settings anymore, you can drop this:
-# pydantic-settings==2.5.2
 
 # --- Scientific computing ---
-numpy>=1.24.0
+numpy>=2.3.4
 
 # --- HTTP requests ---
-requests>=2.31.0
+requests>=2.32.5
 
 # Test dependencies
-pytest>=7.0.0
+pytest>=8.4.2
