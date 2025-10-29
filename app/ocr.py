@@ -7,15 +7,10 @@ from .storage import gcs_upload_bytes, gcs_download_bytes
 
 log = logging.getLogger(__name__)
 
-try:
-    if settings.ocr_provider == "google":
-        from google.cloud import vision
-        from google.oauth2 import service_account
-    else:
-        vision = None
-except Exception as e:
-    vision = None
-    log.exception("Failed importing Google Vision SDK: %s", e)
+# LEGACY: Google Vision SDK removed - now using PyTesseract in BiometryParser
+# Keep this as None for backward compatibility
+vision = None
+log.info("Google Vision SDK disabled - using PyTesseract for OCR")
 
 MAX_OCR_PAGES = int(os.getenv("MAX_OCR_PAGES", "4"))  # Process first 4 pages for dual-eye reports
 OCR_DPI = int(os.getenv("OCR_DPI", "200"))

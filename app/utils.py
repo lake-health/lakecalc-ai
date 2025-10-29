@@ -1,79 +1,14 @@
-# LLM fallback for missing fields
-import openai
-import os
-
+# LEGACY: OpenAI LLM fallback removed - now using Ollama-based BiometryParser
+# This function is kept as a stub for backward compatibility but returns empty results
 def llm_extract_missing_fields(ocr_text: str, missing_fields: dict, model: str = "gpt-4o-mini") -> dict:
     """
-    Calls OpenAI LLM to extract only the missing fields for OD/OS from the OCR text.
-    missing_fields: dict like {"od": ["axial_length", ...], "os": ["lt", ...]}
-    Returns: dict with structure {"od": {...}, "os": {...}}. On error, returns error info in 'llm_error' key.
+    DEPRECATED: Legacy OpenAI LLM fallback function.
+    Use BiometryParser from app.services.biometry_parser instead.
     """
     import logging
     logger = logging.getLogger("llm_fallback")
-    if not missing_fields.get("od") and not missing_fields.get("os"):
-        return {"od": {}, "os": {}}
-
-    # Build prompt
-    prompt = [
-        "Extract the following fields for both eyes (OD and OS) from the text below. OD and OS data may appear on either of the first two pages, and the order/layout may vary. Carefully match the correct values to each eye, even if the pages are inverted or the layout is mirrored. For K1 and K2, always extract both the value (in diopters) and the axis (in degrees), and output them as an object with 'value' and 'axis' keys. Do not repeat K1/K2 values for the same eye. If a field is missing, return an empty string. Output as JSON.",
-        f"OD fields: {', '.join([f'{f} (for K1/K2: value and axis)' if f in ['k1','k2'] else f for f in missing_fields.get('od', [])])}",
-        f"OS fields: {', '.join([f'{f} (for K1/K2: value and axis)' if f in ['k1','k2'] else f for f in missing_fields.get('os', [])])}",
-        "Text:",
-        '"""',
-        ocr_text.strip(),
-        '"""',
-        "Example output:",
-        '{',
-        '  "od": {',
-        '    "axial_length": "",',
-        '    "lt": "",',
-        '    "cct": "",',
-        '    "k1": {"value": "", "axis": ""},',
-        '    "k2": {"value": "", "axis": ""},',
-        '    "ak": ""',
-        '  },',
-        '  "os": {',
-        '    "axial_length": "",',
-        '    "lt": "",',
-        '    "cct": "",',
-        '    "k1": {"value": "", "axis": ""},',
-        '    "k2": {"value": "", "axis": ""},',
-        '    "ak": ""',
-        '  }',
-        '}'
-    ]
-    prompt_str = "\n".join(prompt)
-
-    openai.api_key = os.getenv("OPENAI_API_KEY")
-    try:
-        response = openai.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt_str}],
-            temperature=0.0,
-            max_completion_tokens=256,
-        )
-        content = response.choices[0].message.content
-        # Remove Markdown code block markers if present
-        if content.strip().startswith("```"):
-            # Remove the first line (``` or ```json) and the last line (```)
-            lines = content.strip().splitlines()
-            # Remove first line if it starts with ```
-            if lines[0].startswith("```"):
-                lines = lines[1:]
-            # Remove last line if it is ```
-            if lines and lines[-1].strip() == "```":
-                lines = lines[:-1]
-            content = "\n".join(lines)
-        import json
-        try:
-            result = json.loads(content)
-        except Exception as je:
-            logger.error(f"LLM JSON parse error: {je}; content: {content}")
-            return {"od": {}, "os": {}, "llm_error": f"JSON parse error: {je}"}
-        return result
-    except Exception as e:
-        logger.error(f"LLM API error: {e}")
-        return {"od": {}, "os": {}, "llm_error": str(e)}
+    logger.warning("llm_extract_missing_fields called but is deprecated - use BiometryParser instead")
+    return {"od": {}, "os": {}}
 import re, hashlib
 
 DECIMAL_RX = re.compile(r"(?P<num>\d{1,3}[\.,]\d{1,3})")

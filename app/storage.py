@@ -18,31 +18,10 @@ PARSE_DIR = UPLOADS / "parsed"
 PARSE_DIR.mkdir(exist_ok=True)
 
 
-# GCS integration helpers. We lazily import google-cloud-storage to avoid hard dependency when not configured.
+# LEGACY: GCS (Google Cloud Storage) integration removed
+# Kept as stubs for backward compatibility
 def _make_gcs_client():
-	"""Return a google.cloud.storage.Client or None if not configured/available."""
-	try:
-		from google.cloud import storage
-		from google.oauth2 import service_account
-	except Exception:
-		return None
-
-	# Prefer JSON string first, then file path
-	if settings.google_creds_json:
-		try:
-			info = json.loads(settings.google_creds_json)
-			creds = service_account.Credentials.from_service_account_info(info)
-			client = storage.Client(project=info.get("project_id"), credentials=creds)
-			return client
-		except Exception:
-			return None
-	if settings.google_creds:
-		try:
-			creds = service_account.Credentials.from_service_account_file(settings.google_creds)
-			client = storage.Client(project=settings.google_creds.split("/")[-1] if settings.google_creds else None, credentials=creds)
-			return client
-		except Exception:
-			return None
+	"""DEPRECATED: GCS client creation. Returns None."""
 	return None
 
 
