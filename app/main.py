@@ -60,10 +60,12 @@ from .routes.suggest import router as suggest_router
 from .routes.calculate import router as calculate_router
 from .routes.parser import router as parser_router
 from .routes.parse import router as parse_router
+from .routes.extract import router as extract_router
 app.include_router(suggest_router, prefix="/suggest", tags=["suggest"])
 app.include_router(calculate_router, prefix="/calculate", tags=["calculate"])
 app.include_router(parser_router, tags=["parser"])
 app.include_router(parse_router, prefix="/parse", tags=["parse"])
+app.include_router(extract_router, prefix="/extract", tags=["extract"])
 
 @app.get("/")
 def root():
@@ -95,90 +97,8 @@ async def upload(file: UploadFile = File(...)):
 
 
 
-from app.utils import llm_extract_missing_fields
-
-@app.get("/extract/{file_id}", response_model=ExtractResult)
-async def extract(file_id: str, debug: bool = False):
-    # find file by prefix
-    matches = list(UPLOADS.glob(file_id + "*"))
-    if not matches:
-        raise HTTPException(status_code=404, detail="file_id not found")
-    file_path = matches[0]
-
-    text, err = ocr_file(file_path)
-    if not text:
-        # OCR failed, but we can still try LLM fallback with file metadata
-        # Create a basic text representation for LLM processing
-        text = f"Medical document: {file_path.name} - File type: {file_path.suffix} - OCR failed: {err}"
-        log.warning("OCR failed for %s, using LLM fallback with minimal context", file_path.name)
-
-    parsed = parse_text(file_id, text)
-    result = parsed.model_dump()
-    
-    # Extract gender and device using the enhanced parser
-    from app.services.parsing import parse_biometry
-    biometry_data = parse_biometry(text)
-    result["gender"] = biometry_data.gender
-    result["device"] = biometry_data.device
-
-    # Identify missing/low-confidence fields for LLM fallback
-    def get_missing_fields(eye):
-        fields = ["axial_length", "lt", "cct", "ak", "axis", "k1", "k2", "k1_axis", "k2_axis", "acd", "wtw"]
-        return [k for k in fields if not getattr(parsed, eye).__dict__.get(k)]
-    missing_fields = {
-        "od": get_missing_fields("od"),
-        "os": get_missing_fields("os"),
-    }
-
-    # If OCR failed, be more aggressive with LLM fallback
-    ocr_failed = bool(err)
-    if ocr_failed:
-        # When OCR fails, request all important fields from LLM
-        missing_fields = {
-            "od": ["axial_length", "lt", "cct", "ak", "k1", "k2", "k1_axis", "k2_axis", "acd", "wtw"],
-            "os": ["axial_length", "lt", "cct", "ak", "k1", "k2", "k1_axis", "k2_axis", "acd", "wtw"]
-        }
-
-    # Only call LLM if any fields are missing
-    if missing_fields["od"] or missing_fields["os"]:
-        llm_results = llm_extract_missing_fields(text, missing_fields)
-        for eye in ("od", "os"):
-            eye_llm = llm_results.get(eye, {})
-            for k, v in eye_llm.items():
-                # support both simple values and {value, axis} objects for k1/k2
-                if k in ("k1", "k2") and isinstance(v, dict):
-                    if v.get("value") and not result[eye].get(k):
-                        result[eye][k] = v.get("value")
-                        result["confidence"][f"{eye}.{k}"] = 0.7
-                    # merge axis into k1_axis/k2_axis
-                    axis_key = f"{k}_axis"
-                    if v.get("axis") and not result[eye].get(axis_key):
-                        result[eye][axis_key] = v.get("axis")
-                        result["confidence"][f"{eye}.{axis_key}"] = 0.7
-                else:
-                    if v and not result[eye].get(k):
-                        result[eye][k] = v
-                        result["confidence"][f"{eye}.{k}"] = 0.7
-        result["llm_fallback"] = True
-        if ocr_failed:
-            result["notes"] = f"OCR failed: {err}. Used LLM fallback for data extraction."
-    else:
-        result["llm_fallback"] = False
-
-    # Add default Assumed SIA values - separated into magnitude and axis
-    result["assumed_sia_od_magnitude"] = 0.1
-    result["assumed_sia_od_axis"] = 120.0
-    result["assumed_sia_os_magnitude"] = 0.2
-    result["assumed_sia_os_axis"] = 120.0
-    
-    # Legacy string format for backward compatibility
-    result["assumed_sia_od"] = "0.1 deg 120"
-    result["assumed_sia_os"] = "0.2 deg 120"
-    
-    write_audit("extract_ok", result)
-    if debug:
-        result["ocr_text"] = text
-    return JSONResponse(result)
+# OLD /extract endpoint removed - now handled by app/routes/extract.py
+# This uses the new universal biometry parser with RunPod Ollama
 
 @app.post("/review")
 async def review(payload: ReviewPayload):
