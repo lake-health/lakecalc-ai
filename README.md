@@ -17,20 +17,21 @@ A universal biometry parser using OCR + LLM hybrid approach to extract data from
 ```
 ├── app/
 │   ├── services/
-│   │   ├── biometry_parser.py          # Main parser service
-│   │   ├── calculations.py             # IOL calculations
-│   │   ├── iol_database.py            # IOL database
-│   │   └── toric_calculator.py        # Toric IOL calculator
+│   │   ├── biometry_parser_universal.py  # Universal parser (NEW - Oct 2025)
+│   │   ├── calculations.py               # IOL calculations
+│   │   ├── iol_database.py              # IOL database
+│   │   └── toric_calculator.py          # Toric IOL calculator
 │   ├── routes/
-│   │   ├── parse.py                   # Biometry parsing endpoint
-│   │   ├── calculate.py               # IOL calculations
-│   │   ├── suggest.py                 # IOL suggestions
-│   │   └── parser.py                  # Legacy parser
+│   │   ├── extract.py                   # Biometry extraction (UPDATED)
+│   │   ├── calculate.py                 # IOL calculations
+│   │   ├── suggest.py                   # IOL suggestions
+│   │   └── upload.py                    # File upload
 │   └── static/
-│       └── test_local_llm.html        # Browser interface
-├── test_files/                        # Test PDFs (Carina, Geraldo)
-├── railway.json                       # Railway deployment config
-└── Dockerfile                         # Container configuration
+│       └── test_local_llm.html          # Browser interface
+├── runpod_extraction_scripts/          # RunPod training scripts
+├── test_files/                          # Test PDFs (Carina, Geraldo)
+├── railway.json                         # Railway deployment config
+└── Dockerfile                           # Container configuration
 ```
 
 ## 🚀 Quick Start
